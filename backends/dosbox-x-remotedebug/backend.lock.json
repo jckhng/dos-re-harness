@@ -1,0 +1,12 @@
+{
+  "format_version": 1,
+  "upstream": {
+    "url": "https://github.com/lokkju/dosbox-x-remotedebug.git",
+    "commit": "2917cb31e00a9d0a935060ac9186c1a7885da0fd"
+  },
+  "patch": {
+    "path": "dosbox-x-remotedebug.patch",
+    "sha256": "09d05e31ca4e1645dee91b8bf081d6b43db5cefaffbb318d08fe2a93dd4a1e6e"
+  },
+  "license": "GPL-2.0-only"
+}

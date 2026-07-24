@@ -1,0 +1,234 @@
+{
+  "format_version": 1,
+  "status": "confirmed from binary callers and title/ready/running captures",
+  "capture_basis": "Offsets are relative to the 64 KiB linear dump beginning at DS. Heap positions are fixed for the verified PAKU.EXE allocation layout; tools/inspect_state.py validates the live far pointers.",
+  "fields": [
+    {
+      "name": "rng_state",
+      "offset": "0x6dc",
+      "type": "u32le",
+      "note": "confirmed by RNG routine and matched 88-call first-movement state"
+    },
+    {
+      "name": "score",
+      "offset": "0x6f0",
+      "type": "u32le",
+      "note": "confirmed by score display call and pellet capture"
+    },
+    {
+      "name": "high_score",
+      "offset": "0x6f4",
+      "type": "u32le",
+      "note": "confirmed by high-score display call"
+    },
+    {
+      "name": "lives",
+      "offset": "0x7ac",
+      "type": "u16le"
+    },
+    {
+      "name": "level",
+      "offset": "0x7ae",
+      "type": "u16le"
+    },
+    {
+      "name": "level_index",
+      "offset": "0x7b0",
+      "type": "u16le"
+    },
+    {
+      "name": "pellets_remaining",
+      "offset": "0x7b2",
+      "type": "u16le"
+    },
+    {
+      "name": "ghost_mode",
+      "offset": "0x7b4",
+      "type": "u16le"
+    },
+    {
+      "name": "ghost_score",
+      "offset": "0x7b6",
+      "type": "u16le"
+    },
+    {
+      "name": "ghost_mode_phase",
+      "offset": "0x7b8",
+      "type": "u16le"
+    },
+    {
+      "name": "ghost_mode_ticks",
+      "offset": "0x7ba",
+      "type": "u16le"
+    },
+    {
+      "name": "frightened_ticks",
+      "offset": "0x7c0",
+      "type": "u16le"
+    },
+    {
+      "name": "animation_phase",
+      "offset": "0x7c2",
+      "type": "u16le"
+    },
+    {
+      "name": "update_divisor",
+      "offset": "0x7cc",
+      "type": "u16le"
+    },
+    {
+      "name": "player_direction",
+      "offset": "0xba8",
+      "type": "u8",
+      "note": "0 up, 1 right, 2 down, 3 left"
+    },
+    {
+      "name": "player_requested_direction",
+      "offset": "0xba9",
+      "type": "u8",
+      "note": "0 up, 1 right, 2 down, 3 left"
+    },
+    {
+      "name": "player_x",
+      "offset": "0x7fd8",
+      "type": "u16le"
+    },
+    {
+      "name": "player_y",
+      "offset": "0x7fda",
+      "type": "u16le"
+    },
+    {
+      "name": "player_sprite",
+      "offset": "0x7fdc",
+      "type": "u16le"
+    },
+    {
+      "name": "player_previous_x",
+      "offset": "0x7fe2",
+      "type": "u16le"
+    },
+    {
+      "name": "player_previous_y",
+      "offset": "0x7fe4",
+      "type": "u16le"
+    }
+  ],
+  "blocks": [
+    {
+      "instances": [
+        {
+          "name": "red",
+          "base": "0x7ee0"
+        },
+        {
+          "name": "magenta",
+          "base": "0x7f28"
+        },
+        {
+          "name": "cyan",
+          "base": "0x7f70"
+        },
+        {
+          "name": "brown",
+          "base": "0x7fb8"
+        }
+      ],
+      "fields": [
+        {
+          "name": "ghost_{instance}_x",
+          "offset": 0,
+          "type": "u16le"
+        },
+        {
+          "name": "ghost_{instance}_y",
+          "offset": 2,
+          "type": "u16le"
+        },
+        {
+          "name": "ghost_{instance}_sprite",
+          "offset": 4,
+          "type": "u16le"
+        },
+        {
+          "name": "ghost_{instance}_previous_x",
+          "offset": 10,
+          "type": "u16le"
+        },
+        {
+          "name": "ghost_{instance}_previous_y",
+          "offset": 12,
+          "type": "u16le"
+        }
+      ]
+    },
+    {
+      "instances": [
+        {
+          "name": "red",
+          "base": "0x7eb8"
+        },
+        {
+          "name": "magenta",
+          "base": "0x7f00"
+        },
+        {
+          "name": "cyan",
+          "base": "0x7f48"
+        },
+        {
+          "name": "brown",
+          "base": "0x7f90"
+        }
+      ],
+      "fields": [
+        {
+          "name": "ghost_{instance}_direction",
+          "offset": 8,
+          "type": "u16le"
+        },
+        {
+          "name": "ghost_{instance}_sprite_family",
+          "offset": 14,
+          "type": "u16le"
+        },
+        {
+          "name": "ghost_{instance}_personality",
+          "offset": 16,
+          "type": "u16le"
+        },
+        {
+          "name": "ghost_{instance}_mode",
+          "offset": 18,
+          "type": "u16le",
+          "note": "0 scatter, 1 pursuit, 2 frightened, 3 pen return"
+        },
+        {
+          "name": "ghost_{instance}_mode_ticks",
+          "offset": 22,
+          "type": "u16le"
+        },
+        {
+          "name": "ghost_{instance}_release_ticks",
+          "offset": 24,
+          "type": "u16le"
+        },
+        {
+          "name": "ghost_{instance}_target_x",
+          "offset": 26,
+          "type": "u16le"
+        },
+        {
+          "name": "ghost_{instance}_target_y",
+          "offset": 28,
+          "type": "u16le"
+        },
+        {
+          "name": "ghost_{instance}_in_pen",
+          "offset": 31,
+          "type": "u8"
+        }
+      ]
+    }
+  ]
+}

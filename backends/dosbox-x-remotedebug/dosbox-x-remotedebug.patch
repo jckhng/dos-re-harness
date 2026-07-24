@@ -1,0 +1,224 @@
+diff --git a/include/qmp.h b/include/qmp.h
+index 0aff5d9..7aedade 100644
+--- a/include/qmp.h
++++ b/include/qmp.h
+@@ -47,11 +47,14 @@ enum class QMPInputEventType {
+     KeyRelease,
+     MouseButtonPress,
+     MouseButtonRelease,
+-    MouseMove
++    MouseMove,
++    CaptureWaveStart,
++    CaptureWaveStop
+ };
+ 
+ struct QMPInputEvent {
+     QMPInputEventType type;
++    int delay_ticks = 0;
+     union {
+         KBD_KEYS key;        // For keyboard events
+         uint8_t button;      // For mouse button events
+@@ -107,6 +110,7 @@ private:
+     void handle_query_commands();
+     void handle_memdump(const std::string& cmd);
+     void handle_screendump(const std::string& cmd);
++    void handle_capture_wave(bool start);
+     void handle_savestate(const std::string& cmd);
+     void handle_loadstate(const std::string& cmd);
+     void handle_stop();
+diff --git a/src/debug/gdbserver.cpp b/src/debug/gdbserver.cpp
+index 08d306b..ba744e7 100644
+--- a/src/debug/gdbserver.cpp
++++ b/src/debug/gdbserver.cpp
+@@ -64,7 +64,7 @@ void GDBServer::setup_socket() {
+     fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
+ 
+     address.sin_family = AF_INET;
+-    address.sin_addr.s_addr = INADDR_ANY;
++    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+     address.sin_port = htons(port);
+ 
+     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+diff --git a/src/debug/qmp.cpp b/src/debug/qmp.cpp
+index 0570082..7782eba 100644
+--- a/src/debug/qmp.cpp
++++ b/src/debug/qmp.cpp
+@@ -35,6 +35,9 @@
+ 
+ static QMPServer* qmpServer = nullptr;
+ 
++void CAPTURE_StartWave(void);
++void CAPTURE_StopWave(void);
++
+ // Base64 encoding table
+ static const char base64_chars[] =
+     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+@@ -296,7 +299,7 @@ void QMPServer::setup_socket() {
+     }
+ 
+     address.sin_family = AF_INET;
+-    address.sin_addr.s_addr = INADDR_ANY;
++    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+     address.sin_port = htons(port);
+ 
+     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+@@ -413,6 +416,10 @@ void QMPServer::process_command(const std::string& cmd) {
+         handle_memdump(cmd);
+     } else if (execute == "screendump") {
+         handle_screendump(cmd);
++    } else if (execute == "capture-wave-start") {
++        handle_capture_wave(true);
++    } else if (execute == "capture-wave-stop") {
++        handle_capture_wave(false);
+     } else if (execute == "savestate") {
+         handle_savestate(cmd);
+     } else if (execute == "loadstate") {
+@@ -451,6 +458,8 @@ void QMPServer::handle_query_commands() {
+         "{\"name\": \"query-status\"},"
+         "{\"name\": \"memdump\"},"
+         "{\"name\": \"screendump\"},"
++        "{\"name\": \"capture-wave-start\"},"
++        "{\"name\": \"capture-wave-stop\"},"
+         "{\"name\": \"savestate\"},"
+         "{\"name\": \"loadstate\"},"
+         "{\"name\": \"stop\"},"
+@@ -469,6 +478,7 @@ void QMPServer::queue_input_event(const QMPInputEvent& event) {
+ void QMPServer::process_pending_input_events() {
+     // Process all queued events - this runs on the main thread
+     std::queue<QMPInputEvent> events_to_process;
++    std::queue<QMPInputEvent> delayed_events;
+ 
+     {
+         std::lock_guard<std::mutex> lock(input_queue_mutex);
+@@ -476,7 +486,14 @@ void QMPServer::process_pending_input_events() {
+     }
+ 
+     while (!events_to_process.empty()) {
+-        const QMPInputEvent& event = events_to_process.front();
++        QMPInputEvent event = events_to_process.front();
++        events_to_process.pop();
++
++        if (event.delay_ticks > 0) {
++            --event.delay_ticks;
++            delayed_events.push(event);
++            continue;
++        }
+ 
+         switch (event.type) {
+             case QMPInputEventType::KeyPress:
+@@ -494,12 +511,32 @@ void QMPServer::process_pending_input_events() {
+             case QMPInputEventType::MouseMove:
+                 Mouse_CursorMoved(event.move.x, event.move.y, 0, 0, true);
+                 break;
++            case QMPInputEventType::CaptureWaveStart:
++                CAPTURE_StartWave();
++                break;
++            case QMPInputEventType::CaptureWaveStop:
++                CAPTURE_StopWave();
++                break;
+         }
++    }
+ 
+-        events_to_process.pop();
++    if (!delayed_events.empty()) {
++        std::lock_guard<std::mutex> lock(input_queue_mutex);
++        while (!delayed_events.empty()) {
++            input_queue.push(delayed_events.front());
++            delayed_events.pop();
++        }
+     }
+ }
+ 
++void QMPServer::handle_capture_wave(bool start) {
++    QMPInputEvent event;
++    event.type = start ? QMPInputEventType::CaptureWaveStart
++                       : QMPInputEventType::CaptureWaveStop;
++    queue_input_event(event);
++    send_success();
++}
++
+ void QMPServer::handle_send_key(const std::string& cmd) {
+     // Extract hold-time (default 100ms per QEMU spec)
+     // Note: hold-time is now handled by queuing press and release events
+@@ -541,6 +578,7 @@ void QMPServer::handle_send_key(const std::string& cmd) {
+     for (auto it = kbd_keys.rbegin(); it != kbd_keys.rend(); ++it) {
+         QMPInputEvent event;
+         event.type = QMPInputEventType::KeyRelease;
++        event.delay_ticks = 120;
+         event.key = *it;
+         queue_input_event(event);
+     }
+diff --git a/src/gui/sdlmain.cpp b/src/gui/sdlmain.cpp
+index d6b71c0..71a7352 100644
+--- a/src/gui/sdlmain.cpp
++++ b/src/gui/sdlmain.cpp
+@@ -3844,7 +3844,9 @@ static void GUI_StartUp() {
+     // Because we have the option of a dedicated keyboard shortcut to exit
+     // fullscreen, we don't need an Alt+Tab escape hatch. This lets us
+     // block it along with everything else, so you can use it in Windows etc.
++#if SDL_VERSION_ATLEAST(2,0,16)
+     SDL_SetHint(SDL_HINT_ALLOW_ALT_TAB_WHILE_GRABBED, "0");
++#endif
+ 
+     // Apply raw mouse input setting
+     SDL_SetHintWithPriority(SDL_HINT_MOUSE_RELATIVE_MODE_WARP, section->Get_bool("raw_mouse_input") ? "0" : "1", SDL_HINT_OVERRIDE);
+@@ -4268,10 +4270,17 @@ bool Mouse_IsLocked()
+ #if defined(C_SDL2)
+ void GFX_KeyboardCapture(bool enable) {
+     if (sdl.window) {
++#if SDL_VERSION_ATLEAST(2,0,16)
+         SDL_SetWindowKeyboardGrab(sdl.window, enable ? SDL_TRUE : SDL_FALSE);
+ 
+         // Make sure we're using the true value of the current grabbed state.
+         bool grabbed = SDL_GetWindowKeyboardGrab(sdl.window) == SDL_TRUE;
++#else
++        SDL_SetWindowGrab(sdl.window, enable ? SDL_TRUE : SDL_FALSE);
++
++        // SDL 2.0.10 has only combined mouse/keyboard grab.
++        bool grabbed = SDL_GetWindowGrab(sdl.window) == SDL_TRUE;
++#endif
+         sdl.capture_keyboard = grabbed;
+ 
+         if (grabbed)
+diff --git a/src/hardware/adlib.cpp b/src/hardware/adlib.cpp
+index 3d739c9..b11da44 100644
+--- a/src/hardware/adlib.cpp
++++ b/src/hardware/adlib.cpp
+@@ -49,6 +49,28 @@ bool systemmessagebox(char const * aTitle, char const * aMessage, char const * a
+ extern bool show_recorded_filename;
+ extern std::string pathopl;
+ 
++static void DosReHarness_LogOplWrite(uint32_t reg, uint8_t val) {
++    static FILE *log = nullptr;
++    static bool initialized = false;
++
++    if (!initialized) {
++        initialized = true;
++        const char *path = getenv("DOS_RE_HARNESS_OPL_LOG");
++        if (path && *path) {
++            log = fopen(path, "wb");
++            if (log) {
++                fputs("tick_ms,reg_hex,value_hex\n", log);
++                fflush(log);
++            }
++        }
++    }
++
++    if (log) {
++        fprintf(log, "%.6f,0x%03x,0x%02x\n", static_cast<double>(PIC_Ticks), static_cast<unsigned>(reg), static_cast<unsigned>(val));
++        fflush(log);
++    }
++}
++
+ namespace OPL2 {
+ 	#include "opl.cpp"
+ 
+@@ -870,6 +892,8 @@ Chip::Chip() : timer0(80), timer1(320) {
+ }
+ 
+ bool Chip::Write( uint32_t reg, uint8_t val ) {
++	DosReHarness_LogOplWrite(reg, val);
++
+ 	if (adlib_force_timer_overflow_on_polling) {
+ 		/* detect end of polling loop by whether it writes */
+ 		last_poll = PIC_FullIndex();

@@ -1,0 +1,5 @@
+# Preserve hash-locked patch bytes across Windows and Unix checkouts.
+.gitattributes text eol=lf
+*.patch text eol=lf
+*.sh text eol=lf
+scripts/dos-re text eol=lf

@@ -1,0 +1,9 @@
+{
+  "format_version": 1,
+  "description": "Reach the measured READY screen from the title without timing assumptions.",
+  "actions": [
+    "waitvga:title:15",
+    "tap:ret:0.1",
+    "waitvga:ready:15"
+  ]
+}

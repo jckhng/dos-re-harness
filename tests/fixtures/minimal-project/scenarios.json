@@ -1,0 +1,13 @@
+{
+  "format_version": 1,
+  "scenarios": {
+    "boot": {
+      "description": "Synthetic state-gated startup sequence.",
+      "input_movie": "movies/boot.movie.json",
+      "requires": [
+        "input.keyboard",
+        "screen.capture"
+      ]
+    }
+  }
+}

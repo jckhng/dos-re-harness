@@ -1,0 +1,105 @@
+{
+  "format_version": 1,
+  "id": "paku-paku-1.6-runtime",
+  "scope": "user-supplied runtime specimen; binary-only analysis",
+  "release": {
+    "title": "Paku Paku",
+    "version": "1.6",
+    "date": "2011-11-09",
+    "author": "Jason M. Knight",
+    "evidence": "README.HTM"
+  },
+  "provenance": {
+    "status": "user-supplied",
+    "archive_name": null,
+    "archive_sha256": null,
+    "note": "No upstream archive is part of the binary-only assessment."
+  },
+  "files": [
+    {
+      "path": "CUSTMIDI.TXT",
+      "role": "custom MIDI documentation",
+      "size": 1671,
+      "sha256": "5025645100ee3e78385f967a40b2dc96022397d57f7319b16d487c7d24f11686"
+    },
+    {
+      "path": "FONTS.DAT",
+      "role": "runtime data",
+      "size": 1152,
+      "sha256": "df9948df60e2a7e9785f0cf414eeefe1ebcf80019449775dea026553e2564ee9"
+    },
+    {
+      "path": "MAP.DAT",
+      "role": "runtime data",
+      "size": 566,
+      "sha256": "78a6ca53dc9fa87972ba1e83df8bd9db9568b6a909992187eaa2bd9e350e0fc9"
+    },
+    {
+      "path": "MAPTILES.DAT",
+      "role": "runtime data",
+      "size": 1152,
+      "sha256": "f5bc570be78ebd43977460c9ec9720afdbd86ba23cf6a2b85c25de6f8a3916eb"
+    },
+    {
+      "path": "PAKU.EXE",
+      "role": "DOS MZ executable",
+      "size": 36160,
+      "sha256": "8e3bcf30fad4097d47a2651a7cc2a8c6a1229de33c621c49242ebb529c4bb1aa"
+    },
+    {
+      "path": "PAT_ADLB.DAT",
+      "role": "runtime audio data",
+      "size": 17,
+      "sha256": "78af10d32b104f864dc519b30f303ce1ab5684065b5b247e95e07d8ff8cacce8"
+    },
+    {
+      "path": "PAT_CUST.DAT",
+      "role": "runtime audio data",
+      "size": 16,
+      "sha256": "eb222dfceed38bba65b827e299ad242b1a22a5db18e182d29994e27387a51f9c"
+    },
+    {
+      "path": "PAT_GM.DAT",
+      "role": "runtime audio data",
+      "size": 16,
+      "sha256": "eb222dfceed38bba65b827e299ad242b1a22a5db18e182d29994e27387a51f9c"
+    },
+    {
+      "path": "PAT_MT32.DAT",
+      "role": "runtime audio data",
+      "size": 16,
+      "sha256": "5a85826cd247d8ff15c17073c38a97bbe03f948788dc596a8969126f9024cc95"
+    },
+    {
+      "path": "README.HTM",
+      "role": "bundled release documentation and rights evidence",
+      "size": 26774,
+      "sha256": "2f11cd17572f5fae4fc3a60bf3bcfbafdb5bc83bcc3ce2e8f739da485f2e0c60"
+    },
+    {
+      "path": "SPRITES.DAT",
+      "role": "runtime data",
+      "size": 6720,
+      "sha256": "9de595527316bed18c5db0e1169083c348160352ce08e6c57b47ba686dfbc354"
+    },
+    {
+      "path": "TEXTS.DAT",
+      "role": "runtime data",
+      "size": 1984,
+      "sha256": "875128f0fb93eca2e0ddde6de9112fca7a0a3a9b0250907e92765884a6bd96c4"
+    },
+    {
+      "path": "THEME.DAT",
+      "role": "runtime audio data",
+      "size": 140,
+      "sha256": "a41c6e86d408109d82d792597030b360ff40b2bc585b5de88fec08a1d4e64066"
+    }
+  ],
+  "mutable_files": [
+    {
+      "path": "SCORES.DAT",
+      "baseline": "absent",
+      "evidence": "filename embedded in PAKU.EXE"
+    }
+  ]
+}

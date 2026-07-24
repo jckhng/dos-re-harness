@@ -1,0 +1,73 @@
+{
+  "format_version": 1,
+  "id": "pakupaku-1.6",
+  "description": "Binary-only Paku Paku 1.6 capture adapter and compatibility reimplementation",
+  "specimen": {
+    "root": ".work/specimen/paku-1.6",
+    "hash_manifest": "specimen-manifest.json",
+    "mutable_files": [
+      "SCORES.DAT"
+    ]
+  },
+  "runtime": {
+    "dump_segment": "ds",
+    "dump_size": "0x10000",
+    "state_schema": "state.schema.json",
+    "screen_signatures": "screens.json",
+    "vga_address": "0xb8000",
+    "vga_width": 160,
+    "vga_height": 100,
+    "framebuffer_encoding": "cga-text-attributes-160x100",
+    "status": "raw CGA text buffer and project-local decoder validated; confirmed DS and heap-backed state schema"
+  },
+  "scenarios": "scenarios.json",
+  "capture_adapter": {
+    "type": "powershell-wsl-remotedebug",
+    "backend_lock": "../../backends/dosbox-x-remotedebug/backend.lock.json",
+    "configuration": {
+      "program": "PAKU.EXE",
+      "program_arguments": [
+        "/speaker"
+      ],
+      "machine": "cga",
+      "cpu_type": "auto",
+      "cycles": "fixed 3000",
+      "clean_mount": true
+    },
+    "capabilities": [
+      "cpu.registers.read",
+      "input.keyboard",
+      "memory.read",
+      "screen.capture",
+      "screen.sequence",
+      "state.wait"
+    ],
+    "command": [
+      "pwsh",
+      "-NoProfile",
+      "-File",
+      "{project_dir}\\capture.ps1",
+      "-Scenario",
+      "{scenario}",
+      "-OutDir",
+      "{out_dir}",
+      "-StartupSequence",
+      "{startup_actions}",
+      "-WaitState",
+      "{wait_state}"
+    ]
+  },
+  "analysis": {
+    "boundary": "PAKU.EXE, runtime data, bundled README, and runtime evidence only",
+    "source_code": "excluded",
+    "ghidra_project": ".work/ghidra",
+    "status": "private Ghidra import complete; rendering, map, state, player, ghost, RNG, mode scheduler, collision, score, and actor-reset routines recovered"
+  },
+  "reimplementation": {
+    "root": "reimplementation",
+    "build_system": "CMake",
+    "language": "C++17",
+    "asset_policy": "requires verified user-provided Paku Paku 1.6 data",
+    "status": "READY, first running, and first-life-loss reset frames exact; collision and mode scheduling implemented; temporal death animation and later systems incomplete"
+  }
+}

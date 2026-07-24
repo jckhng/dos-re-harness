@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+TOOLKIT_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+
+PYTHONPATH="$TOOLKIT_ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+exec python3 -m dos_re_harness.cli "$@"

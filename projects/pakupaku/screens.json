@@ -1,0 +1,29 @@
+{
+  "format_version": 1,
+  "width": 160,
+  "height": 100,
+  "unknown": "unknown",
+  "status": "title and ready signatures measured from independent binary captures",
+  "states": [
+    {
+      "name": "title",
+      "region": [
+        0,
+        61,
+        160,
+        39
+      ],
+      "sha256": "8edf2419a3c59c57dd8a77285fc5f2beeb357fd0f6dedef0015e7c78bf28cf29"
+    },
+    {
+      "name": "ready",
+      "region": [
+        0,
+        0,
+        160,
+        100
+      ],
+      "sha256": "cba01bb743e5b1dec829af45a101770872987659c6bb242a6b22cf0c46a5c097"
+    }
+  ]
+}

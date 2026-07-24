@@ -1,0 +1,116 @@
+{
+  "format_version": 1,
+  "status": "title, ready, first movement, and first life loss are durable state-gated scenarios",
+  "scenarios": {
+    "calibrate-title": {
+      "description": "Initial timed capture used only to derive the first title signature.",
+      "startup_actions": [
+        "wait:2"
+      ],
+      "requires": [
+        "cpu.registers.read",
+        "memory.read",
+        "screen.capture"
+      ]
+    },
+    "title": {
+      "description": "First durable natural title capture.",
+      "input_movie": "movies/title.movie.json",
+      "requires": [
+        "cpu.registers.read",
+        "input.keyboard",
+        "memory.read",
+        "screen.capture"
+      ]
+    },
+    "ready": {
+      "description": "Natural title-to-READY transition gated by measured frame states.",
+      "input_movie": "movies/ready.movie.json",
+      "requires": [
+        "cpu.registers.read",
+        "input.keyboard",
+        "memory.read",
+        "screen.capture",
+        "state.wait"
+      ]
+    },
+    "first-movement": {
+      "description": "First deterministic running checkpoint after holding left from READY.",
+      "input_movie": "movies/first-movement.movie.json",
+      "wait_state": [
+        "player_x=18",
+        "score=70",
+        "pellets_remaining=237",
+        "animation_phase=5",
+        "player_previous_x=18",
+        "ghost_red_previous_x=27",
+        "ghost_red_previous_y=41",
+        "ghost_magenta_previous_x=27",
+        "ghost_magenta_previous_y=33",
+        "ghost_cyan_previous_x=33",
+        "ghost_cyan_previous_y=39",
+        "ghost_brown_previous_x=47",
+        "ghost_brown_previous_y=41"
+      ],
+      "requires": [
+        "cpu.registers.read",
+        "input.keyboard",
+        "memory.read",
+        "screen.capture",
+        "state.wait"
+      ]
+    },
+    "first-life-loss": {
+      "description": "First natural normal-ghost collision, gated after actor reset.",
+      "input_movie": "movies/first-life-loss.movie.json",
+      "wait_state": [
+        "lives=2",
+        "score=70",
+        "pellets_remaining=237",
+        "player_x=40",
+        "player_y=68",
+        "player_previous_x=40",
+        "player_previous_y=68",
+        "ghost_red_x=40",
+        "ghost_red_y=32",
+        "ghost_magenta_x=41",
+        "ghost_magenta_y=39",
+        "ghost_cyan_x=34",
+        "ghost_cyan_y=39",
+        "ghost_brown_x=47",
+        "ghost_brown_y=39"
+      ],
+      "requires": [
+        "cpu.registers.read",
+        "input.keyboard",
+        "memory.read",
+        "screen.capture",
+        "state.wait"
+      ]
+    },
+    "calibrate-first-movement": {
+      "description": "Timed post-READY movement calibration used to recover state fields; not a durable validation scenario.",
+      "startup_actions": [
+        "waitvga:title:15",
+        "tap:ret:0.1",
+        "waitvga:ready:15",
+        "tap:left:0.1",
+        "wait:12"
+      ],
+      "requires": [
+        "cpu.registers.read",
+        "input.keyboard",
+        "memory.read",
+        "screen.capture"
+      ]
+    }
+  },
+  "planned_scenarios": [
+    "pellet-consumption",
+    "power-pellet",
+    "collision",
+    "level-clear",
+    "score-persistence",
+    "audio"
+  ]
+}

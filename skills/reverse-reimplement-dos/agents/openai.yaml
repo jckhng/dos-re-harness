@@ -1,0 +1,4 @@
+interface:
+  display_name: "DOS Reverse/Reimplement"
+  short_description: "Evidence-first DOS fidelity workflow"
+  default_prompt: "Use $reverse-reimplement-dos to recover and validate a portable DOS program reimplementation."

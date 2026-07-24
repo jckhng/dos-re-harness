@@ -1,0 +1,10 @@
+{
+  "format_version": 1,
+  "description": "Reach the first natural life-loss reset after holding left from READY.",
+  "actions": [
+    "waitvga:title:15",
+    "tap:ret:0.1",
+    "waitvga:ready:15",
+    "tap:left:0.1"
+  ]
+}

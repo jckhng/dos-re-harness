@@ -1,0 +1,27 @@
+{
+  "format_version": 1,
+  "id": "minimal-fixture",
+  "description": "Synthetic project used by the harness contract tests",
+  "runtime": {
+    "dump_segment": "ds",
+    "dump_size": 8,
+    "state_schema": "state.schema.json",
+    "screen_signatures": "screens.json",
+    "vga_address": "0xa0000",
+    "vga_width": 4,
+    "vga_height": 4
+  },
+  "scenarios": "scenarios.json",
+  "capture_adapter": {
+    "type": "fixture",
+    "capabilities": [
+      "input.keyboard",
+      "screen.capture"
+    ],
+    "command": [
+      "python",
+      "-c",
+      "print('fixture capture: {scenario} -> {out_dir}')"
+    ]
+  }
+}

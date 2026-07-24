@@ -1,0 +1,8 @@
+{
+  "format_version": 1,
+  "description": "Synthetic input movie for contract testing.",
+  "actions": [
+    "waitvga:fixture-screen:1",
+    "hold:spc:0.01"
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "format_version": 1,
+  "description": "Wait for the measured Paku Paku title region without startup timing assumptions.",
+  "actions": [
+    "waitvga:title:15"
+  ]
+}

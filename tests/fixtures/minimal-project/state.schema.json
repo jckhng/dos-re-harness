@@ -1,0 +1,15 @@
+{
+  "format_version": 1,
+  "fields": [
+    {
+      "name": "score",
+      "offset": 0,
+      "type": "u16le"
+    },
+    {
+      "name": "flags",
+      "offset": 2,
+      "type": "u16le"
+    }
+  ]
+}
