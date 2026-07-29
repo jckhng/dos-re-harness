@@ -11,6 +11,7 @@ import select
 import socket
 import struct
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -578,6 +579,30 @@ def parse_screen_wait_action(
     return parts[1], timeout, poll_interval
 
 
+def wait_for_qmp_screen(
+    qmp: Any,
+    classifier: Any,
+    address: int,
+    size: int,
+    expected_state: str,
+    timeout: float,
+    poll_interval: float,
+) -> bytes:
+    deadline = time.monotonic() + timeout
+    last_state = "unknown"
+    while time.monotonic() < deadline:
+        raw = qmp.memdump(address, size)
+        last_state = classifier.classify(raw)
+        if last_state == expected_state:
+            return raw
+        if poll_interval > 0:
+            time.sleep(poll_interval)
+    raise TimeoutError(
+        "timed out waiting for save-state load readiness screen "
+        f"{expected_state!r}; last={last_state!r}"
+    )
+
+
 class QmpClient:
     def __init__(self, host: str, port: int, timeout: float) -> None:
         deadline = time.time() + timeout
@@ -610,12 +635,27 @@ class QmpClient:
             except json.JSONDecodeError:
                 continue
 
-    def command(self, execute: str, arguments: dict[str, Any] | None = None) -> dict[str, Any]:
+    def command(
+        self,
+        execute: str,
+        arguments: dict[str, Any] | None = None,
+        timeout: float | None = None,
+        sent_event: threading.Event | None = None,
+    ) -> dict[str, Any]:
         msg: dict[str, Any] = {"execute": execute}
         if arguments is not None:
             msg["arguments"] = arguments
-        self.sock.sendall((json.dumps(msg) + "\n").encode("utf-8"))
-        response = self._recv_json()
+        previous_timeout = self.sock.gettimeout()
+        if timeout is not None:
+            self.sock.settimeout(timeout)
+        try:
+            self.sock.sendall((json.dumps(msg) + "\n").encode("utf-8"))
+            if sent_event is not None:
+                sent_event.set()
+            response = self._recv_json()
+        finally:
+            if timeout is not None:
+                self.sock.settimeout(previous_timeout)
         if "error" in response:
             raise RuntimeError(f"QMP {execute} failed: {response}")
         return response
@@ -676,6 +716,39 @@ class QmpClient:
             raise RuntimeError(f"QMP screendump did not return base64 data: {response}")
         return base64.b64decode(payload)
 
+    def save_state(
+        self,
+        path: Path,
+        request_sent: threading.Event | None = None,
+    ) -> Path:
+        response = self.command(
+            "savestate",
+            {"file": str(path)},
+            timeout=35.0,
+            sent_event=request_sent,
+        )
+        returned = response.get("return", {}).get("file")
+        if returned != str(path):
+            raise RuntimeError(
+                "QMP savestate returned an unexpected path: "
+                f"{response}"
+            )
+        return path
+
+    def load_state(self, path: Path) -> Path:
+        response = self.command(
+            "loadstate",
+            {"file": str(path)},
+            timeout=35.0,
+        )
+        returned = response.get("return", {}).get("file")
+        if returned != str(path):
+            raise RuntimeError(
+                "QMP loadstate returned an unexpected path: "
+                f"{response}"
+            )
+        return path
+
 
 def capture_optional_screenshot(
     qmp: Any,
@@ -687,6 +760,137 @@ def capture_optional_screenshot(
         return str(exc)
     path.write_bytes(data)
     return None
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_save_state_checkpoint_metadata(
+    save_state_path: Path,
+) -> dict[str, Any]:
+    metadata_path = save_state_path.with_name(
+        "remote_runtime_registers.json"
+    )
+    if not metadata_path.is_file():
+        raise ValueError(
+            "full emulator state requires companion checkpoint metadata: "
+            f"{metadata_path}"
+        )
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    expected_sha256 = metadata.get("save_state_sha256")
+    actual_sha256 = sha256_file(save_state_path)
+    if expected_sha256 != actual_sha256:
+        raise ValueError(
+            "full emulator state does not match companion metadata: "
+            f"expected SHA-256 {expected_sha256!r}, observed "
+            f"{actual_sha256}"
+        )
+    dump_segment_value = metadata.get("dump_segment_value")
+    if not isinstance(dump_segment_value, int):
+        raise ValueError(
+            "full emulator state companion metadata lacks "
+            "dump_segment_value"
+        )
+    return metadata
+
+
+def finalize_halted_checkpoint_save_state(
+    qmp: Any,
+    gdb: Any,
+    breakpoint_linear: int,
+    checkpoint_record: dict[str, Any],
+    timeout: float,
+    read_post_save_state: (
+        Callable[[dict[str, int]], dict[str, int]] | None
+    ) = None,
+) -> tuple[str, dict[str, int]]:
+    checkpoint_path = Path(checkpoint_record["path"])
+    save_state_path = checkpoint_path / "remote_runtime.sav"
+    metadata_path = checkpoint_path / "remote_runtime_registers.json"
+
+    gdb.remove_breakpoint(breakpoint_linear)
+    gdb.step_nowait()
+    step_stop = gdb.wait_for_stop(timeout)
+
+    request_sent = threading.Event()
+    save_error: list[BaseException] = []
+
+    def save_worker() -> None:
+        try:
+            qmp.save_state(save_state_path, request_sent)
+        except BaseException as exc:
+            save_error.append(exc)
+            request_sent.set()
+
+    worker = threading.Thread(
+        target=save_worker,
+        name="dos-re-savestate",
+        daemon=True,
+    )
+    worker.start()
+    if not request_sent.wait(timeout):
+        raise TimeoutError("QMP savestate request was not sent")
+    if save_error:
+        raise RuntimeError("QMP savestate request failed") from save_error[0]
+
+    gdb.continue_nowait()
+    worker.join(40.0)
+    stop = gdb.halt(timeout)
+    registers = gdb.registers()
+    post_save_state = (
+        read_post_save_state(registers)
+        if read_post_save_state is not None
+        else None
+    )
+    if worker.is_alive():
+        raise TimeoutError("QMP savestate did not complete within 40 seconds")
+    if save_error:
+        raise RuntimeError("QMP savestate failed") from save_error[0]
+    if not save_state_path.is_file():
+        raise RuntimeError(
+            "QMP savestate reported success but did not create "
+            f"{save_state_path}"
+        )
+    save_state_size = save_state_path.stat().st_size
+    if save_state_size == 0:
+        raise RuntimeError(
+            f"QMP savestate created an empty file: {save_state_path}"
+        )
+    save_state_sha256 = sha256_file(save_state_path)
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.update(
+        {
+            "save_state": str(save_state_path),
+            "save_state_size": save_state_size,
+            "save_state_sha256": save_state_sha256,
+            "save_state_resume": {
+                "breakpoint_linear": breakpoint_linear,
+                "single_step_stop": step_stop,
+                "post_save_stop": stop,
+                "post_save_registers": registers,
+                "post_save_state": post_save_state,
+            },
+        }
+    )
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    checkpoint_record.update(
+        {
+            "save_state": str(save_state_path),
+            "save_state_size": save_state_size,
+            "save_state_sha256": save_state_sha256,
+            "save_state_resume": metadata["save_state_resume"],
+        }
+    )
+    return stop, registers
 
 
 def recover_checkpoint_screenshot_side_effects(
@@ -771,8 +975,15 @@ def write_state_checkpoint(
     *,
     capture_vga: bool = True,
     capture_screenshot: bool = False,
+    collision_namespace: str | None = None,
 ) -> dict[str, Any]:
     checkpoint_path = checkpoint_root / f"{field_name}-{value}"
+    if checkpoint_path.exists() and collision_namespace is not None:
+        checkpoint_path = (
+            checkpoint_root
+            / collision_namespace
+            / f"{field_name}-{value}"
+        )
     checkpoint_path.mkdir(parents=True, exist_ok=False)
     dump_segment_value = registers[dump_segment_name] & 0xFFFF
     dump_linear = dump_segment_value << 4
@@ -935,6 +1146,38 @@ def apply_halted_poke_files(
             }
         )
     return writes
+
+
+def apply_halted_pokes(
+    gdb: RspClient,
+    specs: list[str],
+    regs: dict[str, int],
+) -> list[dict[str, Any]]:
+    writes: list[dict[str, Any]] = []
+    for spec in specs:
+        address, data = parse_poke(spec, regs)
+        gdb.write_memory_chunked(address, data)
+        writes.append(
+            {
+                "spec": spec,
+                "address": address,
+                "size": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+        )
+    return writes
+
+
+def apply_post_resume_pokes(
+    gdb: RspClient,
+    poke_specs: list[str],
+    poke_file_specs: list[str],
+    regs: dict[str, int],
+) -> list[dict[str, Any]]:
+    return (
+        apply_halted_pokes(gdb, poke_specs, regs)
+        + apply_halted_poke_files(gdb, poke_file_specs, regs)
+    )
 
 
 def run_simple_key_actions(qmp: QmpClient, actions: list[str]) -> None:
@@ -1448,6 +1691,56 @@ def prepare_restore_halt(
     return stop, gdb.registers()
 
 
+def validate_resume_bootstrap(
+    registers: dict[str, int],
+    state: dict[str, int],
+    field_name: str,
+    first_value: int,
+    next_linear: int,
+    *,
+    full_state_loaded: bool,
+) -> None:
+    if not full_state_loaded and registers["eip"] != next_linear:
+        raise ValueError(
+            "resume bootstrap stopped at the wrong next instruction: "
+            f"expected 0x{next_linear:05x}, observed "
+            f"0x{registers['eip']:05x}"
+        )
+    if state.get(field_name) != first_value:
+        raise ValueError(
+            "restored checkpoint state does not match "
+            f"{field_name}={first_value}: "
+            f"{state.get(field_name)!r}"
+        )
+
+
+def full_state_resume_remaining_values(
+    actual_value: int,
+    observed_values: list[int],
+    input_events: list[tuple[int, bool, list[str]]],
+) -> list[int]:
+    if not observed_values:
+        raise ValueError("full-state resume requires observed values")
+    first_value = observed_values[0]
+    final_value = observed_values[-1]
+    if not first_value <= actual_value <= final_value:
+        raise ValueError(
+            "loaded full-state value is outside the resume interval: "
+            f"{actual_value} not in [{first_value}, {final_value}]"
+        )
+    missed_events = [
+        value
+        for value, _pressed, _qcodes in input_events
+        if first_value < value <= actual_value
+    ]
+    if missed_events:
+        raise ValueError(
+            "loaded full-state drift crossed a missed input event at "
+            f"{sorted(set(missed_events))}"
+        )
+    return [value for value in observed_values if value > actual_value]
+
+
 def stop_on_state_checkpoints(
     gdb: RspClient,
     linear_address: int,
@@ -1612,8 +1905,9 @@ def main() -> int:
     parser.add_argument(
         "--resume-checkpoint-script",
         help=(
-            "After state-file pokes, capture and continue at state "
-            "boundaries. Syntax: checkpointstate:<linear-address>:<field>:"
+            "From the current halted state, optionally after state-file "
+            "pokes, capture and continue at state boundaries. Syntax: "
+            "checkpointstate:<linear-address>:<field>:"
             "<value>[+<value>...]:<positive-maximum-hit-count>, or "
             "checkpointstatescriptfile with the same fields. The latter "
             "requires --input-script and a neutral keyboard boundary."
@@ -1660,6 +1954,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--post-resume-poke",
+        action="append",
+        default=[],
+        help=(
+            "At the post-resume breakpoint, write inline hex bytes before "
+            "continuing. Uses the same forms as --poke."
+        ),
+    )
+    parser.add_argument(
         "--post-resume-poke-file",
         action="append",
         default=[],
@@ -1667,6 +1970,15 @@ def main() -> int:
             "At the post-resume breakpoint, write a binary file before "
             "continuing to --post-resume-next-break-*. Uses the same forms "
             "as --poke-file."
+        ),
+    )
+    parser.add_argument(
+        "--post-resume-continue-after-poke",
+        action="store_true",
+        help=(
+            "At the first post-resume breakpoint, apply "
+            "--post-resume-poke-file writes, clear the breakpoint, and "
+            "continue without requiring a second breakpoint."
         ),
     )
     parser.add_argument(
@@ -1711,6 +2023,37 @@ def main() -> int:
             "Capture a QMP screenshot while halted at each nested state "
             "checkpoint."
         ),
+    )
+    parser.add_argument(
+        "--checkpoint-save-state",
+        action="store_true",
+        help=(
+            "Write a full DOSBox-X emulator save state at the final nested "
+            "startup checkpoint. This briefly releases the stopped CPU, so "
+            "the checkpoint action must be the final startup action. The "
+            "state is backend/configuration specific."
+        ),
+    )
+    parser.add_argument(
+        "--load-save-state",
+        type=Path,
+        help=(
+            "Load a full DOSBox-X emulator save state before attaching the "
+            "debugger. The state must match the pinned backend and runtime "
+            "configuration."
+        ),
+    )
+    parser.add_argument(
+        "--load-save-state-ready-screen",
+        help=(
+            "Before loading a full emulator state, wait for this classified "
+            "guest screen so DOSBox-X has completed normal initialization."
+        ),
+    )
+    parser.add_argument(
+        "--load-save-state-ready-timeout",
+        type=float,
+        default=45.0,
     )
     parser.add_argument("--screenshot", action="store_true")
     parser.add_argument("--delay", type=float, default=4.0)
@@ -1779,8 +2122,59 @@ def main() -> int:
         if args.screen_signatures
         else None
     )
+    load_save_state_metadata: dict[str, Any] | None = None
     if wait_predicates and not state_fields:
         parser.error("--wait-state requires --state-schema")
+    if args.checkpoint_save_state:
+        checkpoint_prefixes = (
+            "checkpointstate:",
+            "checkpointstatehold:",
+            "checkpointstatescript:",
+            "checkpointstatescriptfile:",
+        )
+        if (
+            not args.startup_key
+            or not args.startup_key[-1].startswith(checkpoint_prefixes)
+        ):
+            parser.error(
+                "--checkpoint-save-state requires a state-checkpoint action "
+                "as the final --startup-key"
+            )
+        if args.resume_checkpoint_script:
+            parser.error(
+                "--checkpoint-save-state cannot be combined with "
+                "--resume-checkpoint-script"
+            )
+    if args.load_save_state is not None:
+        if not args.load_save_state.is_file():
+            parser.error(
+                f"--load-save-state does not exist: {args.load_save_state}"
+            )
+        if args.startup_key:
+            parser.error(
+                "--load-save-state cannot be combined with --startup-key; "
+                "use resume or post-restore actions from the loaded halt"
+            )
+        try:
+            load_save_state_metadata = (
+                load_save_state_checkpoint_metadata(args.load_save_state)
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+    if args.load_save_state_ready_screen is not None:
+        if args.load_save_state is None:
+            parser.error(
+                "--load-save-state-ready-screen requires --load-save-state"
+            )
+        if screen_classifier is None:
+            parser.error(
+                "--load-save-state-ready-screen requires "
+                "--screen-signatures"
+            )
+        if args.load_save_state_ready_timeout <= 0:
+            parser.error(
+                "--load-save-state-ready-timeout must be positive"
+            )
     if args.resume_checkpoint_script:
         if (
             args.resume_checkpoint_script.startswith(
@@ -1794,10 +2188,6 @@ def main() -> int:
         if not state_fields:
             parser.error(
                 "--resume-checkpoint-script requires --state-schema"
-            )
-        if not args.poke_file:
-            parser.error(
-                "--resume-checkpoint-script requires at least one --poke-file"
             )
         if args.restore_registers is not None:
             parser.error(
@@ -1855,11 +2245,42 @@ def main() -> int:
         args.post_resume_next_break_linear is not None
         or post_resume_next_break_segmented is not None
     )
-    if args.post_resume_poke_file and not has_post_resume_next_break:
+    has_post_resume_pokes = bool(
+        args.post_resume_poke or args.post_resume_poke_file
+    )
+    if has_post_resume_pokes and not (
+        has_post_resume_next_break
+        or args.post_resume_continue_after_poke
+    ):
         parser.error(
-            "--post-resume-poke-file requires "
-            "--post-resume-next-break-linear or "
-            "--post-resume-next-break-segmented"
+            "--post-resume-poke/--post-resume-poke-file requires "
+            "--post-resume-next-break-linear, "
+            "--post-resume-next-break-segmented, or "
+            "--post-resume-continue-after-poke"
+        )
+    if (
+        args.post_resume_continue_after_poke
+        and has_post_resume_next_break
+    ):
+        parser.error(
+            "--post-resume-continue-after-poke cannot be combined with "
+            "--post-resume-next-break-*"
+        )
+    if (
+        args.post_resume_continue_after_poke
+        and not has_post_resume_pokes
+    ):
+        parser.error(
+            "--post-resume-continue-after-poke requires "
+            "--post-resume-poke or --post-resume-poke-file"
+        )
+    if has_post_resume_pokes and (
+        args.post_resume_break_linear is None
+        and post_resume_break_segmented is None
+    ):
+        parser.error(
+            "--post-resume-poke/--post-resume-poke-file requires a first "
+            "--post-resume-break-*"
         )
     if has_post_resume_next_break and (
         args.post_resume_break_linear is None
@@ -1874,7 +2295,9 @@ def main() -> int:
             "--post-resume-next-break-hit-count must be positive"
         )
     if post_resume_break_hit_series is not None and (
-        has_post_resume_next_break or args.post_resume_poke_file
+        has_post_resume_next_break
+        or has_post_resume_pokes
+        or args.post_resume_continue_after_poke
     ):
         parser.error(
             "--post-resume-break-hit-series cannot be combined with "
@@ -1899,6 +2322,23 @@ def main() -> int:
             )
         return screen_classifier.classify(raw)
 
+    if args.load_save_state is not None:
+        qmp_load = QmpClient(args.host, args.qmp_port, args.timeout)
+        try:
+            if args.load_save_state_ready_screen is not None:
+                wait_for_qmp_screen(
+                    qmp_load,
+                    screen_classifier,
+                    args.vga_address,
+                    vga_size,
+                    args.load_save_state_ready_screen,
+                    args.load_save_state_ready_timeout,
+                    args.wait_state_interval,
+                )
+            qmp_load.load_state(args.load_save_state)
+        finally:
+            qmp_load.close()
+
     gdb = RspClient(args.host, args.gdb_port, args.timeout)
     try:
         halted_stop: str | None = None
@@ -1915,7 +2355,11 @@ def main() -> int:
                     f"inserted linear breakpoint at 0x{args.break_linear:05x}",
                     flush=True,
                 )
-            gdb.continue_nowait()
+            if args.load_save_state is not None:
+                halted_stop = initial
+                halted_regs = gdb.registers()
+            else:
+                gdb.continue_nowait()
 
         args.out_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_screenshot_baseline = set(args.out_dir.glob("*.png"))
@@ -1928,6 +2372,34 @@ def main() -> int:
                     "vga_sequence_interval": args.vga_sequence_interval,
                     "omit_checkpoint_vga": args.omit_checkpoint_vga,
                     "checkpoint_screenshot": args.checkpoint_screenshot,
+                    "checkpoint_save_state": args.checkpoint_save_state,
+                    "load_save_state": (
+                        {
+                            "path": str(args.load_save_state),
+                            "size": args.load_save_state.stat().st_size,
+                            "sha256": sha256_file(args.load_save_state),
+                            "ready_screen": (
+                                args.load_save_state_ready_screen
+                            ),
+                            "ready_timeout": (
+                                args.load_save_state_ready_timeout
+                            ),
+                            "checkpoint_metadata": (
+                                str(
+                                    args.load_save_state.with_name(
+                                        "remote_runtime_registers.json"
+                                    )
+                                )
+                            ),
+                            "dump_segment_value": (
+                                load_save_state_metadata[
+                                    "dump_segment_value"
+                                ]
+                            ),
+                        }
+                        if args.load_save_state is not None
+                        else None
+                    ),
                     "break_linear": args.break_linear,
                     "poke_file": args.poke_file,
                     "restore_registers": (
@@ -1946,6 +2418,11 @@ def main() -> int:
                     ),
                     "post_resume_break_hit_count": (
                         args.post_resume_break_hit_count
+                    ),
+                    "post_resume_poke": args.post_resume_poke,
+                    "post_resume_poke_file": args.post_resume_poke_file,
+                    "post_resume_continue_after_poke": (
+                        args.post_resume_continue_after_poke
                     ),
                     "resume_next_linear": args.resume_next_linear,
                     "input_script": (
@@ -2248,6 +2725,24 @@ def main() -> int:
                             capture_script_checkpoint,
                             transition_script_keys,
                         )
+                        if args.checkpoint_save_state:
+                            (
+                                halted_stop,
+                                halted_regs,
+                            ) = finalize_halted_checkpoint_save_state(
+                                qmp_startup,
+                                gdb,
+                                linear_address,
+                                state_checkpoints[-1],
+                                args.timeout,
+                                lambda _registers, segment=(
+                                    halted_regs[args.dump_segment] & 0xFFFF
+                                ): read_segment_state(
+                                    gdb,
+                                    segment,
+                                    state_fields,
+                                ),
+                            )
                         break_state_match = {
                             "linear_address": linear_address,
                             "predicate": f"{field_name}=={values[-1]}",
@@ -2373,6 +2868,24 @@ def main() -> int:
                             capture_hold_checkpoint,
                             transition_hold_key,
                         )
+                        if args.checkpoint_save_state:
+                            (
+                                halted_stop,
+                                halted_regs,
+                            ) = finalize_halted_checkpoint_save_state(
+                                qmp_startup,
+                                gdb,
+                                linear_address,
+                                state_checkpoints[-1],
+                                args.timeout,
+                                lambda _registers, segment=(
+                                    halted_regs[args.dump_segment] & 0xFFFF
+                                ): read_segment_state(
+                                    gdb,
+                                    segment,
+                                    state_fields,
+                                ),
+                            )
                         break_state_match = {
                             "linear_address": linear_address,
                             "predicate": f"{field_name}=={values[-1]}",
@@ -2472,6 +2985,24 @@ def main() -> int:
                             read_checkpoint_state,
                             capture_checkpoint,
                         )
+                        if args.checkpoint_save_state:
+                            (
+                                halted_stop,
+                                halted_regs,
+                            ) = finalize_halted_checkpoint_save_state(
+                                qmp_startup,
+                                gdb,
+                                linear_address,
+                                state_checkpoints[-1],
+                                args.timeout,
+                                lambda _registers, segment=(
+                                    halted_regs[args.dump_segment] & 0xFFFF
+                                ): read_segment_state(
+                                    gdb,
+                                    segment,
+                                    state_fields,
+                                ),
+                            )
                         break_state_match = {
                             "linear_address": linear_address,
                             "predicate": f"{field_name}=={values[-1]}",
@@ -2996,6 +3527,7 @@ def main() -> int:
                             pgm_header,
                             capture_vga=not args.omit_checkpoint_vga,
                             capture_screenshot=args.checkpoint_screenshot,
+                            collision_namespace="resume",
                         )
                         state_checkpoints.append(record)
                         print(
@@ -3027,32 +3559,56 @@ def main() -> int:
                             )
 
                     restored_regs = gdb.registers()
-                    restored_state = read_resumed_checkpoint_state(
-                        restored_regs
-                    )
-                    if restored_regs["eip"] != args.resume_next_linear:
-                        raise ValueError(
-                            "resume bootstrap stopped at the wrong next "
-                            f"instruction: expected "
-                            f"0x{args.resume_next_linear:05x}, observed "
-                            f"0x{restored_regs['eip']:05x}"
+                    if load_save_state_metadata is not None:
+                        restored_state = read_segment_state(
+                            gdb,
+                            int(
+                                load_save_state_metadata[
+                                    "dump_segment_value"
+                                ]
+                            ),
+                            state_fields,
                         )
-                    first_value = observed_values[0]
-                    if restored_state.get(field_name) != first_value:
-                        raise ValueError(
-                            "restored checkpoint state does not match "
-                            f"{field_name}={first_value}: "
-                            f"{restored_state.get(field_name)!r}"
+                    else:
+                        restored_state = read_resumed_checkpoint_state(
+                            restored_regs
                         )
-                    capture_resumed_checkpoint(
-                        first_value,
-                        "resumed-state",
-                        restored_regs,
-                        restored_state,
-                        0,
-                    )
-                    transition_resumed_script_keys(first_value)
-                    if len(observed_values) == 1:
+                    requested_first_value = observed_values[0]
+                    if load_save_state_metadata is not None:
+                        actual_value = restored_state.get(field_name)
+                        if not isinstance(actual_value, int):
+                            raise ValueError(
+                                "loaded full-state checkpoint lacks "
+                                f"{field_name!r}"
+                            )
+                        remaining_values = (
+                            full_state_resume_remaining_values(
+                                actual_value,
+                                observed_values,
+                                input_events,
+                            )
+                        )
+                    else:
+                        validate_resume_bootstrap(
+                            restored_regs,
+                            restored_state,
+                            field_name,
+                            requested_first_value,
+                            args.resume_next_linear,
+                            full_state_loaded=False,
+                        )
+                        capture_resumed_checkpoint(
+                            requested_first_value,
+                            "resumed-state",
+                            restored_regs,
+                            restored_state,
+                            0,
+                        )
+                        transition_resumed_script_keys(
+                            requested_first_value
+                        )
+                        remaining_values = observed_values[1:]
+                    if not remaining_values:
                         halted_stop = "resumed-state"
                         halted_regs = restored_regs
                         matched_state = restored_state
@@ -3067,7 +3623,7 @@ def main() -> int:
                             gdb,
                             linear_address,
                             field_name,
-                            observed_values[1:],
+                            remaining_values,
                             max_hits,
                             args.timeout,
                             read_resumed_checkpoint_state,
@@ -3261,16 +3817,17 @@ def main() -> int:
                             flush=True,
                         )
                     if has_post_resume_next_break:
-                        poke_writes = apply_halted_poke_files(
+                        poke_writes = apply_post_resume_pokes(
                             gdb,
+                            args.post_resume_poke,
                             args.post_resume_poke_file,
                             halted_regs,
                         )
                         for write in poke_writes:
                             print(
-                                "post-resume poke-file wrote "
+                                "post-resume poke wrote "
                                 f"{write['size']} bytes from "
-                                f"{write['path']} at "
+                                f"{write.get('path', 'inline hex')} at "
                                 f"0x{write['address']:05x}",
                                 flush=True,
                             )
@@ -3343,6 +3900,47 @@ def main() -> int:
                             "stopped on post-resume next breakpoint hit "
                             f"{args.post_resume_next_break_hit_count} at "
                             f"{next_description}: {halted_stop}",
+                            flush=True,
+                        )
+                    elif args.post_resume_continue_after_poke:
+                        poke_writes = apply_post_resume_pokes(
+                            gdb,
+                            args.post_resume_poke,
+                            args.post_resume_poke_file,
+                            halted_regs,
+                        )
+                        for write in poke_writes:
+                            print(
+                                "post-resume poke wrote "
+                                f"{write['size']} bytes from "
+                                f"{write.get('path', 'inline hex')} at "
+                                f"0x{write['address']:05x}",
+                                flush=True,
+                            )
+                        first_backend_address = (
+                            pack_segment_offset(
+                                post_resume_break_segmented[0],
+                                post_resume_break_segmented[1],
+                            )
+                            if post_resume_break_segmented is not None
+                            else args.post_resume_break_linear
+                        )
+                        clear_halted_breakpoint(
+                            gdb,
+                            first_backend_address,
+                            args.timeout,
+                        )
+                        break_state_match[
+                            "post_resume_poke_files"
+                        ] = poke_writes
+                        break_state_match[
+                            "post_resume_continued_after_poke"
+                        ] = True
+                        gdb.continue_nowait()
+                        halted_stop = None
+                        halted_regs = None
+                        print(
+                            "continued after post-resume poke files",
                             flush=True,
                         )
             else:

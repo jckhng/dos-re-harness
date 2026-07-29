@@ -25,7 +25,9 @@ param(
     [string]$PostResumeBreakSegmented = "",
     [int]$PostResumeBreakHitCount = 1,
     [string]$PostResumeBreakHitSeries = "",
+    [string[]]$PostResumePoke = @(),
     [string[]]$PostResumePokeFile = @(),
+    [switch]$PostResumeContinueAfterPoke,
     [string]$PostResumeNextBreakLinear = "",
     [string]$PostResumeNextBreakSegmented = "",
     [int]$PostResumeNextBreakHitCount = 1,
@@ -52,6 +54,10 @@ param(
     [switch]$DumpLowMemory,
     [switch]$OmitCheckpointVga,
     [switch]$CheckpointScreenshot,
+    [switch]$CheckpointSaveState,
+    [string]$LoadSaveState = "",
+    [string]$LoadSaveStateReadyScreen = "",
+    [double]$LoadSaveStateReadyTimeout = 45.0,
     [switch]$CaptureAudio,
     [switch]$CaptureSfxOnly,
     [Parameter(Mandatory = $true)]
@@ -244,6 +250,7 @@ $haltAfterPokeArg = if ($HaltAfterPoke) { "1" } else { "0" }
 $dumpLowMemoryArg = if ($DumpLowMemory) { "1" } else { "0" }
 $omitCheckpointVgaArg = if ($OmitCheckpointVga) { "1" } else { "0" }
 $checkpointScreenshotArg = if ($CheckpointScreenshot) { "1" } else { "0" }
+$checkpointSaveStateArg = if ($CheckpointSaveState) { "1" } else { "0" }
 $captureAudioArg = if ($CaptureAudio -or $CaptureSfxOnly) { "1" } else { "0" }
 $captureSfxOnlyArg = if ($CaptureSfxOnly) { "1" } else { "0" }
 $stateSchemaPath = Resolve-WorkspacePath $repoRoot $StateSchema
@@ -302,7 +309,12 @@ post_resume_next_break_linear="${43}"
 post_resume_next_break_hit_count="${44}"
 post_resume_next_break_segmented="${45}"
 post_resume_break_hit_series="${46}"
-shift 46
+post_resume_continue_after_poke="${47}"
+checkpoint_save_state="${48}"
+load_save_state="${49}"
+load_save_state_ready_screen="${50}"
+load_save_state_ready_timeout="${51}"
+shift 51
 if [ "$program_arguments" = "__none__" ]; then
     program_arguments=""
 fi
@@ -311,11 +323,13 @@ poke_specs=()
 poke_file_specs=()
 post_restore_keys=()
 wait_state_specs=()
+post_resume_poke_specs=()
 post_resume_poke_file_specs=()
 parsing_pokes=0
 parsing_poke_files=0
 parsing_post_restore=0
 parsing_wait_state=0
+parsing_post_resume_pokes=0
 parsing_post_resume_poke_files=0
 for arg in "$@"; do
     if [ "$arg" = "--" ] || [ "$arg" = "--pokes" ]; then
@@ -323,6 +337,7 @@ for arg in "$@"; do
         parsing_poke_files=0
         parsing_post_restore=0
         parsing_wait_state=0
+        parsing_post_resume_pokes=0
         parsing_post_resume_poke_files=0
         continue
     fi
@@ -331,6 +346,7 @@ for arg in "$@"; do
         parsing_poke_files=1
         parsing_post_restore=0
         parsing_wait_state=0
+        parsing_post_resume_pokes=0
         parsing_post_resume_poke_files=0
         continue
     fi
@@ -339,6 +355,7 @@ for arg in "$@"; do
         parsing_poke_files=0
         parsing_post_restore=1
         parsing_wait_state=0
+        parsing_post_resume_pokes=0
         parsing_post_resume_poke_files=0
         continue
     fi
@@ -347,6 +364,16 @@ for arg in "$@"; do
         parsing_poke_files=0
         parsing_post_restore=0
         parsing_wait_state=1
+        parsing_post_resume_pokes=0
+        parsing_post_resume_poke_files=0
+        continue
+    fi
+    if [ "$arg" = "--post-resume-pokes" ]; then
+        parsing_pokes=0
+        parsing_poke_files=0
+        parsing_post_restore=0
+        parsing_wait_state=0
+        parsing_post_resume_pokes=1
         parsing_post_resume_poke_files=0
         continue
     fi
@@ -355,11 +382,14 @@ for arg in "$@"; do
         parsing_poke_files=0
         parsing_post_restore=0
         parsing_wait_state=0
+        parsing_post_resume_pokes=0
         parsing_post_resume_poke_files=1
         continue
     fi
     if [ "$parsing_post_resume_poke_files" = "1" ]; then
         post_resume_poke_file_specs+=("$arg")
+    elif [ "$parsing_post_resume_pokes" = "1" ]; then
+        post_resume_poke_specs+=("$arg")
     elif [ "$parsing_wait_state" = "1" ]; then
         wait_state_specs+=("$arg")
     elif [ "$parsing_post_restore" = "1" ]; then
@@ -527,9 +557,15 @@ if [ "$post_resume_break_hit_series" != "__none__" ]; then
         --post-resume-break-hit-series "$post_resume_break_hit_series"
     )
 fi
+for poke in "${post_resume_poke_specs[@]}"; do
+    controller_args+=(--post-resume-poke "$poke")
+done
 for poke_file in "${post_resume_poke_file_specs[@]}"; do
     controller_args+=(--post-resume-poke-file "$poke_file")
 done
+if [ "$post_resume_continue_after_poke" = "1" ]; then
+    controller_args+=(--post-resume-continue-after-poke)
+fi
 if [ "$post_resume_next_break_linear" != "__none__" ]; then
     controller_args+=(
         --post-resume-next-break-linear "$post_resume_next_break_linear"
@@ -556,6 +592,18 @@ if [ "$omit_checkpoint_vga" = "1" ]; then
 fi
 if [ "$checkpoint_screenshot" = "1" ]; then
     controller_args+=(--checkpoint-screenshot)
+fi
+if [ "$checkpoint_save_state" = "1" ]; then
+    controller_args+=(--checkpoint-save-state)
+fi
+if [ "$load_save_state" != "__none__" ]; then
+    controller_args+=(--load-save-state "$load_save_state")
+fi
+if [ "$load_save_state_ready_screen" != "__none__" ]; then
+    controller_args+=(
+        --load-save-state-ready-screen "$load_save_state_ready_screen"
+        --load-save-state-ready-timeout "$load_save_state_ready_timeout"
+    )
 fi
 if [ "$screenshot" = "1" ]; then
     controller_args+=(--screenshot)
@@ -664,7 +712,24 @@ try {
             Convert-PokeFileSpecToWsl $spec
         }
     )
-    & wsl.exe --exec bash $tempScriptWsl $repoRootWsl $outPathWsl $Program $mountPathWsl $DelaySeconds $StartupDelaySeconds $DumpSize $DumpSegment $keep $screenshotArg $WaitStateTimeout $WaitStateInterval $restoreRegistersWsl $haltAfterPokeArg $dumpLowMemoryArg $callNearArg $VgaSequenceFrames $VgaSequenceInterval $vgaSequenceStopSha256Arg $captureAudioArg $captureSfxOnlyArg $stateSchemaWsl $screenSignaturesWsl $toolkitRootWsl $dosboxBinaryWsl $RuntimeName $Machine $CpuType $Cycles $programArgumentsArg $VgaAddress $VgaWidth $VgaHeight $breakpointLinearArg $inputScriptWsl $resumeCheckpointScriptArg $resumeNextLinearArg $omitCheckpointVgaArg $checkpointScreenshotArg $postResumeBreakLinearArg $PostResumeBreakHitCount $postResumeBreakSegmentedArg $postResumeNextBreakLinearArg $PostResumeNextBreakHitCount $postResumeNextBreakSegmentedArg $postResumeBreakHitSeriesArg @StartupKey --pokes @Poke --poke-files @pokeFilesWsl --post-restore @PostRestoreKey --wait-state @WaitState --post-resume-poke-files @postResumePokeFilesWsl
+    $postResumeContinueAfterPokeArg = if (
+        $PostResumeContinueAfterPoke
+    ) { "1" } else { "0" }
+    $loadSaveStateWsl = if ($LoadSaveState.Trim().Length -gt 0) {
+        Convert-WindowsPathToWsl (
+            Resolve-WorkspacePath $repoRoot $LoadSaveState
+        )
+    } else {
+        "__none__"
+    }
+    $loadSaveStateReadyScreenArg = if (
+        $LoadSaveStateReadyScreen.Trim().Length -gt 0
+    ) {
+        $LoadSaveStateReadyScreen
+    } else {
+        "__none__"
+    }
+    & wsl.exe --exec bash $tempScriptWsl $repoRootWsl $outPathWsl $Program $mountPathWsl $DelaySeconds $StartupDelaySeconds $DumpSize $DumpSegment $keep $screenshotArg $WaitStateTimeout $WaitStateInterval $restoreRegistersWsl $haltAfterPokeArg $dumpLowMemoryArg $callNearArg $VgaSequenceFrames $VgaSequenceInterval $vgaSequenceStopSha256Arg $captureAudioArg $captureSfxOnlyArg $stateSchemaWsl $screenSignaturesWsl $toolkitRootWsl $dosboxBinaryWsl $RuntimeName $Machine $CpuType $Cycles $programArgumentsArg $VgaAddress $VgaWidth $VgaHeight $breakpointLinearArg $inputScriptWsl $resumeCheckpointScriptArg $resumeNextLinearArg $omitCheckpointVgaArg $checkpointScreenshotArg $postResumeBreakLinearArg $PostResumeBreakHitCount $postResumeBreakSegmentedArg $postResumeNextBreakLinearArg $PostResumeNextBreakHitCount $postResumeNextBreakSegmentedArg $postResumeBreakHitSeriesArg $postResumeContinueAfterPokeArg $checkpointSaveStateArg $loadSaveStateWsl $loadSaveStateReadyScreenArg $LoadSaveStateReadyTimeout @StartupKey --pokes @Poke --poke-files @pokeFilesWsl --post-restore @PostRestoreKey --wait-state @WaitState --post-resume-pokes @PostResumePoke --post-resume-poke-files @postResumePokeFilesWsl
     if ($LASTEXITCODE -ne 0) {
         throw "wsl.exe failed with exit code $LASTEXITCODE"
     }

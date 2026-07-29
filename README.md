@@ -567,11 +567,32 @@ the backend writes a PNG only after a timed-out request resumes, the harness
 retains it as a deferred side effect with
 `screenshot_exact_checkpoint: false`; it is not state-aligned regression
 evidence.
-`--resume-checkpoint-script` accepts either a neutral
+Use `-CheckpointSaveState` only when the final startup action is a state
+checkpoint. It writes `remote_runtime.sav` beside that checkpoint and records
+its size, SHA-256, request boundary, post-save registers, and post-save schema
+state. Unlike a segment dump, the DOSBox-X state includes CPU, RAM, VGA
+planes/pages and registers, and the DAC palette. The controller briefly
+releases the stopped CPU because DOSBox-X cannot service a save request while
+its GDB loop is halted.
+Load that artifact with `-LoadSaveState`. The companion
+`remote_runtime_registers.json` is mandatory and its saved-state hash is
+verified before load. `-LoadSaveStateReadyScreen` gates the load on a
+classified guest screen so DOSBox-X has completed normal initialization.
+Save/load requests are asynchronous: execution can move between the requested
+checkpoint and the actual saved or reattached state. Input-script resume
+accepts that drift only when it proves that no input event was crossed.
+Save states are pinned-backend/configuration accelerators, not portable
+behavioral evidence or substitutes for a natural-reachability capture. Store
+them below the target's `.work` tree and create them sparsely at neutral,
+high-value boundaries.
+`--resume-checkpoint-script` continues from the current halted state, with or
+without target-controlled state-file pokes. It accepts either a neutral
 `checkpointstate:<linear-address>:<field>:<value>[+<value>...]:<maximum-hits>`
-action or the input-driven `checkpointstatescriptfile` form after
-target-controlled state-file pokes. The first value must already match the
-restored schema state. The file-backed form discards earlier input events only
+action or the input-driven `checkpointstatescriptfile` form. The first value
+must already match the current or restored schema state. If a resumed value
+reuses an existing startup-checkpoint name, it is written below
+`checkpoints/resume/` instead of overwriting or colliding with that evidence.
+The file-backed form discards earlier input events only
 after proving that no key is held across the resume boundary. The target must
 also supply `--resume-next-linear`, and its bootstrap movie must clear the
 original breakpoint and stop at that statically verified next instruction.
@@ -595,13 +616,17 @@ state-boundary breakpoint first when the resume script advanced through more
 than one state. This avoids replaying startup solely to inspect code reached
 from an already verified checkpoint.
 After that first post-resume stop,
+`--post-resume-poke <linear>:<hexbytes>` and
 `--post-resume-poke-file <linear>:<path>` can apply one or more file-backed
-memory writes while the CPU remains halted. Pair it with
+or inline memory writes while the CPU remains halted. Pair them with
 `--post-resume-next-break-linear` or
 `--post-resume-next-break-segmented <segment>:<offset>` and
 `--post-resume-next-break-hit-count` to step off the first breakpoint and
 stop at a later instruction. The second breakpoint is also valid without a
 poke, which supports entry-to-exit captures inside one function invocation.
+Use `--post-resume-continue-after-poke` instead when the write creates a
+controlled running state for a timed VGA or screenshot sequence and no second
+breakpoint is required.
 Metadata records each poke's resolved address, byte count, and SHA-256, plus
 both breakpoint selections.
 `clearbreak:<linear-address>` removes a halted linear breakpoint, single-steps
