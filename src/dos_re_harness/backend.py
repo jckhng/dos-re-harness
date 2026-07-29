@@ -17,6 +17,7 @@ CAPABILITIES = {
     "cpu.halt",
     "cpu.registers.read",
     "cpu.registers.write",
+    "execution.breakpoint-series",
     "execution.call-near",
     "input.keyboard",
     "memory.read",

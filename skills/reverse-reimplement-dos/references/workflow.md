@@ -60,6 +60,25 @@ Maintain semantic maps with:
 Do not rename from appearance alone. Confirm decompiler types against
 instructions, calling convention, segment use, and runtime state.
 
+### Packed MZ executables
+
+If the original MZ import exposes only a loader stub, unpack a private
+derivative with the harness:
+
+```powershell
+pwsh -NoProfile -File scripts/dos-re.ps1 unpack-mz `
+  projects/target/.work/specimen/release/GAME.EXE `
+  projects/target/.work/unpacked/GAME.UNPACKED.EXE `
+  --tool /absolute/path/to/mzexplode `
+  --wsl-distribution Ubuntu
+```
+
+The command writes an adjacent JSON manifest containing the mzexplode binary,
+packed input, and unpacked output hashes. Use the unpacked image to recover
+code and relocations in Ghidra. Keep the packed executable as the runtime
+behavioral specification and record both hashes in analysis notes. Never
+publish the unpacked derivative.
+
 ## 3. Resource Recovery
 
 Inventory every resource record before classifying it. Do not assume a
@@ -119,6 +138,35 @@ emulated ticks or explicit state transitions.
 Capture registers and segment bases with memory. In real mode, record whether
 addresses are segment-relative or linear. Do not compare a DS-relative field
 against an absolute rewrite address.
+
+When several nearby state values must be compared, stop on one stable
+breakpoint and capture the requested values in order during the same emulator
+run. Each checkpoint must contain enough memory and register evidence to be
+compared independently. Hash nested checkpoint files recursively, use named
+workspaces for alternate boundaries, and keep confirmed-identical regressions
+separate from known-divergent frontier observations.
+
+For several call ordinals at the same post-resume breakpoint, pass one
+strictly increasing series through the target adapter:
+
+```text
+--adapter-argument post_resume_break_segmented=0x1234:0x5678
+--adapter-argument post_resume_break_hit_series=2,9,17,31
+```
+
+The capture writes `checkpoints/breakpoint_hit-2` and the other requested hits
+without rebooting DOSBox-X. Keep breakpoint-specific decoding target-local;
+the generic harness records registers and requested memory artifacts.
+
+Inspect captures through the compact index first:
+
+```text
+dos-re summarize-capture projects/target/.work/captures/probe
+```
+
+Use `--json` for the compact structured form or `--out PATH` to materialize
+it. The summary hashes large embedded input scripts and state records instead
+of expanding them. The full evidence remains authoritative on disk.
 
 ## 5. Compatibility Core
 

@@ -10,14 +10,52 @@ from pathlib import Path
 
 from .audit import audit_public_tree
 from .backend import diagnose
+from .capture_summary import (
+    build_capture_summary,
+    format_capture_summary_line,
+    write_capture_summary,
+)
 from .evidence import write_evidence_manifest
 from .frames import write_raw_diff
-from .movie import scenario_actions
+from .movie import load_movie, scenario_actions
+from .mzexplode import unpack_mz
 from .project import load_project, load_scenarios, validate_project
 from .schema import load_schema
 from .screens import ScreenClassifier
 from .state import diff_states, load_state, parse_dump_file
 from .traces import first_trace_difference, load_jsonl
+
+
+def capture_adapter_replacements(
+    adapter: dict[str, object],
+    scenario: dict[str, object],
+    overrides: list[str],
+) -> dict[str, str]:
+    configuration = adapter.get("configuration", {})
+    if not isinstance(configuration, dict):
+        raise ValueError("capture_adapter.configuration must be an object")
+    arguments = scenario.get("arguments", {})
+    if not isinstance(arguments, dict):
+        raise ValueError("scenario arguments must be an object")
+    replacements = {
+        str(key): str(value)
+        for source in (configuration, arguments)
+        for key, value in source.items()
+        if isinstance(value, (str, int, float))
+        and not isinstance(value, bool)
+    }
+    for assignment in overrides:
+        key, separator, value = assignment.partition("=")
+        if not separator or not key:
+            raise ValueError(
+                "capture adapter arguments must use NAME=VALUE syntax"
+            )
+        if key not in replacements:
+            raise ValueError(
+                f"unknown capture adapter argument {key!r}"
+            )
+        replacements[key] = value
+    return replacements
 
 
 def command_validate(args: argparse.Namespace) -> int:
@@ -133,6 +171,24 @@ def command_audit_tree(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_unpack_mz(args: argparse.Namespace) -> int:
+    manifest_path = unpack_mz(
+        input_path=args.input,
+        output_path=args.output,
+        tool=args.tool,
+        wsl_distribution=args.wsl_distribution,
+        manifest_path=args.manifest,
+        force=args.force,
+    )
+    document = json.loads(manifest_path.read_text(encoding="utf-8"))
+    print(
+        f"UNPACKED input={document['input']['sha256']} "
+        f"output={document['output']['sha256']}"
+    )
+    print(f"wrote {manifest_path}")
+    return 0
+
+
 def command_capture(args: argparse.Namespace) -> int:
     project = load_project(args.project)
     errors = validate_project(project)
@@ -149,20 +205,38 @@ def command_capture(args: argparse.Namespace) -> int:
     if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
         raise ValueError("capture_adapter.command must be an argument array")
     scenario = scenarios[args.scenario]
-    actions = scenario_actions(project.root, scenario)
+    movie_path = args.movie.resolve() if args.movie is not None else None
+    input_script_path = (
+        args.input_script.resolve()
+        if args.input_script is not None
+        else None
+    )
+    if input_script_path is not None and not input_script_path.is_file():
+        raise ValueError(f"input script is missing: {input_script_path}")
+    actions = (
+        list(load_movie(movie_path)["actions"])
+        if movie_path is not None
+        else scenario_actions(project.root, scenario)
+    )
     replacements = {
         "project": str(project.path),
         "project_dir": str(project.root),
         "scenario": args.scenario,
         "out_dir": str(args.out_dir.resolve()),
         "startup_actions": ",".join(actions),
+        "input_script": (
+            str(input_script_path)
+            if input_script_path is not None
+            else ""
+        ),
         "wait_state": ";".join(scenario.get("wait_state", [])),
     }
     replacements.update(
-        {
-            str(key): str(value)
-            for key, value in scenario.get("arguments", {}).items()
-        }
+        capture_adapter_replacements(
+            adapter,
+            scenario,
+            args.adapter_argument,
+        )
     )
     rendered = [
         part.format_map(replacements)
@@ -178,9 +252,23 @@ def command_capture(args: argparse.Namespace) -> int:
         args.out_dir.resolve(),
         rendered,
         exit_code,
+        input_movie_path=movie_path,
+        input_script_path=input_script_path,
     )
     print(f"wrote {manifest_path}")
     return exit_code
+
+
+def command_summarize_capture(args: argparse.Namespace) -> int:
+    summary = build_capture_summary(args.capture_dir)
+    if args.out is not None:
+        output = write_capture_summary(args.capture_dir, args.out)
+        print(f"wrote {output}")
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    else:
+        print(format_capture_summary_line(summary))
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -236,10 +324,54 @@ def build_parser() -> argparse.ArgumentParser:
     audit.add_argument("--max-file-size", type=int, default=1_000_000)
     audit.set_defaults(func=command_audit_tree)
 
+    unpack = subparsers.add_parser(
+        "unpack-mz",
+        help="Unpack a DOS MZ executable with mzexplode and write hash evidence.",
+    )
+    unpack.add_argument("input", type=Path)
+    unpack.add_argument("output", type=Path)
+    unpack.add_argument("--tool", required=True, help="Native or WSL mzexplode path.")
+    unpack.add_argument("--wsl-distribution")
+    unpack.add_argument("--manifest", type=Path)
+    unpack.add_argument("--force", action="store_true")
+    unpack.set_defaults(func=command_unpack_mz)
+
+    summarize = subparsers.add_parser(
+        "summarize-capture",
+        help="Print a compact summary without expanding large capture records.",
+    )
+    summarize.add_argument("capture_dir", type=Path)
+    summarize.add_argument("--json", action="store_true")
+    summarize.add_argument("--out", type=Path)
+    summarize.set_defaults(func=command_summarize_capture)
+
     capture = subparsers.add_parser("capture")
     capture.add_argument("project", type=Path)
     capture.add_argument("scenario")
     capture.add_argument("--out-dir", type=Path, required=True)
+    capture.add_argument(
+        "--movie",
+        type=Path,
+        help="Override the scenario input movie and hash the override as evidence.",
+    )
+    capture.add_argument(
+        "--input-script",
+        type=Path,
+        help=(
+            "State-boundary input script passed to the capture adapter and "
+            "hashed as evidence."
+        ),
+    )
+    capture.add_argument(
+        "--adapter-argument",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help=(
+            "Override one configured capture-adapter argument; repeatable. "
+            "Only names declared by the adapter or scenario are accepted."
+        ),
+    )
     capture.add_argument("--dry-run", action="store_true")
     capture.set_defaults(func=command_capture)
     return parser

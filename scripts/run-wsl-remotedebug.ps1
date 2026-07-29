@@ -14,11 +14,23 @@ param(
     [double]$DelaySeconds = 4.0,
     [double]$StartupDelaySeconds = 3.0,
     [string]$StartupSequence = "",
+    [string]$InputScript = "",
     [string[]]$StartupKey = @(),
     [string[]]$Poke = @(),
     [string[]]$PokeFile = @(),
     [string]$RestoreRegisters = "",
+    [string]$ResumeCheckpointScript = "",
+    [string]$ResumeNextLinear = "",
+    [string]$PostResumeBreakLinear = "",
+    [string]$PostResumeBreakSegmented = "",
+    [int]$PostResumeBreakHitCount = 1,
+    [string]$PostResumeBreakHitSeries = "",
+    [string[]]$PostResumePokeFile = @(),
+    [string]$PostResumeNextBreakLinear = "",
+    [string]$PostResumeNextBreakSegmented = "",
+    [int]$PostResumeNextBreakHitCount = 1,
     [string]$CallNear = "",
+    [string]$BreakpointLinear = "",
     [switch]$HaltAfterPoke,
     [string]$PostRestoreSequence = "",
     [string[]]$PostRestoreKey = @(),
@@ -38,6 +50,8 @@ param(
     [string[]]$RestoreTrackedFile = @(),
     [switch]$Screenshot,
     [switch]$DumpLowMemory,
+    [switch]$OmitCheckpointVga,
+    [switch]$CheckpointScreenshot,
     [switch]$CaptureAudio,
     [switch]$CaptureSfxOnly,
     [Parameter(Mandatory = $true)]
@@ -81,6 +95,33 @@ function Convert-WindowsPathToWsl {
     $drive = $Matches[1].ToLowerInvariant()
     $rest = $Matches[2] -replace "\\", "/"
     return "/mnt/$drive/$rest"
+}
+
+function Convert-PokeFileSpecToWsl {
+    param(
+        [Parameter(Mandatory = $true)][string]$Spec
+    )
+
+    if ($Spec.StartsWith("ds:") -or $Spec.StartsWith("ss:")) {
+        $parts = $Spec.Split(":", 3)
+        if ($parts.Count -ne 3) {
+            throw "PokeFile must be ds:offset:path / ss:offset:path, got '$Spec'"
+        }
+        return (
+            $parts[0] + ":" + $parts[1] + ":" +
+            (Convert-WindowsPathToWsl (Resolve-Path $parts[2]).Path)
+        )
+    }
+    $separator = $Spec.IndexOf(":")
+    if ($separator -lt 0) {
+        throw "PokeFile must be linear:path or ds:offset:path / ss:offset:path, got '$Spec'"
+    }
+    $address = $Spec.Substring(0, $separator)
+    $path = $Spec.Substring($separator + 1)
+    return (
+        $address + ":" +
+        (Convert-WindowsPathToWsl (Resolve-Path $path).Path)
+    )
 }
 
 function Export-GitBlob {
@@ -201,6 +242,8 @@ $keep = if ($KeepRunning) { "1" } else { "0" }
 $screenshotArg = if ($Screenshot) { "1" } else { "0" }
 $haltAfterPokeArg = if ($HaltAfterPoke) { "1" } else { "0" }
 $dumpLowMemoryArg = if ($DumpLowMemory) { "1" } else { "0" }
+$omitCheckpointVgaArg = if ($OmitCheckpointVga) { "1" } else { "0" }
+$checkpointScreenshotArg = if ($CheckpointScreenshot) { "1" } else { "0" }
 $captureAudioArg = if ($CaptureAudio -or $CaptureSfxOnly) { "1" } else { "0" }
 $captureSfxOnlyArg = if ($CaptureSfxOnly) { "1" } else { "0" }
 $stateSchemaPath = Resolve-WorkspacePath $repoRoot $StateSchema
@@ -246,7 +289,20 @@ program_arguments="${30}"
 vga_address="${31}"
 vga_width="${32}"
 vga_height="${33}"
-shift 33
+break_linear="${34}"
+input_script="${35}"
+resume_checkpoint_script="${36}"
+resume_next_linear="${37}"
+omit_checkpoint_vga="${38}"
+checkpoint_screenshot="${39}"
+post_resume_break_linear="${40}"
+post_resume_break_hit_count="${41}"
+post_resume_break_segmented="${42}"
+post_resume_next_break_linear="${43}"
+post_resume_next_break_hit_count="${44}"
+post_resume_next_break_segmented="${45}"
+post_resume_break_hit_series="${46}"
+shift 46
 if [ "$program_arguments" = "__none__" ]; then
     program_arguments=""
 fi
@@ -255,16 +311,19 @@ poke_specs=()
 poke_file_specs=()
 post_restore_keys=()
 wait_state_specs=()
+post_resume_poke_file_specs=()
 parsing_pokes=0
 parsing_poke_files=0
 parsing_post_restore=0
 parsing_wait_state=0
+parsing_post_resume_poke_files=0
 for arg in "$@"; do
     if [ "$arg" = "--" ] || [ "$arg" = "--pokes" ]; then
         parsing_pokes=1
         parsing_poke_files=0
         parsing_post_restore=0
         parsing_wait_state=0
+        parsing_post_resume_poke_files=0
         continue
     fi
     if [ "$arg" = "--poke-files" ]; then
@@ -272,6 +331,7 @@ for arg in "$@"; do
         parsing_poke_files=1
         parsing_post_restore=0
         parsing_wait_state=0
+        parsing_post_resume_poke_files=0
         continue
     fi
     if [ "$arg" = "--post-restore" ]; then
@@ -279,6 +339,7 @@ for arg in "$@"; do
         parsing_poke_files=0
         parsing_post_restore=1
         parsing_wait_state=0
+        parsing_post_resume_poke_files=0
         continue
     fi
     if [ "$arg" = "--wait-state" ]; then
@@ -286,9 +347,20 @@ for arg in "$@"; do
         parsing_poke_files=0
         parsing_post_restore=0
         parsing_wait_state=1
+        parsing_post_resume_poke_files=0
         continue
     fi
-    if [ "$parsing_wait_state" = "1" ]; then
+    if [ "$arg" = "--post-resume-poke-files" ]; then
+        parsing_pokes=0
+        parsing_poke_files=0
+        parsing_post_restore=0
+        parsing_wait_state=0
+        parsing_post_resume_poke_files=1
+        continue
+    fi
+    if [ "$parsing_post_resume_poke_files" = "1" ]; then
+        post_resume_poke_file_specs+=("$arg")
+    elif [ "$parsing_wait_state" = "1" ]; then
         wait_state_specs+=("$arg")
     elif [ "$parsing_post_restore" = "1" ]; then
         post_restore_keys+=("$arg")
@@ -320,7 +392,10 @@ else
     opl_mode=opl2
 fi
 
-pkill -f "dosbox-x.*${runtime_name}.conf" >/dev/null 2>&1 || true
+# DOSBox-X handles SIGTERM by opening an interactive quit confirmation when a
+# DOS program is active. A stale headless capture must never block the next
+# run on that invisible dialog.
+pkill -9 -f "dosbox-x.*${runtime_name}.conf" >/dev/null 2>&1 || true
 rm -f "$conf" "$log" "$pidfile"
 
 cat > "$conf" <<EOF
@@ -405,6 +480,12 @@ controller_args=(
 if [ "$vga_sequence_stop_sha256" != "__none__" ]; then
     controller_args+=(--vga-sequence-stop-sha256 "$vga_sequence_stop_sha256")
 fi
+if [ "$break_linear" != "__none__" ]; then
+    controller_args+=(--break-linear "$break_linear")
+fi
+if [ "$input_script" != "__none__" ]; then
+    controller_args+=(--input-script "$input_script")
+fi
 for key in "${startup_keys[@]}"; do
     controller_args+=(--startup-key "$key")
 done
@@ -423,6 +504,44 @@ done
 if [ "$restore_registers" != "__none__" ]; then
     controller_args+=(--restore-registers "$restore_registers")
 fi
+if [ "$resume_checkpoint_script" != "__none__" ]; then
+    controller_args+=(--resume-checkpoint-script "$resume_checkpoint_script")
+fi
+if [ "$resume_next_linear" != "__none__" ]; then
+    controller_args+=(--resume-next-linear "$resume_next_linear")
+fi
+if [ "$post_resume_break_linear" != "__none__" ]; then
+    controller_args+=(
+        --post-resume-break-linear "$post_resume_break_linear"
+        --post-resume-break-hit-count "$post_resume_break_hit_count"
+    )
+fi
+if [ "$post_resume_break_segmented" != "__none__" ]; then
+    controller_args+=(
+        --post-resume-break-segmented "$post_resume_break_segmented"
+        --post-resume-break-hit-count "$post_resume_break_hit_count"
+    )
+fi
+if [ "$post_resume_break_hit_series" != "__none__" ]; then
+    controller_args+=(
+        --post-resume-break-hit-series "$post_resume_break_hit_series"
+    )
+fi
+for poke_file in "${post_resume_poke_file_specs[@]}"; do
+    controller_args+=(--post-resume-poke-file "$poke_file")
+done
+if [ "$post_resume_next_break_linear" != "__none__" ]; then
+    controller_args+=(
+        --post-resume-next-break-linear "$post_resume_next_break_linear"
+        --post-resume-next-break-hit-count "$post_resume_next_break_hit_count"
+    )
+fi
+if [ "$post_resume_next_break_segmented" != "__none__" ]; then
+    controller_args+=(
+        --post-resume-next-break-segmented "$post_resume_next_break_segmented"
+        --post-resume-next-break-hit-count "$post_resume_next_break_hit_count"
+    )
+fi
 if [ "$call_near" != "__none__" ]; then
     controller_args+=(--call-near "$call_near")
 fi
@@ -431,6 +550,12 @@ if [ "$halt_after_poke" = "1" ]; then
 fi
 if [ "$dump_low_memory" = "1" ]; then
     controller_args+=(--dump-low-memory)
+fi
+if [ "$omit_checkpoint_vga" = "1" ]; then
+    controller_args+=(--omit-checkpoint-vga)
+fi
+if [ "$checkpoint_screenshot" = "1" ]; then
+    controller_args+=(--checkpoint-screenshot)
 fi
 if [ "$screenshot" = "1" ]; then
     controller_args+=(--screenshot)
@@ -471,26 +596,75 @@ try {
     } else {
         "__none__"
     }
+    $breakpointLinearArg = if ($BreakpointLinear.Trim().Length -gt 0) {
+        $BreakpointLinear
+    } else {
+        "__none__"
+    }
+    $inputScriptWsl = if ($InputScript.Trim().Length -gt 0) {
+        $resolvedInputScript = Resolve-WorkspacePath $repoRoot $InputScript
+        Convert-WindowsPathToWsl $resolvedInputScript
+    } else {
+        "__none__"
+    }
+    $resumeCheckpointScriptArg = if (
+        $ResumeCheckpointScript.Trim().Length -gt 0
+    ) {
+        $ResumeCheckpointScript
+    } else {
+        "__none__"
+    }
+    $resumeNextLinearArg = if ($ResumeNextLinear.Trim().Length -gt 0) {
+        $ResumeNextLinear
+    } else {
+        "__none__"
+    }
+    $postResumeBreakLinearArg = if (
+        $PostResumeBreakLinear.Trim().Length -gt 0
+    ) {
+        $PostResumeBreakLinear
+    } else {
+        "__none__"
+    }
+    $postResumeBreakSegmentedArg = if (
+        $PostResumeBreakSegmented.Trim().Length -gt 0
+    ) {
+        $PostResumeBreakSegmented
+    } else {
+        "__none__"
+    }
+    $postResumeBreakHitSeriesArg = if (
+        $PostResumeBreakHitSeries.Trim().Length -gt 0
+    ) {
+        $PostResumeBreakHitSeries
+    } else {
+        "__none__"
+    }
+    $postResumeNextBreakLinearArg = if (
+        $PostResumeNextBreakLinear.Trim().Length -gt 0
+    ) {
+        $PostResumeNextBreakLinear
+    } else {
+        "__none__"
+    }
+    $postResumeNextBreakSegmentedArg = if (
+        $PostResumeNextBreakSegmented.Trim().Length -gt 0
+    ) {
+        $PostResumeNextBreakSegmented
+    } else {
+        "__none__"
+    }
     $pokeFilesWsl = @(
         foreach ($spec in $PokeFile) {
-            if ($spec.StartsWith("ds:") -or $spec.StartsWith("ss:")) {
-                $parts = $spec.Split(":", 3)
-                if ($parts.Count -ne 3) {
-                    throw "PokeFile must be ds:offset:path / ss:offset:path, got '$spec'"
-                }
-                $parts[0] + ":" + $parts[1] + ":" + (Convert-WindowsPathToWsl (Resolve-Path $parts[2]).Path)
-            } else {
-                $separator = $spec.IndexOf(":")
-                if ($separator -lt 0) {
-                    throw "PokeFile must be linear:path or ds:offset:path / ss:offset:path, got '$spec'"
-                }
-                $address = $spec.Substring(0, $separator)
-                $path = $spec.Substring($separator + 1)
-                $address + ":" + (Convert-WindowsPathToWsl (Resolve-Path $path).Path)
-            }
+            Convert-PokeFileSpecToWsl $spec
         }
     )
-    & wsl.exe --exec bash $tempScriptWsl $repoRootWsl $outPathWsl $Program $mountPathWsl $DelaySeconds $StartupDelaySeconds $DumpSize $DumpSegment $keep $screenshotArg $WaitStateTimeout $WaitStateInterval $restoreRegistersWsl $haltAfterPokeArg $dumpLowMemoryArg $callNearArg $VgaSequenceFrames $VgaSequenceInterval $vgaSequenceStopSha256Arg $captureAudioArg $captureSfxOnlyArg $stateSchemaWsl $screenSignaturesWsl $toolkitRootWsl $dosboxBinaryWsl $RuntimeName $Machine $CpuType $Cycles $programArgumentsArg $VgaAddress $VgaWidth $VgaHeight @StartupKey --pokes @Poke --poke-files @pokeFilesWsl --post-restore @PostRestoreKey --wait-state @WaitState
+    $postResumePokeFilesWsl = @(
+        foreach ($spec in $PostResumePokeFile) {
+            Convert-PokeFileSpecToWsl $spec
+        }
+    )
+    & wsl.exe --exec bash $tempScriptWsl $repoRootWsl $outPathWsl $Program $mountPathWsl $DelaySeconds $StartupDelaySeconds $DumpSize $DumpSegment $keep $screenshotArg $WaitStateTimeout $WaitStateInterval $restoreRegistersWsl $haltAfterPokeArg $dumpLowMemoryArg $callNearArg $VgaSequenceFrames $VgaSequenceInterval $vgaSequenceStopSha256Arg $captureAudioArg $captureSfxOnlyArg $stateSchemaWsl $screenSignaturesWsl $toolkitRootWsl $dosboxBinaryWsl $RuntimeName $Machine $CpuType $Cycles $programArgumentsArg $VgaAddress $VgaWidth $VgaHeight $breakpointLinearArg $inputScriptWsl $resumeCheckpointScriptArg $resumeNextLinearArg $omitCheckpointVgaArg $checkpointScreenshotArg $postResumeBreakLinearArg $PostResumeBreakHitCount $postResumeBreakSegmentedArg $postResumeNextBreakLinearArg $PostResumeNextBreakHitCount $postResumeNextBreakSegmentedArg $postResumeBreakHitSeriesArg @StartupKey --pokes @Poke --poke-files @pokeFilesWsl --post-restore @PostRestoreKey --wait-state @WaitState --post-resume-poke-files @postResumePokeFilesWsl
     if ($LASTEXITCODE -ne 0) {
         throw "wsl.exe failed with exit code $LASTEXITCODE"
     }

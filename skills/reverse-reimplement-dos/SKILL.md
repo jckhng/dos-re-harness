@@ -43,6 +43,29 @@ Work in this order:
 Read [references/workflow.md](references/workflow.md) before designing a new
 project or validation harness.
 
+When locating a frontier across nearby logical ticks, capture an ordered state
+checkpoint series in one emulator run. Keep every checkpoint independently
+comparable, hash nested artifacts in the parent evidence manifest, and report
+only observed exact/divergent ticks. Do not treat a known divergence as a
+passing regression merely because it is expected.
+
+Before launching repeated Nth-hit probes at one post-resume breakpoint, batch
+the required hit ordinals into one capture. Use the harness
+`--post-resume-break-hit-series` adapter capability and decode the resulting
+`checkpoints/breakpoint_hit-*` artifacts with a target-local analyzer. Do not
+repeat full emulator startup solely to change the requested hit count.
+
+Read `capture_summary.json` or run `dos-re summarize-capture CAPTURE` before
+opening full register metadata. Load `remote_runtime_registers.json` only when
+the compact counts, hashes, final registers, and checkpoint index are
+insufficient.
+
+When an MZ import exposes only a packer or relocation stub, use the harness
+`unpack-mz` command with a pinned `mzexplode` binary. Hash the tool, packed
+input, unpacked output, and command in a private manifest. Import the unpacked
+copy for static analysis, but continue to capture and validate the pristine
+packed executable.
+
 ## Recover Behavior, Not an Approximation
 
 - Preserve integer width, overflow, signedness, fixed-point scale, truncation,
@@ -145,5 +168,7 @@ Do not tune downstream pixels while upstream state still diverges.
 - Record uncertainty instead of inventing behavior.
 - Prefer reproducible commands, manifests, hashes, and regression tests over
   narrative claims.
+- Keep unpacked executable images and their analysis databases under `.work`;
+  never substitute an unpacked derivative for pristine runtime evidence.
 - Stop and inspect the harness when repeated manual comparison produces
   contradictory conclusions.

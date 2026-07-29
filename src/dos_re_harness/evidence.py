@@ -20,9 +20,13 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def file_record(path: Path) -> dict[str, Any]:
+def file_record(path: Path, root: Path | None = None) -> dict[str, Any]:
     return {
-        "path": path.name,
+        "path": (
+            path.relative_to(root).as_posix()
+            if root is not None
+            else path.name
+        ),
         "bytes": path.stat().st_size,
         "sha256": sha256_file(path),
     }
@@ -118,6 +122,8 @@ def write_evidence_manifest(
     out_dir: Path,
     command: list[str],
     exit_code: int,
+    input_movie_path: Path | None = None,
+    input_script_path: Path | None = None,
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     schema_path = project.referenced_path("runtime.state_schema")
@@ -137,8 +143,8 @@ def write_evidence_manifest(
 
     manifest_path = out_dir / "harness_manifest.json"
     artifacts = [
-        file_record(path)
-        for path in sorted(out_dir.iterdir())
+        file_record(path, out_dir)
+        for path in sorted(out_dir.rglob("*"))
         if path.is_file() and path != manifest_path
     ]
     contracts = {
@@ -155,11 +161,20 @@ def write_evidence_manifest(
             "sha256": sha256_file(scenarios_path),
         },
     }
-    if isinstance(input_movie, str):
+    movie_path = input_movie_path
+    if movie_path is None and isinstance(input_movie, str):
         movie_path = project.resolve(input_movie)
+    if movie_path is not None:
+        movie_path = movie_path.resolve()
         contracts["input_movie"] = {
             "path": str(movie_path),
             "sha256": sha256_file(movie_path),
+        }
+    if input_script_path is not None:
+        script_path = input_script_path.resolve()
+        contracts["state_input_script"] = {
+            "path": str(script_path),
+            "sha256": sha256_file(script_path),
         }
 
     adapter = project.data.get("capture_adapter", {})
