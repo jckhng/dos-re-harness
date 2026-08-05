@@ -55,10 +55,38 @@ the required hit ordinals into one capture. Use the harness
 `checkpoints/breakpoint_hit-*` artifacts with a target-local analyzer. Do not
 repeat full emulator startup solely to change the requested hit count.
 
+When a subsystem breakpoint must be correlated with a running state series,
+use the generic concurrent side-breakpoint controls. Arm it at a state value
+that excludes startup noise and cap the number of side hits when the routine
+is high frequency:
+
+```text
+--adapter-argument resume_side_break_segmented=0x1234:0x5678
+--adapter-argument resume_side_break_start_value=1
+--adapter-argument resume_side_break_max_hits=128
+```
+
+The capture writes `side_breakpoint_trace.json` with registers and the
+correlated state field. Treat a capped trace as a prefix boundary; report the
+cap and do not claim full-route hardware parity from it.
+
+When the breakpoint ABI exposes an address/value register pair, first run the
+generic `dos-re extract-write-trace` command to produce an ordered, masked
+stream and hash. Add device- or target-specific grouping, tick correlation,
+and semantic names in a target-local analyzer.
+
 Read `capture_summary.json` or run `dos-re summarize-capture CAPTURE` before
 opening full register metadata. Load `remote_runtime_registers.json` only when
 the compact counts, hashes, final registers, and checkpoint index are
 insufficient.
+
+When a recovered subsystem has a narrow deterministic ABI, consider a
+controlled hybrid substitution: replace that routine inside a private copy or
+loaded image of the original, prove the replacement is invoked, and compare
+the pristine and substituted runs from the same resumable boundary. Read
+[references/hybrid-substitution.md](references/hybrid-substitution.md) before
+using this method. Treat it as a contract-verification ladder, not as the
+portable deliverable.
 
 When an MZ import exposes only a packer or relocation stub, use the harness
 `unpack-mz` command with a pinned `mzexplode` binary. Hash the tool, packed
@@ -78,6 +106,19 @@ packed executable.
 - Separate asset decoding from presentation logic.
 - Separate audio resource identity, codec, device remap, call timing, loop
   lifetime, and mixer behavior.
+- For Sound Blaster/OPL work, use the generic launcher’s optional
+  `-OplLogPath` and `-OplTickLinear` parameters. The pinned DOSBox-X backend
+  logger records `tick_ms,reg_hex,value_hex`; when `-OplTickLinear` names a
+  guest word containing the loop tick, it records
+  `tick_ms,loop_tick,reg_hex,value_hex` without adding a breakpoint or changing
+  guest execution. Keep the raw CSV under `.work`, compare register/value
+  order before waveform data, and record when the backend exposes only PIC
+  timestamps so that an apparent audio mismatch is not mislabelled as a
+  simulation mismatch.
+- Run `dos-re inspect-wave` on captured and portable PCM before opening or
+  embedding full sample data. Use `dos-re diff-wave` only with explicit
+  mixdown, tolerance, or frame-skip transforms, and retain those transforms
+  in the comparison report.
 - Recover shared presenters once. Reuse them for every original path that calls
   them rather than creating visually similar scene-specific replacements.
 
@@ -100,6 +141,25 @@ Check:
 
 Read [references/failure-modes.md](references/failure-modes.md) when a scene
 looks close but remains visibly or audibly wrong.
+
+For a complete route, consolidate the evidence at one logical tick boundary.
+The target capture must provide exact post-display screenshots and decoded
+state checkpoints; the portable side must provide an indexed frame sequence,
+semantic JSON series, and (when available) OPL/audio event traces.  A useful
+target-local pattern is:
+
+```text
+verify_<route>_golden_route.py
+make_<route>_logical_tick_video.py
+```
+
+The verifier should report first divergence by domain (frame/DAC, semantic
+state, audio/OPL), changed regions and palette frontier, and draw-owner
+candidates.  It must keep unresolved palette or timestamp alignment as an
+evidence frontier rather than treating it as an exact match.  The video
+renderer should key every frame to the logical tick, label the source clock,
+and emit a manifest with input hashes and encoded frame count; native capture
+timing is not a substitute for tick alignment.
 
 ## Use Controlled Warps
 

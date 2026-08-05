@@ -59,7 +59,13 @@ if ($Build) {
     }
     $forkWsl = "/mnt/{0}/{1}" -f $Matches[1].ToLowerInvariant(),
         ($Matches[2] -replace "\\", "/")
-    & wsl.exe --exec bash -lc 'cd "$1" && ./build-debug --enable-remotedebug' `
+    # Git on Windows may materialize the backend's Unix-oriented source tree
+    # with CRLF endings. Normalize only tracked text files that still contain
+    # CRLF; avoiding a rewrite of already-normalized files preserves build
+    # timestamps and keeps incremental backend rebuilds incremental. NUL
+    # delimiters keep paths with spaces safe, and the private checkout is the
+    # only tree touched.
+    & wsl.exe --exec bash -lc 'cd "$1" && git ls-files -z | xargs -0 grep -IlZ $'"'"'\r'"'"' | xargs -0 -r sed -i "s/\r$//" && ./build-debug --enable-remotedebug' `
         dos-re-build $forkWsl
     if ($LASTEXITCODE -ne 0) {
         throw "WSL DOSBox-X build failed"

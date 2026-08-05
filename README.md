@@ -464,7 +464,8 @@ dos-re summarize-capture `
 Add `--json` for compact structured output or `--out PATH` to write
 `capture_summary.json`. Large embedded input scripts and checkpoint states are
 represented by counts and SHA-256 identities; the original evidence remains
-unchanged.
+unchanged. PCM WAV files below the capture directory are indexed with their
+hash, format, duration, peak, DC offset, RMS, and per-channel metrics.
 
 Capture-adapter configuration values and scenario arguments can be overridden
 without editing a tracked scenario:
@@ -480,6 +481,30 @@ Each `NAME` must already be declared in the adapter `configuration` or the
 selected scenario's `arguments`. Command-line values override scenario values,
 which override adapter defaults. The rendered command records the effective
 values in the evidence manifest.
+
+Preflight a changed state-input-script tail before starting DOSBox-X:
+
+```powershell
+.\scripts\dos-re.ps1 plan-state-tail `
+    projects\example\project.json gameplay `
+    --previous-input-script projects\example\.work\routes\v1.input.script `
+    --input-script projects\example\.work\routes\v2.input.script `
+    --resume-from projects\example\.work\captures\prior\checkpoints\tick-500 `
+    --checkpoint-value 500 --end-value 650 `
+    --state-field tick --breakpoint 0x850c `
+    --movie projects\example\.work\movies\resume.movie.json `
+    --capture-out projects\example\.work\captures\tail-v2 `
+    --transition-breakpoint 0x1234:0x5678 `
+    --transition-out projects\example\.work\captures\tail-v2-transition `
+    --out projects\example\.work\plans\tail-v2.json
+```
+
+The planner does not launch the backend. It validates the project, scenario,
+scripts, tick-1 bootstrap movie, snapshot dump size, registers, output-path
+freshness, adapter argument names, and transition address. Its JSON records
+the first input-state difference and ready-to-run `capture_cli_args` for the
+continuous tail and optional transition probe. Pass `--allow-existing-output`
+only when intentionally reusing retained evidence.
 
 ## Generic State Tools
 
@@ -654,6 +679,16 @@ address, `breakso:<segment>:<offset>` packs the two 16-bit components without
 assuming that the packet accepts a physical linear address.
 `breaksonth:<segment>:<offset>:<positive-hit-count>` combines that packed
 address form with deterministic nth-hit stopping.
+`runfor:<positive-seconds>` resumes an already halted guest for a bounded
+host duration and re-halts it. This is intended for cleanup after an exact
+checkpoint, such as allowing a DOS program to exit and finalize native
+capture files; it is not an emulated-tick synchronization primitive.
+
+The generic WSL launcher also accepts `-CaptureVideo`. It wraps the configured
+DOS program with DOSBox-X `DX-CAPTURE /V`, leaving the resulting native AVI in
+the capture directory where the ordinary evidence manifest hashes it. Targets
+must still provide an explicit post-checkpoint exit path so the AVI is
+finalized. Declare this backend feature as `video.capture`.
 
 `scenarios.json` contains deterministic startup actions, state predicates, and
 adapter arguments. Reusable actions can be placed in a versioned
@@ -690,6 +725,45 @@ Compare two raw 320x200 indexed framebuffers and write a PGM difference image:
     --json captures\diff.json `
     --diff captures\diff.pgm
 ```
+
+Inspect a PCM WAV without adding an audio dependency:
+
+```powershell
+.\dos-re-harness\scripts\dos-re.ps1 inspect-wave `
+    captures\original\program_000.wav `
+    --out captures\original\program_000.wave.json
+```
+
+Compare original and portable PCM. The default is exact, frame-aligned sample
+comparison. Explicit mixdown, sample tolerance, and leading-frame skips are
+available for controlled diagnostic comparisons:
+
+```powershell
+.\dos-re-harness\scripts\dos-re.ps1 diff-wave `
+    captures\original\program_000.wav `
+    captures\reimpl\program.wav `
+    --mixdown `
+    --sample-tolerance 2 `
+    --out captures\audio-diff.json
+```
+
+Extract a stable register-pair stream from one-process
+`breakpoint_hit-N` checkpoints. The target chooses the breakpoint and ABI;
+the generic extractor masks, orders, hashes, and serializes the observed
+pairs:
+
+```powershell
+.\dos-re-harness\scripts\dos-re.ps1 extract-write-trace `
+    captures\original\device-writes `
+    --address-register ebx `
+    --value-register ecx `
+    --address-mask 0xff `
+    --value-mask 0xff `
+    --out captures\original\device-writes.json
+```
+
+Device-specific register classification, game ticks, driver addresses, and
+semantic labels remain in the target adapter.
 
 ## Ghidra Queries
 
@@ -732,8 +806,8 @@ Before publishing it independently:
    supply unattended original-binary CI captures. The examples roadmap is in
    `docs/examples-roadmap.md`.
 2. Add a reproducible backend build job and corresponding-source archive.
-3. Add target-independent temporal video and audio comparators to the toolkit
-   CLI.
+3. Add a target-independent temporal video comparator. PCM audio inspection
+   and waveform comparison are already available in the toolkit CLI.
 4. Add emulated-tick input recording and replay.
 5. Add native-Windows backend support only if its GDB/QMP behavior passes the
    same contract suite.

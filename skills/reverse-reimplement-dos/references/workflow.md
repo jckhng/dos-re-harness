@@ -135,6 +135,13 @@ Wall-clock sleeps are a fallback, not deterministic replay. Move repeated
 sequences into versioned input movies. For strict parity, tie input changes to
 emulated ticks or explicit state transitions.
 
+For DOSBox-X screenshot side effects, treat an empty QMP payload or a newly
+created zero-byte PNG as missing evidence. Snapshot the root PNG baseline
+before any VRAM dump that can trigger the backend encoder, then accept a
+deferred side effect only after its size is nonzero and stable. Emit a
+per-checkpoint hash/provenance manifest so a later verifier can distinguish
+complete image evidence from a transient file race.
+
 Capture registers and segment bases with memory. In real mode, record whether
 addresses are segment-relative or linear. Do not compare a DS-relative field
 against an absolute rewrite address.
@@ -166,7 +173,30 @@ dos-re summarize-capture projects/target/.work/captures/probe
 
 Use `--json` for the compact structured form or `--out PATH` to materialize
 it. The summary hashes large embedded input scripts and state records instead
-of expanding them. The full evidence remains authoritative on disk.
+of expanding them. Captured PCM WAVs are summarized by hash, format, duration,
+peak, DC offset, RMS, and per-channel metrics. The full evidence remains
+authoritative on disk.
+
+If a breakpoint series exposes a hardware or subsystem write ABI as two
+registers, extract its ordered masked pairs with:
+
+```text
+dos-re extract-write-trace CAPTURE \
+  --address-register ebx --value-register ecx \
+  --address-mask 0xff --value-mask 0xff --out writes.json
+```
+
+Keep the breakpoint address, game-state correlation, device register groups,
+and semantic interpretation target-local.
+
+Before recapturing a changed file-backed route, run the generic
+`plan-state-tail` preflight. Give it the previous and current scripts, the
+nearest verified snapshot at or before the first changed input value, the
+continuous end value, the tick-1 bootstrap movie, and an optional transition
+breakpoint. The plan must validate the snapshot size, registers, bootstrap
+breakpoint removal, fresh outputs, and adapter argument names before DOSBox-X
+starts. Keep comparison commands and semantic breakpoint meanings
+target-local.
 
 ## 5. Compatibility Core
 
@@ -199,6 +229,12 @@ as an earlier state, RNG, or scheduling mismatch.
 
 When a mismatch is intermittent, capture hidden scheduling fields and the full
 RNG path before adjusting timing constants.
+
+For a deterministic subsystem with a recovered ABI, hybrid substitution may
+add a second boundary check: replace the routine inside a private original
+image, prove it is invoked, and compare against a pristine run from the same
+state. Follow `hybrid-substitution.md`. This closes a subsystem contract but
+does not replace standalone portable validation.
 
 ## 7. Scripted Presentation
 
@@ -249,6 +285,12 @@ alarm, or ambience sound to a scene-entry one-shot.
 When IDs remain ambiguous, export isolated WAV candidates with hashes and ask a
 human to label them. Record that identification as evidence rather than
 repeatedly guessing by ear.
+
+Use `dos-re inspect-wave FILE.wav` for compact PCM format and signal evidence.
+Use `dos-re diff-wave EXPECTED.wav ACTUAL.wav` for frame-aligned comparison.
+Mixdown, tolerance, and frame skips are diagnostic transforms and must be
+explicit in the command and retained in its JSON result. Do not treat a
+correlated waveform as proof of correct event routing or lifetime.
 
 ## 9. Portability
 

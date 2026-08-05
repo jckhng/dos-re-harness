@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .audio import summarize_wave
+
 
 SUMMARY_NAME = "capture_summary.json"
 REGISTER_METADATA_NAME = "remote_runtime_registers.json"
@@ -151,8 +153,28 @@ def build_capture_summary(capture_dir: Path) -> dict[str, Any]:
                 "sha256": _file_sha256(path),
             }
         )
+    audio = []
+    for path in sorted(capture_dir.rglob("*.wav")):
+        item = summarize_wave(path)
+        item["path"] = _display_path(capture_dir, path.resolve())
+        audio.append(item)
 
     break_state = _compact_break_state(metadata.get("break_state"))
+    screenshot_provenance_path = capture_dir / "screenshot-provenance-v1.json"
+    screenshot_provenance = None
+    if screenshot_provenance_path.is_file():
+        provenance = json.loads(
+            screenshot_provenance_path.read_text(encoding="utf-8")
+        )
+        screenshot_provenance = {
+            "path": screenshot_provenance_path.name,
+            "size": screenshot_provenance_path.stat().st_size,
+            "sha256": _file_sha256(screenshot_provenance_path),
+            "status": provenance.get("status", "complete"),
+            "tick_count": provenance.get("tick_count", 0),
+            "valid_png_count": provenance.get("valid_png_count", 0),
+            "nonempty_count": provenance.get("nonempty_count", 0),
+        }
     post_resume_hits = 0
     if isinstance(break_state, dict):
         series = break_state.get("post_resume_breakpoint_series")
@@ -170,8 +192,11 @@ def build_capture_summary(capture_dir: Path) -> dict[str, Any]:
         "counts": {
             "state_checkpoints": len(compact_checkpoints),
             "post_resume_hits": post_resume_hits,
+            "wave_files": len(audio),
         },
         "artifacts": artifacts,
+        "screenshot_provenance": screenshot_provenance,
+        "audio": audio,
         "source": {
             "path": REGISTER_METADATA_NAME,
             "size": metadata_path.stat().st_size,
@@ -211,8 +236,12 @@ def format_capture_summary_line(summary: dict[str, Any]) -> str:
     eip = int(registers.get("eip", 0))
     state_checkpoints = int(counts.get("state_checkpoints", 0))
     post_resume_hits = int(counts.get("post_resume_hits", 0))
-    return (
+    result = (
         f"CAPTURE stop={stop} cs={cs:04x} eip={eip:08x} "
         f"state_checkpoints={state_checkpoints} "
         f"post_resume_hits={post_resume_hits}"
     )
+    wave_files = int(counts.get("wave_files", 0))
+    if wave_files:
+        result += f" wave_files={wave_files}"
+    return result

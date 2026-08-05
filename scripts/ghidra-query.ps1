@@ -1,6 +1,22 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("decompile", "instructions", "xrefs", "functions", "programs", "scalar", "custom")]
+    [ValidateSet(
+        "decompile",
+        "instructions",
+        "xrefs",
+        "functions",
+        "programs",
+        "scalar",
+        "instruction-text",
+        "memory-range-refs",
+        "bytes-and-callers",
+        "bulk-copy",
+        "dump-range",
+        "direct-offset",
+        "raw-string",
+        "defined-string",
+        "custom"
+    )]
     [string]$Query,
     [Parameter(Mandatory = $true)]
     [string]$GhidraHeadless,
@@ -33,6 +49,14 @@ $script = switch ($Query) {
     "functions" { "ListFunctionsStdout.java" }
     "programs" { "ListProgramsStdout.java" }
     "scalar" { "FindScalarUsage.java" }
+    "instruction-text" { "FindInstructionText.java" }
+    "memory-range-refs" { "FindMemoryRangeRefs.java" }
+    "bytes-and-callers" { "FindBytesAndCallers.java" }
+    "bulk-copy" { "FindBulkCopyPatterns.java" }
+    "dump-range" { "DumpRangeStdout.java" }
+    "direct-offset" { "FindDirectOffsetUsage.java" }
+    "raw-string" { "FindRawStringUsage.java" }
+    "defined-string" { "FindStringUsage.java" }
     "custom" {
         if ([string]::IsNullOrWhiteSpace($CustomScript)) {
             throw "-CustomScript is required when -Query custom is selected"

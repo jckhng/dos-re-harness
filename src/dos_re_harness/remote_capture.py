@@ -579,6 +579,18 @@ def parse_screen_wait_action(
     return parts[1], timeout, poll_interval
 
 
+def parse_run_for_action(action: str) -> float:
+    parts = action.split(":")
+    if len(parts) != 2 or parts[0] != "runfor":
+        raise ValueError(
+            f"runfor action syntax: runfor:<positive-seconds>, got {action!r}"
+        )
+    seconds = float(parts[1])
+    if seconds <= 0:
+        raise ValueError("runfor duration must be positive")
+    return seconds
+
+
 def wait_for_qmp_screen(
     qmp: Any,
     classifier: Any,
@@ -709,12 +721,40 @@ class QmpClient:
             raise RuntimeError(f"QMP memdump did not return base64 data: {response}")
         return base64.b64decode(payload)
 
+    def dacdump(self) -> dict[str, Any]:
+        response = self.command("dacdump")
+        result = response.get("return")
+        if not isinstance(result, dict):
+            raise RuntimeError(f"QMP dacdump did not return an object: {response}")
+        payload = result.get("data")
+        if not isinstance(payload, str):
+            raise RuntimeError(f"QMP dacdump did not return base64 data: {response}")
+        data = base64.b64decode(payload)
+        if len(data) != 256 * 3:
+            raise RuntimeError(
+                "QMP dacdump returned an unexpected palette size: "
+                f"{len(data)}"
+            )
+        return {
+            "data": data,
+            "bits": int(result.get("bits", 0)),
+            "pel_mask": int(result.get("pel_mask", 0)),
+            "pel_index": int(result.get("pel_index", 0)),
+            "state": int(result.get("state", 0)),
+            "write_index": int(result.get("write_index", 0)),
+            "read_index": int(result.get("read_index", 0)),
+            "first_changed": int(result.get("first_changed", 0)),
+        }
+
     def screendump(self) -> bytes:
         response = self.command("screendump")
         payload = response.get("return", {}).get("data")
         if not isinstance(payload, str):
             raise RuntimeError(f"QMP screendump did not return base64 data: {response}")
-        return base64.b64decode(payload)
+        data = base64.b64decode(payload)
+        if not data:
+            raise RuntimeError(f"QMP screendump returned an empty payload: {response}")
+        return data
 
     def save_state(
         self,
@@ -933,8 +973,11 @@ def recover_checkpoint_screenshot_side_effects(
     for record, source in zip(requested, side_effects):
         checkpoint = Path(record["path"])
         destination = checkpoint / "remote_runtime_screen.png"
+        data = _read_stable_nonempty_file(source, timeout_seconds)
+        if data is None:
+            return recovered
         if not destination.exists():
-            destination.write_bytes(source.read_bytes())
+            destination.write_bytes(data)
             recovered += 1
         metadata_path = checkpoint / "remote_runtime_registers.json"
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -955,6 +998,103 @@ def recover_checkpoint_screenshot_side_effects(
         record["screenshot_exact_checkpoint"] = False
         record["screenshot_deferred_side_effect"] = True
     return recovered
+
+
+def _read_stable_nonempty_file(
+    path: Path,
+    timeout_seconds: float = 1.0,
+) -> bytes | None:
+    """Read a backend side-effect file after its writer has finished.
+
+    DOSBox-X can create the PNG directory entry before its encoder has
+    flushed the contents.  Treating that transient zero-byte file as a
+    screenshot permanently loses the frame, so require a nonzero size that is
+    unchanged across a short observation interval.
+    """
+    if timeout_seconds <= 0:
+        try:
+            data = path.read_bytes()
+        except FileNotFoundError:
+            return None
+        return data or None
+    deadline = time.monotonic() + timeout_seconds
+    previous_size: int | None = None
+    while time.monotonic() < deadline:
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            time.sleep(0.02)
+            continue
+        if size > 0 and size == previous_size:
+            data = path.read_bytes()
+            if data:
+                return data
+        previous_size = size
+        time.sleep(0.02)
+    return None
+
+
+def write_screenshot_provenance_manifest(
+    out_dir: Path,
+    state_checkpoints: list[dict[str, Any]],
+) -> Path | None:
+    """Persist machine-readable provenance for checkpoint PNGs.
+
+    This is intentionally backend-agnostic: it records the checkpoint image
+    hash and corroborating root side-effect hashes without assuming that a
+    direct QMP response or a deferred side effect was used for a particular
+    tick.
+    """
+    records: list[dict[str, Any]] = []
+    root_hashes: dict[str, list[str]] = {}
+    for source in sorted(out_dir.glob("*.png")):
+        data = source.read_bytes()
+        root_hashes.setdefault(hashlib.sha256(data).hexdigest(), []).append(
+            source.name
+        )
+    for checkpoint in state_checkpoints:
+        checkpoint_path = Path(str(checkpoint["path"]))
+        destination = checkpoint_path / "remote_runtime_screen.png"
+        if not destination.is_file():
+            continue
+        data = destination.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        records.append(
+            {
+                "tick": int(checkpoint.get("value", len(records) + 1)),
+                "destination": str(destination),
+                "destination_sha256": digest,
+                "destination_size": len(data),
+                "valid_png": data.startswith(b"\x89PNG\r\n\x1a\n"),
+                "matching_root_side_effects": root_hashes.get(digest, []),
+                "root_match_count": len(root_hashes.get(digest, [])),
+            }
+        )
+    if not records:
+        return None
+    manifest = out_dir / "screenshot-provenance-v1.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "capture": str(out_dir),
+                "tick_count": len(records),
+                "valid_png_count": sum(item["valid_png"] for item in records),
+                "nonempty_count": sum(item["destination_size"] > 0 for item in records),
+                "root_side_effect_count": len(list(out_dir.glob("*.png"))),
+                "root_hash_match_ticks": sum(
+                    item["root_match_count"] > 0 for item in records
+                ),
+                "method": "stable_nonempty_post_display_screenshot_with_root_side_effect_hash_crosscheck",
+                "ticks": records,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return manifest
 
 
 def write_state_checkpoint(
@@ -1087,6 +1227,217 @@ def write_state_checkpoint(
         ),
         "screenshot_deferred_side_effect": False,
     }
+
+
+def capture_post_display_screenshot(
+    gdb: RspClient,
+    qmp: QmpClient,
+    timeout: float,
+    post_break_segmented: tuple[int, int],
+    poke_linear: int,
+    poke_bytes: bytes,
+    checkpoint_record: dict[str, Any],
+    delay: float,
+    *,
+    primary_breakpoint_installed: bool = True,
+) -> None:
+    """Freeze the just-completed display pass and capture a running screenshot.
+
+    DOSBox-X's QMP screendump is not reliable while the guest is stopped in
+    its GDB loop.  The caller is halted at the state boundary.  We therefore
+    step off that boundary, stop at a display-complete instruction, replace
+    that instruction with a self-loop while the emulator is running, and
+    screendump the frozen frame.  The original bytes and boundary breakpoint
+    are restored before returning so a checkpoint series can continue.
+    """
+    segment, offset = post_break_segmented
+    post_backend = pack_segment_offset(segment, offset)
+    post_linear = (segment << 4) + offset
+    primary = checkpoint_record.get("primary_breakpoint")
+    if not isinstance(primary, int):
+        raise ValueError("post-display capture requires primary breakpoint")
+    if primary_breakpoint_installed:
+        gdb.remove_breakpoint(primary)
+        gdb.step_nowait()
+        gdb.wait_for_stop(timeout)
+    gdb.insert_breakpoint(post_backend)
+    gdb.continue_nowait()
+    gdb.wait_for_stop(timeout)
+    gdb.remove_breakpoint(post_backend)
+    original = gdb.read_memory(poke_linear, len(poke_bytes))
+    metadata_path = Path(checkpoint_record["path"]) / "remote_runtime_registers.json"
+    checkpoint_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    screenshot_path = Path(checkpoint_record["path"]) / "remote_runtime_screen.png"
+    screenshot_error: RuntimeError | None = None
+    screenshot_deferred_side_effect = False
+    post_display_state_error: Exception | None = None
+    post_display_state: dict[str, Any] | None = None
+    try:
+        gdb.write_memory(poke_linear, poke_bytes)
+        gdb.continue_nowait()
+        time.sleep(delay)
+        out_dir = Path(checkpoint_record["path"]).parent.parent
+        # DOSBox-X may emit its deferred root PNG while servicing the VRAM
+        # memdump.  Snapshot the baseline before that request so an empty
+        # screendump response can recover the side effect deterministically.
+        before_screens = set(out_dir.glob("*.png"))
+        qmp.memdump(0xA0000, 320 * 200)
+        screenshot_data: bytes | None = None
+        for attempt in range(3):
+            try:
+                screenshot_data = qmp.screendump()
+                if not screenshot_data:
+                    raise RuntimeError(
+                        "QMP screendump returned an empty decoded payload"
+                    )
+                screenshot_error = None
+                break
+            except RuntimeError as exc:
+                screenshot_error = exc
+                side_effects = sorted(
+                    (
+                        path
+                        for path in out_dir.glob("*.png")
+                        if path not in before_screens
+                    ),
+                    key=lambda path: path.stat().st_mtime_ns,
+                )
+                for side_effect in reversed(side_effects):
+                    screenshot_data = _read_stable_nonempty_file(
+                        side_effect,
+                        timeout_seconds=1.0,
+                    )
+                    if screenshot_data is None:
+                        continue
+                    screenshot_error = None
+                    screenshot_deferred_side_effect = True
+                    print(
+                        "post-display: recovered deferred screendump side effect",
+                        flush=True,
+                    )
+                    break
+                time.sleep(0.1)
+        if screenshot_data is None:
+            raise screenshot_error or RuntimeError("post-display screendump failed")
+        screenshot_path.write_bytes(screenshot_data)
+    finally:
+        gdb.halt(timeout)
+        # The primary checkpoint dump is taken before the display pass.  The
+        # running self-loop is a separate, exact post-display boundary; retain
+        # its canonical data segment and registers so semantic comparisons can
+        # use the same boundary as the framebuffer instead of mixing phases.
+        try:
+            post_registers = gdb.registers()
+            dump_segment_name = str(
+                checkpoint_metadata.get("dump_segment", "ds")
+            )
+            dump_segment = post_registers[dump_segment_name] & 0xFFFF
+            dump_size = int(checkpoint_metadata.get("dump_size", 0x10000))
+            post_dump = qmp.memdump(dump_segment << 4, dump_size)
+            checkpoint_path = Path(checkpoint_record["path"])
+            post_dump_path = checkpoint_path / "remote_runtime_post_display_ds.bin"
+            post_dump_path.write_bytes(post_dump)
+            dac = qmp.dacdump()
+            post_dac_path = checkpoint_path / "remote_runtime_post_display_dac.bin"
+            post_dac_path.write_bytes(dac["data"])
+            post_display_state = {
+                "registers": post_registers,
+                "dump_segment": dump_segment_name,
+                "dump_segment_value": dump_segment,
+                "ds_linear": dump_segment << 4,
+                "dump": str(post_dump_path),
+                "dump_size": len(post_dump),
+                "stop": "post-display-self-loop",
+                "dac": {
+                    "dump": str(post_dac_path),
+                    "size": len(dac["data"]),
+                    "bits": dac["bits"],
+                    "pel_mask": dac["pel_mask"],
+                    "pel_index": dac["pel_index"],
+                    "state": dac["state"],
+                    "write_index": dac["write_index"],
+                    "read_index": dac["read_index"],
+                    "first_changed": dac["first_changed"],
+                },
+            }
+            post_registers_path = (
+                checkpoint_path / "remote_runtime_post_display_registers.json"
+            )
+            post_registers_path.write_text(
+                json.dumps(post_display_state, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            post_display_state["registers_file"] = str(post_registers_path)
+        except Exception as exc:  # restore the executable even if dumping fails
+            post_display_state_error = exc
+        gdb.write_memory(poke_linear, original)
+        if primary_breakpoint_installed:
+            gdb.insert_breakpoint(primary)
+    if screenshot_error is not None:
+        raise screenshot_error
+    if post_display_state_error is not None:
+        raise RuntimeError("post-display state dump failed") from post_display_state_error
+    checkpoint_record.update(
+        {
+            "screenshot": str(screenshot_path),
+            "screenshot_exact_checkpoint": True,
+            "screenshot_post_display_breakpoint": f"{segment:04x}:{offset:04x}",
+            "screenshot_post_display_linear": post_linear,
+            "screenshot_poke": {
+                "address": poke_linear,
+                "bytes": poke_bytes.hex(),
+                "restored": original.hex(),
+            },
+            "screenshot_deferred_side_effect": screenshot_deferred_side_effect,
+            "post_display_state": post_display_state,
+        }
+    )
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.update(
+        {
+            "screenshot": str(screenshot_path),
+            "screenshot_error": None,
+            "screenshot_exact_checkpoint": True,
+            "screenshot_post_display_breakpoint": f"{segment:04x}:{offset:04x}",
+            "screenshot_post_display_linear": post_linear,
+            "screenshot_poke": checkpoint_record["screenshot_poke"],
+            "screenshot_deferred_side_effect": screenshot_deferred_side_effect,
+            "post_display_state": post_display_state,
+        }
+    )
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def capture_configured_post_display(
+    gdb: RspClient,
+    qmp: QmpClient,
+    timeout: float,
+    post_display_break: tuple[int, int] | None,
+    post_display_poke: tuple[int, bytes] | None,
+    checkpoint_record: dict[str, Any],
+    primary_breakpoint: int,
+    delay: float,
+    *,
+    primary_breakpoint_installed: bool = True,
+) -> None:
+    """Capture the configured post-display boundary for any checkpoint mode."""
+    if post_display_break is None or post_display_poke is None:
+        return
+    checkpoint_record["primary_breakpoint"] = primary_breakpoint
+    capture_post_display_screenshot(
+        gdb,
+        qmp,
+        timeout,
+        post_display_break,
+        post_display_poke[0],
+        post_display_poke[1],
+        checkpoint_record,
+        delay,
+        primary_breakpoint_installed=primary_breakpoint_installed,
+    )
 
 
 def parse_poke(spec: str, regs: dict[str, int]) -> tuple[int, bytes]:
@@ -1597,6 +1948,26 @@ def resumed_state_script_plan(
     capture_values: list[int],
     events: list[tuple[int, bool, list[str]]],
 ) -> tuple[list[int], list[tuple[int, bool, list[str]]]]:
+    observed_values, resumed_events, initial_held = (
+        resumed_state_script_plan_with_held(capture_values, events)
+    )
+    if initial_held:
+        raise ValueError(
+            "resumed state input scripts require a neutral keyboard boundary; "
+            f"held before {capture_values[0]}: "
+            f"{', '.join(initial_held)}"
+        )
+    return observed_values, resumed_events
+
+
+def resumed_state_script_plan_with_held(
+    capture_values: list[int],
+    events: list[tuple[int, bool, list[str]]],
+) -> tuple[
+    list[int],
+    list[tuple[int, bool, list[str]]],
+    list[str],
+]:
     if (
         not capture_values
         or any(
@@ -1618,11 +1989,6 @@ def resumed_state_script_plan(
                 held.add(qcode)
             else:
                 held.remove(qcode)
-    if held:
-        raise ValueError(
-            "resumed state input scripts require a neutral keyboard boundary; "
-            f"held before {first_value}: {', '.join(sorted(held))}"
-        )
     resumed_events = [
         event
         for event in events
@@ -1631,6 +1997,7 @@ def resumed_state_script_plan(
     return (
         merged_state_script_values(capture_values, resumed_events),
         resumed_events,
+        sorted(held),
     )
 
 
@@ -1644,6 +2011,7 @@ def resumed_state_checkpoint_plan(
     list[int],
     int,
     list[tuple[int, bool, list[str]]],
+    list[str],
 ]:
     if action.startswith("checkpointstate:"):
         linear_address, field_name, capture_values, max_hits = (
@@ -1656,14 +2024,14 @@ def resumed_state_checkpoint_plan(
             capture_values,
             max_hits,
             [],
+            [],
         )
     if action.startswith("checkpointstatescriptfile:"):
         linear_address, field_name, capture_values, max_hits = (
             parse_state_checkpoint_script_file_action(action)
         )
-        observed_values, resumed_events = resumed_state_script_plan(
-            capture_values,
-            events,
+        observed_values, resumed_events, initial_held = (
+            resumed_state_script_plan_with_held(capture_values, events)
         )
         return (
             linear_address,
@@ -1672,6 +2040,7 @@ def resumed_state_checkpoint_plan(
             observed_values,
             max_hits,
             resumed_events,
+            initial_held,
         )
     raise ValueError(
         "resume checkpoint action must be checkpointstate or "
@@ -1755,19 +2124,64 @@ def stop_on_state_checkpoints(
     ],
     after_capture: Callable[[int], None] | None = None,
     initially_halted: bool = False,
+    side_breakpoint: tuple[int, int] | None = None,
+    side_capture: Callable[
+        [int, str, dict[str, int]],
+        None,
+    ] | None = None,
+    side_max_hits: int | None = None,
+    side_start_value: int | None = None,
 ) -> tuple[str, dict[str, int], dict[str, int], int]:
     if not values:
         raise ValueError("state checkpoint values must not be empty")
     if max_hits < 1:
         raise ValueError("state checkpoint maximum hit count must be positive")
+    if side_breakpoint is not None and side_capture is None:
+        raise ValueError("side breakpoint requires a capture callback")
+    if side_max_hits is not None and side_max_hits < 1:
+        raise ValueError("side breakpoint maximum hit count must be positive")
+    if side_max_hits is not None and side_breakpoint is None:
+        raise ValueError("side breakpoint maximum requires a side breakpoint")
+    if side_start_value is not None and side_start_value < 0:
+        raise ValueError("side breakpoint start value must be non-negative")
+    if side_start_value is not None and side_breakpoint is None:
+        raise ValueError("side breakpoint start requires a side breakpoint")
+    if side_breakpoint is not None and side_breakpoint[0] == linear_address:
+        raise ValueError("side breakpoint must differ from state checkpoint")
     if not initially_halted:
         gdb.halt(timeout)
     gdb.insert_breakpoint(linear_address)
+    if side_breakpoint is not None:
+        side_backend_address, side_expected_eip = side_breakpoint
+        side_active = side_start_value is None
+        if side_active:
+            gdb.insert_breakpoint(side_backend_address)
+    else:
+        side_backend_address = side_expected_eip = None
+        side_active = False
+    side_exhausted = False
     next_value_index = 0
-    for hit_index in range(1, max_hits + 1):
+    primary_hit_index = 0
+    side_hit_index = 0
+    while primary_hit_index < max_hits:
         gdb.continue_nowait()
         stop = gdb.wait_for_stop(timeout)
         registers = gdb.registers()
+        if side_active and registers["eip"] == side_expected_eip:
+            side_hit_index += 1
+            side_capture(side_hit_index, stop, registers)
+            if side_max_hits is not None and side_hit_index >= side_max_hits:
+                gdb.remove_breakpoint(side_backend_address)
+                side_active = False
+                side_backend_address = None
+                side_exhausted = True
+                continue
+            gdb.remove_breakpoint(side_backend_address)
+            gdb.step_nowait()
+            gdb.wait_for_stop(timeout)
+            gdb.insert_breakpoint(side_backend_address)
+            continue
+        primary_hit_index += 1
         state = read_state(registers)
         if field_name not in state:
             raise ValueError(
@@ -1775,13 +2189,31 @@ def stop_on_state_checkpoints(
             )
         value = values[next_value_index]
         if state[field_name] == value:
-            capture_match(value, stop, registers, state, hit_index)
+            capture_match(
+                value,
+                stop,
+                registers,
+                state,
+                primary_hit_index,
+            )
             if after_capture is not None:
                 after_capture(value)
             next_value_index += 1
             if next_value_index == len(values):
-                return stop, registers, state, hit_index
-        if hit_index < max_hits:
+                if side_active and side_backend_address is not None:
+                    gdb.remove_breakpoint(side_backend_address)
+                return stop, registers, state, primary_hit_index
+        if (
+            not side_active
+            and not side_exhausted
+            and side_breakpoint is not None
+            and side_start_value is not None
+            and state[field_name] >= side_start_value
+        ):
+            side_backend_address, side_expected_eip = side_breakpoint
+            gdb.insert_breakpoint(side_backend_address)
+            side_active = True
+        if primary_hit_index < max_hits:
             gdb.remove_breakpoint(linear_address)
             gdb.step_nowait()
             gdb.wait_for_stop(timeout)
@@ -1862,6 +2294,7 @@ def main() -> int:
             "waitvga:<state>:<s>[:<interval>], "
             "waitnotvga:<state>:<s>[:<interval>], "
             "drivevga:<state>:<timeout>:<qcode>[:hold][:interval], "
+            "runfor:<positive-seconds>, "
             "hold:<qcode>:<s>, tap:<qcode>[:s], keydown:<qcode>, keyup:<qcode>, "
              "break:<linear-address>, "
              "breaknth:<linear-address>:<positive-hit-count>, "
@@ -1910,7 +2343,8 @@ def main() -> int:
             "checkpointstate:<linear-address>:<field>:"
             "<value>[+<value>...]:<positive-maximum-hit-count>, or "
             "checkpointstatescriptfile with the same fields. The latter "
-            "requires --input-script and a neutral keyboard boundary."
+            "requires --input-script; held keys at the resume boundary are "
+            "derived from earlier script events and restored automatically."
         ),
     )
     parser.add_argument(
@@ -1919,6 +2353,35 @@ def main() -> int:
         help=(
             "Known next instruction after the resume bootstrap clears its "
             "breakpoint. Required with --resume-checkpoint-script."
+        ),
+    )
+    parser.add_argument(
+        "--state-side-break-segmented",
+        "--resume-side-break-segmented",
+        "--checkpoint-side-break-segmented",
+        dest="state_side_break_segmented",
+        help=(
+            "While a state checkpoint loop runs, trace a second real-mode "
+            "<segment>:<offset> breakpoint and associate each hit with the "
+            "current checkpoint state."
+        ),
+    )
+    parser.add_argument(
+        "--state-side-break-max-hits",
+        type=int,
+        default=0,
+        help=(
+            "Stop tracing the side breakpoint after this many hits while "
+            "continuing the primary state checkpoint loop; zero is unlimited."
+        ),
+    )
+    parser.add_argument(
+        "--state-side-break-start-value",
+        type=int,
+        default=0,
+        help=(
+            "Arm the side breakpoint only after the primary state field "
+            "reaches this value; zero arms it immediately."
         ),
     )
     parser.add_argument(
@@ -2025,6 +2488,26 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--checkpoint-post-display-break-segmented",
+        help=(
+            "For each state checkpoint, capture an exact running screenshot "
+            "after resuming to this <segment>:<offset> display boundary."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-post-display-poke",
+        help=(
+            "Linear address and hex bytes for the temporary self-loop used "
+            "by --checkpoint-post-display-break-segmented."
+        ),
+    )
+    parser.add_argument(
+        "--checkpoint-post-display-delay",
+        type=float,
+        default=0.05,
+        help="Seconds to run the post-display self-loop before screendump.",
+    )
+    parser.add_argument(
         "--checkpoint-save-state",
         action="store_true",
         help=(
@@ -2094,6 +2577,26 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+    post_display_break = (
+        parse_segmented_address(args.checkpoint_post_display_break_segmented)
+        if args.checkpoint_post_display_break_segmented
+        else None
+    )
+    post_display_poke: tuple[int, bytes] | None = None
+    if args.checkpoint_post_display_poke:
+        poke_parts = args.checkpoint_post_display_poke.split(":", 1)
+        if len(poke_parts) != 2:
+            parser.error("--checkpoint-post-display-poke requires ADDRESS:HEX")
+        post_display_poke = (int(poke_parts[0], 0), bytes.fromhex(poke_parts[1]))
+        if not post_display_poke[1]:
+            parser.error("--checkpoint-post-display-poke bytes must not be empty")
+    if (post_display_break is None) != (post_display_poke is None):
+        parser.error(
+            "--checkpoint-post-display-break-segmented and "
+            "--checkpoint-post-display-poke must be supplied together"
+        )
+    if args.checkpoint_post_display_delay <= 0:
+        parser.error("--checkpoint-post-display-delay must be positive")
     post_resume_break_hit_series = (
         parse_breakpoint_hit_series(args.post_resume_break_hit_series)
         if args.post_resume_break_hit_series is not None
@@ -2107,6 +2610,25 @@ def main() -> int:
     post_resume_next_break_segmented = (
         parse_segmented_address(args.post_resume_next_break_segmented)
         if args.post_resume_next_break_segmented is not None
+        else None
+    )
+    state_side_break_segmented = (
+        parse_segmented_address(args.state_side_break_segmented)
+        if args.state_side_break_segmented is not None
+        else None
+    )
+    state_side_break_max_hits = (
+        args.state_side_break_max_hits
+        if args.state_side_break_max_hits > 0
+        else None
+    )
+    if args.state_side_break_max_hits < 0:
+        parser.error("--state-side-break-max-hits must be non-negative")
+    if args.state_side_break_start_value < 0:
+        parser.error("--state-side-break-start-value must be non-negative")
+    state_side_break_start_value = (
+        args.state_side_break_start_value
+        if args.state_side_break_start_value > 0
         else None
     )
     wait_predicates = [parse_state_predicate(spec) for spec in args.wait_state]
@@ -2346,6 +2868,7 @@ def main() -> int:
         wait_state_match: dict[str, Any] | None = None
         break_state_match: dict[str, Any] | None = None
         state_checkpoints: list[dict[str, Any]] = []
+        state_side_breakpoint_records: list[dict[str, Any]] = []
         initial = gdb.packet("?")
         if initial.startswith(("S", "T")):
             # The remotedebug fork starts halted when a GDB client is attached.
@@ -2425,6 +2948,15 @@ def main() -> int:
                         args.post_resume_continue_after_poke
                     ),
                     "resume_next_linear": args.resume_next_linear,
+                    "state_side_break_segmented": (
+                        args.state_side_break_segmented
+                    ),
+                    "state_side_break_max_hits": (
+                        args.state_side_break_max_hits
+                    ),
+                    "state_side_break_start_value": (
+                        args.state_side_break_start_value
+                    ),
                     "input_script": (
                         {
                             "path": str(args.input_script),
@@ -2453,6 +2985,18 @@ def main() -> int:
                 for key in args.startup_key:
                     if key.startswith("wait:"):
                         time.sleep(float(key.split(":", 1)[1]))
+                        continue
+                    if key.startswith("runfor:"):
+                        seconds = parse_run_for_action(key)
+                        gdb.continue_nowait()
+                        time.sleep(seconds)
+                        halted_stop = gdb.halt(args.timeout)
+                        halted_regs = gdb.registers()
+                        print(
+                            f"ran guest for {seconds:.3f}s and re-halted: "
+                            f"{halted_stop}",
+                            flush=True,
+                        )
                         continue
                     if key.startswith("tap:"):
                         parts = key.split(":")
@@ -2682,6 +3226,16 @@ def main() -> int:
                                 capture_vga=not args.omit_checkpoint_vga,
                                 capture_screenshot=args.checkpoint_screenshot,
                             )
+                            capture_configured_post_display(
+                                gdb,
+                                qmp_startup,
+                                args.timeout,
+                                post_display_break,
+                                post_display_poke,
+                                record,
+                                linear_address,
+                                args.checkpoint_post_display_delay,
+                            )
                             state_checkpoints.append(record)
                             print(
                                 "captured state checkpoint "
@@ -2709,6 +3263,22 @@ def main() -> int:
                                     flush=True,
                                 )
 
+                        def capture_script_side_breakpoint(
+                            side_hit: int,
+                            side_stop: str,
+                            side_registers: dict[str, int],
+                        ) -> None:
+                            state_side_breakpoint_records.append(
+                                {
+                                    "hit": side_hit,
+                                    "stop": side_stop,
+                                    "registers": side_registers,
+                                    "state": read_script_checkpoint_state(
+                                        side_registers
+                                    ),
+                                }
+                            )
+
                         (
                             halted_stop,
                             halted_regs,
@@ -2724,6 +3294,21 @@ def main() -> int:
                             read_script_checkpoint_state,
                             capture_script_checkpoint,
                             transition_script_keys,
+                            False,
+                            (
+                                pack_segment_offset(
+                                    *state_side_break_segmented
+                                ),
+                                (state_side_break_segmented[0] << 4)
+                                + state_side_break_segmented[1],
+                            )
+                            if state_side_break_segmented is not None
+                            else None,
+                            capture_script_side_breakpoint
+                            if state_side_break_segmented is not None
+                            else None,
+                            state_side_break_max_hits,
+                            state_side_break_start_value,
                         )
                         if args.checkpoint_save_state:
                             (
@@ -3458,6 +4043,7 @@ def main() -> int:
                     observed_values,
                     max_hits,
                     input_events,
+                    initial_held_qcodes,
                 ) = resumed_state_checkpoint_plan(
                     args.resume_checkpoint_script,
                     state_input_events,
@@ -3529,6 +4115,17 @@ def main() -> int:
                             capture_screenshot=args.checkpoint_screenshot,
                             collision_namespace="resume",
                         )
+                        capture_configured_post_display(
+                            gdb,
+                            qmp_resume,
+                            args.timeout,
+                            post_display_break,
+                            post_display_poke,
+                            record,
+                            linear_address,
+                            args.checkpoint_post_display_delay,
+                            primary_breakpoint_installed=hit_index != 0,
+                        )
                         state_checkpoints.append(record)
                         print(
                             "captured resumed state checkpoint "
@@ -3557,6 +4154,33 @@ def main() -> int:
                                 f"{field_name}={value}",
                                 flush=True,
                             )
+
+                    def restore_resumed_held_keys() -> None:
+                        for qcode in initial_held_qcodes:
+                            qmp_resume.key_event(qcode, True)
+                        if initial_held_qcodes:
+                            print(
+                                "restored held keys "
+                                + "+".join(initial_held_qcodes),
+                                flush=True,
+                            )
+
+                    def capture_resumed_side_breakpoint(
+                        side_hit: int,
+                        side_stop: str,
+                        side_registers: dict[str, int],
+                    ) -> None:
+                        side_state = read_resumed_checkpoint_state(
+                            side_registers
+                        )
+                        state_side_breakpoint_records.append(
+                            {
+                                "hit": side_hit,
+                                "stop": side_stop,
+                                "registers": side_registers,
+                                "state": side_state,
+                            }
+                        )
 
                     restored_regs = gdb.registers()
                     if load_save_state_metadata is not None:
@@ -3604,6 +4228,7 @@ def main() -> int:
                             restored_state,
                             0,
                         )
+                        restore_resumed_held_keys()
                         transition_resumed_script_keys(
                             requested_first_value
                         )
@@ -3630,6 +4255,20 @@ def main() -> int:
                             capture_resumed_checkpoint,
                             transition_resumed_script_keys,
                             True,
+                            (
+                                pack_segment_offset(
+                                    *state_side_break_segmented
+                                ),
+                                (state_side_break_segmented[0] << 4)
+                                + state_side_break_segmented[1],
+                            )
+                            if state_side_break_segmented is not None
+                            else None,
+                            capture_resumed_side_breakpoint
+                            if state_side_break_segmented is not None
+                            else None,
+                            state_side_break_max_hits,
+                            state_side_break_start_value,
                         )
                 finally:
                     qmp_resume.close()
@@ -3640,6 +4279,7 @@ def main() -> int:
                     "matched_hit": hit_index,
                     "state": matched_state,
                     "resumed": True,
+                    "initial_held_qcodes": initial_held_qcodes,
                     "input_script_source": (
                         str(args.input_script)
                         if args.input_script is not None
@@ -4131,6 +4771,41 @@ def main() -> int:
             )
             print(f"wrote {sequence_manifest}", flush=True)
 
+        side_trace_path: Path | None = None
+        if state_side_break_segmented is not None:
+            side_trace_path = args.out_dir / "side_breakpoint_trace.json"
+            side_trace_path.write_text(
+                json.dumps(
+                    {
+                        "segment": state_side_break_segmented[0],
+                        "offset": state_side_break_segmented[1],
+                        "expected_eip": (state_side_break_segmented[0] << 4)
+                        + state_side_break_segmented[1],
+                        "max_hits": state_side_break_max_hits,
+                        "start_value": state_side_break_start_value,
+                        "truncated": (
+                            state_side_break_max_hits is not None
+                            and len(state_side_breakpoint_records)
+                            >= state_side_break_max_hits
+                        ),
+                        "hits": state_side_breakpoint_records,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            if break_state_match is not None:
+                break_state_match["side_breakpoint_trace"] = {
+                    "segment": state_side_break_segmented[0],
+                    "offset": state_side_break_segmented[1],
+                    "path": str(side_trace_path),
+                    "hit_count": len(state_side_breakpoint_records),
+                    "max_hits": state_side_break_max_hits,
+                    "start_value": state_side_break_start_value,
+                }
+
         stop = halted_stop
         regs = halted_regs
         if stop is None or regs is None:
@@ -4186,7 +4861,11 @@ def main() -> int:
                 sort_keys=True,
             )
             + "\n",
-            encoding="utf-8",
+                encoding="utf-8",
+            )
+        screenshot_provenance_path = write_screenshot_provenance_manifest(
+            args.out_dir,
+            state_checkpoints,
         )
         summary_path = write_capture_summary(args.out_dir)
 
@@ -4199,6 +4878,8 @@ def main() -> int:
         )
         print(f"wrote {regs_path}", flush=True)
         print(f"wrote {summary_path}", flush=True)
+        if screenshot_provenance_path is not None:
+            print(f"wrote {screenshot_provenance_path}", flush=True)
         print(f"wrote {dump_path} ({len(dump)} bytes from linear 0x{ds_linear:05x})", flush=True)
         if lowmem_dump is not None:
             print(f"wrote {lowmem_path} ({len(lowmem_dump)} bytes from linear 0x00000)", flush=True)

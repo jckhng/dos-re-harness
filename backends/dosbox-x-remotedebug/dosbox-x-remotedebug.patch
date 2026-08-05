@@ -18,11 +18,12 @@ index 0aff5d9..7aedade 100644
      union {
          KBD_KEYS key;        // For keyboard events
          uint8_t button;      // For mouse button events
-@@ -107,6 +110,7 @@ private:
+@@ -107,6 +110,8 @@ private:
      void handle_query_commands();
      void handle_memdump(const std::string& cmd);
      void handle_screendump(const std::string& cmd);
 +    void handle_capture_wave(bool start);
++    void handle_dacdump();
      void handle_savestate(const std::string& cmd);
      void handle_loadstate(const std::string& cmd);
      void handle_stop();
@@ -43,7 +44,12 @@ diff --git a/src/debug/qmp.cpp b/src/debug/qmp.cpp
 index 0570082..7782eba 100644
 --- a/src/debug/qmp.cpp
 +++ b/src/debug/qmp.cpp
-@@ -35,6 +35,9 @@
+@@ -31,10 +31,14 @@
+ #include "logging.h"
+ #include "debug.h"
+ #include "hardware.h"
++#include "vga.h"
+ #include "mouse.h"
  
  static QMPServer* qmpServer = nullptr;
  
@@ -62,8 +68,10 @@ index 0570082..7782eba 100644
      address.sin_port = htons(port);
  
      if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-@@ -413,6 +416,10 @@ void QMPServer::process_command(const std::string& cmd) {
+@@ -413,6 +416,12 @@ void QMPServer::process_command(const std::string& cmd) {
          handle_memdump(cmd);
++    } else if (execute == "dacdump") {
++        handle_dacdump();
      } else if (execute == "screendump") {
          handle_screendump(cmd);
 +    } else if (execute == "capture-wave-start") {
@@ -73,9 +81,10 @@ index 0570082..7782eba 100644
      } else if (execute == "savestate") {
          handle_savestate(cmd);
      } else if (execute == "loadstate") {
-@@ -451,6 +458,8 @@ void QMPServer::handle_query_commands() {
+@@ -451,6 +458,9 @@ void QMPServer::handle_query_commands() {
          "{\"name\": \"query-status\"},"
          "{\"name\": \"memdump\"},"
++        "{\"name\": \"dacdump\"},"
          "{\"name\": \"screendump\"},"
 +        "{\"name\": \"capture-wave-start\"},"
 +        "{\"name\": \"capture-wave-stop\"},"
@@ -148,6 +157,32 @@ index 0570082..7782eba 100644
          event.key = *it;
          queue_input_event(event);
      }
+@@ -736,1 +778,25 @@
++void QMPServer::handle_dacdump() {
++    std::vector<uint8_t> data;
++    data.reserve(256u * 3u);
++    for (unsigned int index = 0; index < 256u; ++index) {
++        data.push_back(vga.dac.rgb[index].red);
++        data.push_back(vga.dac.rgb[index].green);
++        data.push_back(vga.dac.rgb[index].blue);
++    }
++
++    std::ostringstream response;
++    response << "{\"return\":{\"data\":\""
++             << base64_encode(data)
++             << "\",\"size\": " << data.size()
++             << ",\"bits\": " << static_cast<unsigned int>(vga.dac.bits)
++             << ",\"pel_mask\": " << static_cast<unsigned int>(vga.dac.pel_mask)
++             << ",\"pel_index\": " << static_cast<unsigned int>(vga.dac.pel_index)
++             << ",\"state\": " << static_cast<unsigned int>(vga.dac.state)
++             << ",\"write_index\": " << static_cast<unsigned int>(vga.dac.write_index)
++             << ",\"read_index\": " << static_cast<unsigned int>(vga.dac.read_index)
++             << ",\"first_changed\": " << static_cast<unsigned long>(vga.dac.first_changed)
++             << "}}\r\n";
++    send_response(response.str());
++}
++
+ void QMPServer::handle_screendump(const std::string& cmd) {
 diff --git a/src/gui/sdlmain.cpp b/src/gui/sdlmain.cpp
 index d6b71c0..71a7352 100644
 --- a/src/gui/sdlmain.cpp
@@ -184,28 +219,47 @@ diff --git a/src/hardware/adlib.cpp b/src/hardware/adlib.cpp
 index 3d739c9..b11da44 100644
 --- a/src/hardware/adlib.cpp
 +++ b/src/hardware/adlib.cpp
-@@ -49,6 +49,28 @@ bool systemmessagebox(char const * aTitle, char const * aMessage, char const * a
+@@ -49,6 +49,47 @@ bool systemmessagebox(char const * aTitle, char const * aMessage, char const * a
  extern bool show_recorded_filename;
  extern std::string pathopl;
  
 +static void DosReHarness_LogOplWrite(uint32_t reg, uint8_t val) {
 +    static FILE *log = nullptr;
 +    static bool initialized = false;
++    static bool include_loop_tick = false;
++    static PhysPt loop_tick_address = 0;
 +
 +    if (!initialized) {
 +        initialized = true;
 +        const char *path = getenv("DOS_RE_HARNESS_OPL_LOG");
++        const char *loop_tick = getenv("DOS_RE_HARNESS_OPL_TICK_LINEAR");
++        if (loop_tick && *loop_tick) {
++            char *end = nullptr;
++            const unsigned long parsed = strtoul(loop_tick, &end, 0);
++            if (end != loop_tick && *end == '\0') {
++                include_loop_tick = true;
++                loop_tick_address = static_cast<PhysPt>(parsed);
++            }
++        }
 +        if (path && *path) {
 +            log = fopen(path, "wb");
 +            if (log) {
-+                fputs("tick_ms,reg_hex,value_hex\n", log);
++                if (include_loop_tick) {
++                    fputs("tick_ms,loop_tick,reg_hex,value_hex\n", log);
++                } else {
++                    fputs("tick_ms,reg_hex,value_hex\n", log);
++                }
 +                fflush(log);
 +            }
 +        }
 +    }
 +
 +    if (log) {
-+        fprintf(log, "%.6f,0x%03x,0x%02x\n", static_cast<double>(PIC_Ticks), static_cast<unsigned>(reg), static_cast<unsigned>(val));
++        if (include_loop_tick) {
++            fprintf(log, "%.6f,%u,0x%03x,0x%02x\n", static_cast<double>(PIC_Ticks), static_cast<unsigned>(mem_readw(loop_tick_address)), static_cast<unsigned>(reg), static_cast<unsigned>(val));
++        } else {
++            fprintf(log, "%.6f,0x%03x,0x%02x\n", static_cast<double>(PIC_Ticks), static_cast<unsigned>(reg), static_cast<unsigned>(val));
++        }
 +        fflush(log);
 +    }
 +}

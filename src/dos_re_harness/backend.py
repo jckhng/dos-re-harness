@@ -25,6 +25,7 @@ CAPABILITIES = {
     "screen.capture",
     "screen.sequence",
     "state.wait",
+    "video.capture",
 }
 
 

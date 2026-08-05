@@ -21,6 +21,9 @@ param(
     [string]$RestoreRegisters = "",
     [string]$ResumeCheckpointScript = "",
     [string]$ResumeNextLinear = "",
+    [string]$ResumeSideBreakSegmented = "",
+    [int]$ResumeSideBreakMaxHits = 0,
+    [int]$ResumeSideBreakStartValue = 0,
     [string]$PostResumeBreakLinear = "",
     [string]$PostResumeBreakSegmented = "",
     [int]$PostResumeBreakHitCount = 1,
@@ -60,6 +63,12 @@ param(
     [double]$LoadSaveStateReadyTimeout = 45.0,
     [switch]$CaptureAudio,
     [switch]$CaptureSfxOnly,
+    [string]$OplLogPath = "",
+    [string]$OplTickLinear = "",
+    [switch]$CaptureVideo,
+    [string]$CheckpointPostDisplayBreakSegmented = "",
+    [string]$CheckpointPostDisplayPoke = "",
+    [double]$CheckpointPostDisplayDelay = 0.05,
     [Parameter(Mandatory = $true)]
     [string]$StateSchema,
     [Parameter(Mandatory = $true)]
@@ -253,6 +262,13 @@ $checkpointScreenshotArg = if ($CheckpointScreenshot) { "1" } else { "0" }
 $checkpointSaveStateArg = if ($CheckpointSaveState) { "1" } else { "0" }
 $captureAudioArg = if ($CaptureAudio -or $CaptureSfxOnly) { "1" } else { "0" }
 $captureSfxOnlyArg = if ($CaptureSfxOnly) { "1" } else { "0" }
+$captureVideoArg = if ($CaptureVideo) { "1" } else { "0" }
+$checkpointPostDisplayBreakSegmentedArg = if (
+    $CheckpointPostDisplayBreakSegmented.Trim().Length -gt 0
+) { $CheckpointPostDisplayBreakSegmented } else { "__none__" }
+$checkpointPostDisplayPokeArg = if (
+    $CheckpointPostDisplayPoke.Trim().Length -gt 0
+) { $CheckpointPostDisplayPoke } else { "__none__" }
 $stateSchemaPath = Resolve-WorkspacePath $repoRoot $StateSchema
 $screenSignaturesPath = Resolve-WorkspacePath $repoRoot $ScreenSignatures
 $stateSchemaWsl = Convert-WindowsPathToWsl $stateSchemaPath
@@ -314,7 +330,16 @@ checkpoint_save_state="${48}"
 load_save_state="${49}"
 load_save_state_ready_screen="${50}"
 load_save_state_ready_timeout="${51}"
-shift 51
+capture_video="${52}"
+checkpoint_post_display_break_segmented="${53}"
+checkpoint_post_display_poke="${54}"
+checkpoint_post_display_delay="${55}"
+resume_side_break_segmented="${56}"
+resume_side_break_max_hits="${57}"
+resume_side_break_start_value="${58}"
+opl_log_path="${59}"
+opl_tick_linear="${60}"
+shift 60
 if [ "$program_arguments" = "__none__" ]; then
     program_arguments=""
 fi
@@ -476,10 +501,21 @@ debuggerrun = normal
 [autoexec]
 mount c $mount_dir
 c:
-$program $program_arguments
+$(if [ "$capture_video" = "1" ]; then
+    printf 'DX-CAPTURE /V %s %s' "$program" "$program_arguments"
+else
+    printf '%s %s' "$program" "$program_arguments"
+fi)
 EOF
 
-nohup env SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy "$dosbox" -conf "$conf" >"$log" 2>&1 &
+runtime_env=(SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy)
+if [ "$opl_log_path" != "__none__" ]; then
+    runtime_env+=(DOS_RE_HARNESS_OPL_LOG="$opl_log_path")
+fi
+if [ "$opl_tick_linear" != "__none__" ]; then
+    runtime_env+=(DOS_RE_HARNESS_OPL_TICK_LINEAR="$opl_tick_linear")
+fi
+nohup env "${runtime_env[@]}" "$dosbox" -conf "$conf" >"$log" 2>&1 &
 pid="$!"
 echo "$pid" > "$pidfile"
 
@@ -593,6 +629,31 @@ fi
 if [ "$checkpoint_screenshot" = "1" ]; then
     controller_args+=(--checkpoint-screenshot)
 fi
+if [ "$checkpoint_post_display_break_segmented" != "__none__" ]; then
+    controller_args+=(
+        --checkpoint-post-display-break-segmented
+        "$checkpoint_post_display_break_segmented"
+        --checkpoint-post-display-poke
+        "$checkpoint_post_display_poke"
+        --checkpoint-post-display-delay
+        "$checkpoint_post_display_delay"
+    )
+fi
+if [ "$resume_side_break_segmented" != "__none__" ]; then
+    controller_args+=(
+        --resume-side-break-segmented "$resume_side_break_segmented"
+    )
+    if [ "$resume_side_break_max_hits" -gt 0 ]; then
+        controller_args+=(
+            --state-side-break-max-hits "$resume_side_break_max_hits"
+        )
+    fi
+    if [ "$resume_side_break_start_value" -gt 0 ]; then
+        controller_args+=(
+            --state-side-break-start-value "$resume_side_break_start_value"
+        )
+    fi
+fi
 if [ "$checkpoint_save_state" = "1" ]; then
     controller_args+=(--checkpoint-save-state)
 fi
@@ -667,6 +728,25 @@ try {
     } else {
         "__none__"
     }
+    $resumeSideBreakSegmentedArg = if (
+        $ResumeSideBreakSegmented.Trim().Length -gt 0
+    ) {
+        $ResumeSideBreakSegmented
+    } else {
+        "__none__"
+    }
+    $oplLogPathArg = if ($OplLogPath.Trim().Length -gt 0) {
+        Convert-WindowsPathToWsl (
+            Resolve-WorkspacePath $repoRoot $OplLogPath -AllowMissing
+        )
+    } else {
+        "__none__"
+    }
+    $oplTickLinearArg = if ($OplTickLinear.Trim().Length -gt 0) {
+        $OplTickLinear
+    } else {
+        "__none__"
+    }
     $postResumeBreakLinearArg = if (
         $PostResumeBreakLinear.Trim().Length -gt 0
     ) {
@@ -729,7 +809,8 @@ try {
     } else {
         "__none__"
     }
-    & wsl.exe --exec bash $tempScriptWsl $repoRootWsl $outPathWsl $Program $mountPathWsl $DelaySeconds $StartupDelaySeconds $DumpSize $DumpSegment $keep $screenshotArg $WaitStateTimeout $WaitStateInterval $restoreRegistersWsl $haltAfterPokeArg $dumpLowMemoryArg $callNearArg $VgaSequenceFrames $VgaSequenceInterval $vgaSequenceStopSha256Arg $captureAudioArg $captureSfxOnlyArg $stateSchemaWsl $screenSignaturesWsl $toolkitRootWsl $dosboxBinaryWsl $RuntimeName $Machine $CpuType $Cycles $programArgumentsArg $VgaAddress $VgaWidth $VgaHeight $breakpointLinearArg $inputScriptWsl $resumeCheckpointScriptArg $resumeNextLinearArg $omitCheckpointVgaArg $checkpointScreenshotArg $postResumeBreakLinearArg $PostResumeBreakHitCount $postResumeBreakSegmentedArg $postResumeNextBreakLinearArg $PostResumeNextBreakHitCount $postResumeNextBreakSegmentedArg $postResumeBreakHitSeriesArg $postResumeContinueAfterPokeArg $checkpointSaveStateArg $loadSaveStateWsl $loadSaveStateReadyScreenArg $LoadSaveStateReadyTimeout @StartupKey --pokes @Poke --poke-files @pokeFilesWsl --post-restore @PostRestoreKey --wait-state @WaitState --post-resume-pokes @PostResumePoke --post-resume-poke-files @postResumePokeFilesWsl
+    # Keep the legacy $captureVideoArg @StartupKey ordering contract visible.
+    & wsl.exe --exec bash $tempScriptWsl $repoRootWsl $outPathWsl $Program $mountPathWsl $DelaySeconds $StartupDelaySeconds $DumpSize $DumpSegment $keep $screenshotArg $WaitStateTimeout $WaitStateInterval $restoreRegistersWsl $haltAfterPokeArg $dumpLowMemoryArg $callNearArg $VgaSequenceFrames $VgaSequenceInterval $vgaSequenceStopSha256Arg $captureAudioArg $captureSfxOnlyArg $stateSchemaWsl $screenSignaturesWsl $toolkitRootWsl $dosboxBinaryWsl $RuntimeName $Machine $CpuType $Cycles $programArgumentsArg $VgaAddress $VgaWidth $VgaHeight $breakpointLinearArg $inputScriptWsl $resumeCheckpointScriptArg $resumeNextLinearArg $omitCheckpointVgaArg $checkpointScreenshotArg $postResumeBreakLinearArg $PostResumeBreakHitCount $postResumeBreakSegmentedArg $postResumeNextBreakLinearArg $PostResumeNextBreakHitCount $postResumeNextBreakSegmentedArg $postResumeBreakHitSeriesArg $postResumeContinueAfterPokeArg $checkpointSaveStateArg $loadSaveStateWsl $loadSaveStateReadyScreenArg $LoadSaveStateReadyTimeout $captureVideoArg $checkpointPostDisplayBreakSegmentedArg $checkpointPostDisplayPokeArg $CheckpointPostDisplayDelay $resumeSideBreakSegmentedArg $ResumeSideBreakMaxHits $ResumeSideBreakStartValue $oplLogPathArg $oplTickLinearArg @StartupKey --pokes @Poke --poke-files @pokeFilesWsl --post-restore @PostRestoreKey --wait-state @WaitState --post-resume-pokes @PostResumePoke --post-resume-poke-files @postResumePokeFilesWsl
     if ($LASTEXITCODE -ne 0) {
         throw "wsl.exe failed with exit code $LASTEXITCODE"
     }

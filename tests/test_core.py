@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import json
+import base64
 import hashlib
+import shutil
 import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+import wave
 import zlib
 from pathlib import Path
 from unittest.mock import patch
@@ -33,6 +36,184 @@ from dos_re_harness.traces import (
 
 
 class CaptureAdapterTests(unittest.TestCase):
+    def test_powershell_launcher_forwards_positionals_out_and_help(self) -> None:
+        powershell = shutil.which("pwsh")
+        if powershell is None:
+            self.skipTest("PowerShell Core is unavailable")
+        launcher = TOOLKIT_ROOT / "scripts" / "dos-re.ps1"
+        validate = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-File",
+                str(launcher),
+                "validate-project",
+                str(FIXTURE_ROOT / "project.json"),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(validate.returncode, 0, validate.stderr)
+        self.assertIn("VALID project=minimal-fixture", validate.stdout)
+        help_result = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-File",
+                str(launcher),
+                "plan-state-tail",
+                "--help",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(help_result.returncode, 0, help_result.stderr)
+        self.assertIn("usage: cli.py plan-state-tail", help_result.stdout)
+        with tempfile.TemporaryDirectory() as temporary:
+            dump = Path(temporary) / "state.bin"
+            output = Path(temporary) / "state.json"
+            dump.write_bytes(bytes(8))
+            parse = subprocess.run(
+                [
+                    powershell,
+                    "-NoProfile",
+                    "-File",
+                    str(launcher),
+                    "parse-state",
+                    "--schema",
+                    str(FIXTURE_ROOT / "state.schema.json"),
+                    "--dump",
+                    str(dump),
+                    "--out",
+                    str(output),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(parse.returncode, 0, parse.stderr)
+            self.assertTrue(output.is_file())
+
+    def test_state_tail_plan_finds_first_input_state_change(self) -> None:
+        from dos_re_harness.state_tail import build_state_tail_plan
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            previous = root / "previous.input.script"
+            current = root / "current.input.script"
+            previous.write_text(
+                "dos-re-state-input-script-v1\n"
+                "# state_field=loop_tick\n"
+                "# terminal_value=12\n"
+                "1=down.left\n"
+                "5=up.left\n"
+                "10=down.right\n"
+                "12=up.right\n",
+                encoding="utf-8",
+            )
+            current.write_text(
+                "dos-re-state-input-script-v1\n"
+                "# state_field=loop_tick\n"
+                "# terminal_value=12\n"
+                "1=down.left\n"
+                "5=up.left\n"
+                "7=down.right\n"
+                "12=up.right\n",
+                encoding="utf-8",
+            )
+            snapshot = root / "checkpoints" / "loop_tick-5"
+            snapshot.mkdir(parents=True)
+            (snapshot / "remote_runtime_ds.bin").write_bytes(bytes(65536))
+            (snapshot / "remote_runtime_registers.json").write_text(
+                "{}\n",
+                encoding="utf-8",
+            )
+            movie = root / "resume.movie.json"
+            movie.write_text(
+                json.dumps(
+                    {
+                        "format_version": 1,
+                        "actions": [
+                            "breakstate:0x850c:loop_tick==1:63",
+                            "clearbreak:0x850c",
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            plan = build_state_tail_plan(
+                previous_script=previous,
+                current_script=current,
+                snapshot=snapshot,
+                checkpoint_value=5,
+                end_value=11,
+                breakpoint="0x850c",
+                state_field="loop_tick",
+                maximum_hit_margin=62,
+                resume_next_linear="0x850f",
+                bootstrap_movie=movie,
+                capture_out=root / "capture",
+                transition_breakpoint="0x0824:0x6f52",
+                transition_out=root / "transition",
+            )
+
+        self.assertEqual(plan["first_changed_value"], 7)
+        self.assertEqual(plan["capture"]["first_value"], 5)
+        self.assertEqual(plan["capture"]["last_value"], 11)
+        self.assertEqual(plan["capture"]["value_count"], 7)
+        self.assertIn(
+            "resume_checkpoint_script=checkpointstatescriptfile:"
+            "0x850c:loop_tick:"
+            "5+6+7+8+9+10+11:68",
+            plan["capture"]["adapter_arguments"],
+        )
+        self.assertEqual(
+            plan["transition"]["breakpoint"],
+            "0x0824:0x6f52",
+        )
+
+    def test_state_tail_plan_rejects_invalid_snapshot_and_bootstrap(self) -> None:
+        from dos_re_harness.state_tail import build_state_tail_plan
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            script = root / "route.input.script"
+            script.write_text(
+                "dos-re-state-input-script-v1\n"
+                "# state_field=loop_tick\n"
+                "1=down.left\n"
+                "2=up.left\n",
+                encoding="utf-8",
+            )
+            snapshot = root / "loop_tick-1"
+            snapshot.mkdir()
+            (snapshot / "remote_runtime_ds.bin").write_bytes(b"short")
+            (snapshot / "remote_runtime_registers.json").write_text(
+                "{}\n",
+                encoding="utf-8",
+            )
+            movie = root / "resume.movie.json"
+            movie.write_text(
+                json.dumps({"format_version": 1, "actions": ["wait:1"]}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "expected 65536 bytes"):
+                build_state_tail_plan(
+                    previous_script=script,
+                    current_script=script,
+                    snapshot=snapshot,
+                    checkpoint_value=1,
+                    end_value=2,
+                    breakpoint="0x850c",
+                    state_field="loop_tick",
+                    bootstrap_movie=movie,
+                    capture_out=root / "capture",
+                )
+
     def test_adapter_arguments_merge_configuration_scenario_and_cli(self) -> None:
         from dos_re_harness.cli import capture_adapter_replacements
 
@@ -81,6 +262,65 @@ class CaptureAdapterTests(unittest.TestCase):
         self.assertEqual(args.capture_dir, Path("capture-directory"))
         self.assertFalse(args.json)
         self.assertIsNone(args.out)
+
+    def test_state_tail_planner_parser_exposes_preflight_inputs(self) -> None:
+        from dos_re_harness.cli import build_parser
+
+        args = build_parser().parse_args(
+            [
+                "plan-state-tail",
+                "project.json",
+                "probe",
+                "--previous-input-script",
+                "v1.input.script",
+                "--input-script",
+                "v2.input.script",
+                "--resume-from",
+                "loop_tick-40",
+                "--checkpoint-value",
+                "40",
+                "--end-value",
+                "90",
+                "--state-field",
+                "loop_tick",
+                "--breakpoint",
+                "0x850c",
+                "--movie",
+                "resume.movie.json",
+                "--capture-out",
+                "capture",
+                "--out",
+                "plan.json",
+            ]
+        )
+        self.assertEqual(args.checkpoint_value, 40)
+        self.assertEqual(args.end_value, 90)
+        self.assertEqual(args.maximum_hit_margin, 62)
+
+    def test_audio_and_write_trace_commands_are_exposed(self) -> None:
+        from dos_re_harness.cli import build_parser
+
+        parser = build_parser()
+        inspect = parser.parse_args(["inspect-wave", "capture.wav"])
+        self.assertEqual(inspect.wave, Path("capture.wav"))
+        compare = parser.parse_args(
+            ["diff-wave", "original.wav", "rewrite.wav", "--mixdown"]
+        )
+        self.assertTrue(compare.mixdown)
+        trace = parser.parse_args(
+            [
+                "extract-write-trace",
+                "capture",
+                "--address-register",
+                "ebx",
+                "--value-register",
+                "ecx",
+                "--out",
+                "writes.json",
+            ]
+        )
+        self.assertEqual(trace.address_register, "ebx")
+        self.assertEqual(trace.value_register, "ecx")
 
 
 class SchemaTests(unittest.TestCase):
@@ -162,6 +402,41 @@ class ScreenTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
+    def test_configured_post_display_capture_is_checkpoint_mode_neutral(
+        self,
+    ) -> None:
+        from dos_re_harness.remote_capture import (
+            capture_configured_post_display,
+        )
+
+        record: dict[str, object] = {"path": "checkpoint"}
+        with patch(
+            "dos_re_harness.remote_capture.capture_post_display_screenshot"
+        ) as capture:
+            capture_configured_post_display(
+                "gdb",
+                "qmp",
+                10.0,
+                (0x0824, 0x03D1),
+                (0x8611, b"\xeb\xfe"),
+                record,
+                0x850C,
+                0.05,
+                primary_breakpoint_installed=False,
+            )
+            capture.assert_called_once_with(
+                "gdb",
+                "qmp",
+                10.0,
+                (0x0824, 0x03D1),
+                0x8611,
+                b"\xeb\xfe",
+                record,
+                0.05,
+                primary_breakpoint_installed=False,
+            )
+        self.assertEqual(record["primary_breakpoint"], 0x850C)
+
     def test_capture_parser_accepts_evidence_hashed_movie_override(self) -> None:
         from dos_re_harness.cli import build_parser
 
@@ -200,6 +475,15 @@ class WorkflowTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             parse_screen_wait_action("waitvga:state:2:0", "waitvga")
+
+    def test_runfor_action_requires_positive_bounded_duration(self) -> None:
+        from dos_re_harness.remote_capture import parse_run_for_action
+
+        self.assertEqual(parse_run_for_action("runfor:1.25"), 1.25)
+        with self.assertRaises(ValueError):
+            parse_run_for_action("runfor:0")
+        with self.assertRaises(ValueError):
+            parse_run_for_action("run:1")
 
     def test_rsp_linear_breakpoint_uses_gdb_software_packet(self) -> None:
         from dos_re_harness.remote_capture import RspClient
@@ -916,6 +1200,7 @@ class WorkflowTests(unittest.TestCase):
             prepare_restore_halt,
             resumed_state_checkpoint_plan,
             resumed_state_script_plan,
+            resumed_state_script_plan_with_held,
             stop_on_state_checkpoints,
             write_state_checkpoint,
         )
@@ -1007,6 +1292,7 @@ class WorkflowTests(unittest.TestCase):
                 [1000, 1050, 1100],
                 164,
                 [],
+                [],
             ),
         )
         self.assertEqual(
@@ -1030,6 +1316,7 @@ class WorkflowTests(unittest.TestCase):
                     (1050, True, ["right"]),
                     (1051, False, ["right"]),
                 ],
+                [],
             ),
         )
         for invalid in (
@@ -1114,6 +1401,24 @@ class WorkflowTests(unittest.TestCase):
                     (52, False, ["left"]),
                 ],
             )
+        self.assertEqual(
+            resumed_state_script_plan_with_held(
+                [50, 55],
+                [
+                    (48, True, ["left", "spc"]),
+                    (52, False, ["spc"]),
+                    (54, False, ["left"]),
+                ],
+            ),
+            (
+                [50, 52, 54, 55],
+                [
+                    (52, False, ["spc"]),
+                    (54, False, ["left"]),
+                ],
+                ["left", "spc"],
+            ),
+        )
 
         class AlreadyHaltedGdb:
             def halt(self, _timeout: float) -> str:
@@ -1238,6 +1543,71 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertEqual(calls.count(("step",)), 2)
 
+    def test_state_checkpoints_trace_concurrent_side_breakpoint(self) -> None:
+        from dos_re_harness.remote_capture import stop_on_state_checkpoints
+
+        calls = []
+        registers = iter(
+            (
+                {"eip": (0x4122 << 4) + 0x26E5, "ds": 0x2567},
+                {"eip": 0x850C, "ds": 0x2567},
+                {"eip": 0x850C, "ds": 0x2567},
+            )
+        )
+        states = iter(({"loop_tick": 10}, {"loop_tick": 11}))
+        primary = []
+        side = []
+
+        class FakeGdb:
+            def halt(self, timeout: float) -> str:
+                calls.append(("halt", timeout))
+                return "S05"
+
+            def insert_breakpoint(self, address: int) -> None:
+                calls.append(("break", address))
+
+            def continue_nowait(self) -> None:
+                calls.append(("continue",))
+
+            def wait_for_stop(self, timeout: float) -> str:
+                calls.append(("wait-stop", timeout))
+                return "S05"
+
+            def registers(self) -> dict[str, int]:
+                calls.append(("registers",))
+                return next(registers)
+
+            def remove_breakpoint(self, address: int) -> None:
+                calls.append(("remove-break", address))
+
+            def step_nowait(self) -> None:
+                calls.append(("step",))
+
+        result = stop_on_state_checkpoints(
+            FakeGdb(),
+            0x850C,
+            "loop_tick",
+            [10, 11],
+            4,
+            7.0,
+            lambda _registers: next(states),
+            lambda value, _stop, _registers, _state, hit: primary.append(
+                (value, hit)
+            ),
+            side_breakpoint=(0x412226E5, (0x4122 << 4) + 0x26E5),
+            side_capture=lambda hit, _stop, _registers: side.append(hit),
+            side_max_hits=1,
+        )
+        self.assertEqual(
+            result,
+            ("S05", {"eip": 0x850C, "ds": 0x2567}, {"loop_tick": 11}, 2),
+        )
+        self.assertEqual(primary, [(10, 1), (11, 2)])
+        self.assertEqual(side, [1])
+        self.assertIn(("break", 0x850C), calls)
+        self.assertIn(("break", 0x412226E5), calls)
+        self.assertIn(("remove-break", 0x412226E5), calls)
+
     def test_state_checkpoint_writes_complete_nested_snapshot(self) -> None:
         from dos_re_harness.remote_capture import write_state_checkpoint
 
@@ -1328,7 +1698,44 @@ class WorkflowTests(unittest.TestCase):
             ],
         )
         self.assertIsNone(calls[0][3])
-        self.assertIsNone(calls[1][3])
+
+    def test_qmp_dacdump_decodes_palette_and_state(self) -> None:
+        from dos_re_harness.remote_capture import QmpClient
+
+        client = QmpClient.__new__(QmpClient)
+        palette = bytes(range(256)) * 3
+
+        def command(execute, arguments=None, timeout=None, sent_event=None):
+            self.assertEqual(execute, "dacdump")
+            self.assertIsNone(arguments)
+            self.assertIsNone(timeout)
+            self.assertIsNone(sent_event)
+            return {
+                "return": {
+                    "data": base64.b64encode(palette).decode("ascii"),
+                    "bits": 6,
+                    "pel_mask": 255,
+                    "pel_index": 2,
+                    "state": 1,
+                    "write_index": 12,
+                    "read_index": 11,
+                    "first_changed": 256,
+                }
+            }
+
+        client.command = command
+        result = client.dacdump()
+        self.assertEqual(result["data"], palette)
+        self.assertEqual(result["bits"], 6)
+        self.assertEqual(result["write_index"], 12)
+
+    def test_qmp_screendump_rejects_empty_payload(self) -> None:
+        from dos_re_harness.remote_capture import QmpClient
+
+        client = QmpClient.__new__(QmpClient)
+        client.command = lambda *args, **kwargs: {"return": {"data": ""}}
+        with self.assertRaisesRegex(RuntimeError, "empty payload"):
+            client.screendump()
 
     def test_state_checkpoint_can_write_full_emulator_save_state(self) -> None:
         from dos_re_harness.remote_capture import (
@@ -1702,6 +2109,27 @@ class WorkflowTests(unittest.TestCase):
                     str(checkpoint / "remote_runtime_screen.png"),
                 )
 
+    def test_screenshot_provenance_manifest_records_nonempty_pngs(self) -> None:
+        from dos_re_harness.remote_capture import (
+            write_screenshot_provenance_manifest,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkpoint = root / "checkpoints" / "loop_tick-1"
+            checkpoint.mkdir(parents=True)
+            png = b"\x89PNG\r\n\x1a\nvalid"
+            (checkpoint / "remote_runtime_screen.png").write_bytes(png)
+            manifest = write_screenshot_provenance_manifest(
+                root,
+                [{"path": str(checkpoint), "value": 1}],
+            )
+            self.assertIsNotNone(manifest)
+            document = json.loads(manifest.read_text(encoding="utf-8"))
+            self.assertEqual(document["tick_count"], 1)
+            self.assertEqual(document["valid_png_count"], 1)
+            self.assertEqual(document["nonempty_count"], 1)
+
     def test_mzexplode_wsl_command_maps_windows_paths(self) -> None:
         from dos_re_harness.mzexplode import build_mzexplode_command
 
@@ -1919,6 +2347,28 @@ class HarnessContractTests(unittest.TestCase):
             launcher,
         )
 
+    def test_generic_launcher_wraps_opt_in_native_video_capture(self) -> None:
+        launcher = (
+            TOOLKIT_ROOT / "scripts" / "run-wsl-remotedebug.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn("[switch]$CaptureVideo", launcher)
+        self.assertIn('capture_video="${52}"', launcher)
+        self.assertIn("DX-CAPTURE /V %s %s", launcher)
+        self.assertIn("$captureVideoArg @StartupKey", launcher)
+
+    def test_generic_launcher_plumbs_optional_opl_log_path(self) -> None:
+        launcher = (
+            TOOLKIT_ROOT / "scripts" / "run-wsl-remotedebug.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn('[string]$OplLogPath = ""', launcher)
+        self.assertIn('[string]$OplTickLinear = ""', launcher)
+        self.assertIn('DOS_RE_HARNESS_OPL_LOG="$opl_log_path"', launcher)
+        self.assertIn('DOS_RE_HARNESS_OPL_TICK_LINEAR="$opl_tick_linear"', launcher)
+        self.assertIn(
+            "$oplLogPathArg $oplTickLinearArg @StartupKey",
+            launcher,
+        )
+
     def test_ghidra_query_supports_atomic_custom_evidence(self) -> None:
         wrapper = (
             TOOLKIT_ROOT / "scripts" / "ghidra-query.ps1"
@@ -1988,7 +2438,7 @@ class HarnessContractTests(unittest.TestCase):
             )
             self.assertEqual(
                 document["backend"]["patch"]["sha256"],
-                "09d05e31ca4e1645dee91b8bf081d6b43db5cefaffbb318d08fe2a93dd4a1e6e",
+                "1e21ec13f9b85b9d747b0737d5390eb1f2ef95424dbcc999b76edb553a4cb675",
             )
             self.assertEqual(
                 document["capture"]["configuration"]["machine"],
@@ -2163,6 +2613,138 @@ class HarnessContractTests(unittest.TestCase):
             self.assertEqual(output, capture / "capture_summary.json")
             written = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(written, summary)
+
+
+class AudioEvidenceTests(unittest.TestCase):
+    @staticmethod
+    def _write_wave(
+        path: Path,
+        channels: int,
+        frames: list[tuple[int, ...]],
+        sample_rate: int = 8000,
+    ) -> None:
+        with wave.open(str(path), "wb") as output:
+            output.setnchannels(channels)
+            output.setsampwidth(2)
+            output.setframerate(sample_rate)
+            output.writeframes(
+                b"".join(
+                    struct.pack("<" + "h" * channels, *frame)
+                    for frame in frames
+                )
+            )
+
+    def test_wave_summary_reports_reproducible_pcm_metrics(self) -> None:
+        from dos_re_harness.audio import summarize_wave
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "capture.wav"
+            self._write_wave(
+                path,
+                2,
+                [(0, 0), (100, -100), (-200, 200), (300, -300)],
+            )
+            summary = summarize_wave(path)
+            self.assertEqual(summary["channels"], 2)
+            self.assertEqual(summary["sample_rate"], 8000)
+            self.assertEqual(summary["sample_width_bits"], 16)
+            self.assertEqual(summary["frame_count"], 4)
+            self.assertEqual(summary["peak"], 300)
+            self.assertAlmostEqual(summary["duration_seconds"], 0.0005)
+            self.assertEqual(len(summary["sha256"]), 64)
+            self.assertEqual(summary["channel_metrics"][0]["minimum"], -200)
+            self.assertEqual(summary["channel_metrics"][1]["maximum"], 200)
+
+    def test_wave_comparison_supports_tolerance_and_stereo_mixdown(self) -> None:
+        from dos_re_harness.audio import compare_waves
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            original = root / "original.wav"
+            rewrite = root / "rewrite.wav"
+            self._write_wave(
+                original,
+                2,
+                [(100, 100), (200, 200), (-300, -300), (0, 0)],
+            )
+            self._write_wave(
+                rewrite,
+                1,
+                [(101,), (198,), (-300,), (0,)],
+            )
+            result = compare_waves(
+                original,
+                rewrite,
+                mixdown=True,
+                sample_tolerance=2,
+            )
+            self.assertTrue(result["formats_compatible"])
+            self.assertEqual(result["compared_frames"], 4)
+            self.assertEqual(result["different_samples"], 0)
+            self.assertEqual(result["maximum_absolute_error"], 2)
+            self.assertIsNone(result["first_different_frame"])
+
+    def test_capture_summary_includes_wave_artifacts_and_metrics(self) -> None:
+        from dos_re_harness.capture_summary import build_capture_summary
+
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary)
+            (capture / "remote_runtime_registers.json").write_text(
+                json.dumps(
+                    {
+                        "stop": "T05",
+                        "registers": {"cs": 0, "eip": 0},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self._write_wave(capture / "program_000.wav", 1, [(1,), (-1,)])
+            summary = build_capture_summary(capture)
+            self.assertEqual(summary["counts"]["wave_files"], 1)
+            self.assertEqual(summary["audio"][0]["path"], "program_000.wav")
+            self.assertEqual(summary["audio"][0]["peak"], 1)
+
+
+class RegisterWriteTraceTests(unittest.TestCase):
+    def test_breakpoint_series_becomes_stable_register_pair_stream(self) -> None:
+        from dos_re_harness.write_trace import extract_register_pair_trace
+
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary)
+            for hit, address, value in ((2, 0x1BD, 0x100), (7, 0xA0, 0x57)):
+                checkpoint = (
+                    capture / "checkpoints" / f"breakpoint_hit-{hit}"
+                )
+                checkpoint.mkdir(parents=True)
+                (checkpoint / "remote_runtime_registers.json").write_text(
+                    json.dumps(
+                        {
+                            "registers": {
+                                "ebx": address,
+                                "ecx": value,
+                                "cs": 0x1234,
+                                "eip": 0x5678,
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            result = extract_register_pair_trace(
+                capture,
+                address_register="ebx",
+                value_register="ecx",
+                address_mask=0xFF,
+                value_mask=0xFF,
+            )
+            self.assertEqual(
+                result["writes"],
+                [
+                    {"hit": 2, "address": 0xBD, "value": 0},
+                    {"hit": 7, "address": 0xA0, "value": 0x57},
+                ],
+            )
+            self.assertEqual(result["write_count"], 2)
+            self.assertEqual(len(result["stream_sha256"]), 64)
 
 
 if __name__ == "__main__":
