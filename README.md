@@ -11,7 +11,7 @@ specification. It combines:
   warps;
 - one-process state and repeated-breakpoint checkpoint series;
 - schema-driven process-memory capture;
-- indexed VGA framebuffer and temporal sequence capture;
+- indexed VGA framebuffer, DAC palette, and temporal sequence capture;
 - WAV/OPL capture through the emulator backend;
 - specimen hashes and auditable capture artifacts;
 - Ghidra headless function, instruction, xref, and scalar queries;
@@ -581,7 +581,7 @@ the declared order. Checkpoints are written below
 `checkpoints/<field>-<value>/`; the parent evidence manifest recursively hashes
 every nested artifact. Breakpoint predicates read only the declared schema
 field bytes through RSP on intermediate hits; complete segment, low-memory,
-VGA, and register dumps are still retained for each selected checkpoint.
+VGA, DAC, and register dumps are still retained for each selected checkpoint.
 Use `-OmitCheckpointVga` when nested checkpoints are semantic-state evidence
 only. It retains the final root VGA capture but omits per-checkpoint VGA dumps,
 and records null VGA artifacts in checkpoint metadata.
@@ -592,6 +592,10 @@ the backend writes a PNG only after a timed-out request resumes, the harness
 retains it as a deferred side effect with
 `screenshot_exact_checkpoint: false`; it is not state-aligned regression
 evidence.
+Timed VGA sequences retain both the indexed framebuffer and the 256-entry DAC
+palette for every sample. Each row in `vga_sequence.json` records independent
+hashes and change counts for pixels and palette bytes, so palette-only fades,
+flashes, and cycling remain observable even when framebuffer memory is static.
 Use `-CheckpointSaveState` only when the final startup action is a state
 checkpoint. It writes `remote_runtime.sav` beside that checkpoint and records
 its size, SHA-256, request boundary, post-save registers, and post-save schema
@@ -634,8 +638,9 @@ Use `--post-resume-break-hit-series 2,9,17,31` instead when several invocation
 ordinals are required. The CPU advances once to the largest ordinal and writes
 each requested hit below `checkpoints/breakpoint_hit-<hit>/`, avoiding one
 DOSBox-X startup per ordinal. Series values must be positive and strictly
-increasing. A series is read-only and cannot be combined with post-resume poke
-files or the staged next-breakpoint path.
+increasing. Every selected hit retains the VGA DAC as well as the indexed
+framebuffer. A series is read-only and cannot be combined with post-resume
+poke files or the staged next-breakpoint path.
 The controller arms this breakpoint only after restoration and removes the
 state-boundary breakpoint first when the resume script advanced through more
 than one state. This avoids replaying startup solely to inspect code reached

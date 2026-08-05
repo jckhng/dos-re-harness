@@ -1615,6 +1615,18 @@ class WorkflowTests(unittest.TestCase):
             def memdump(self, address: int, size: int) -> bytes:
                 return bytes([address & 0xFF]) * size
 
+            def dacdump(self) -> dict[str, object]:
+                return {
+                    "data": bytes(range(256)) * 3,
+                    "bits": 6,
+                    "pel_mask": 0xFF,
+                    "pel_index": 7,
+                    "state": 0,
+                    "write_index": 8,
+                    "read_index": 9,
+                    "first_changed": 16,
+                }
+
             def screendump(self) -> bytes:
                 return b"checkpoint-screen"
 
@@ -1635,6 +1647,7 @@ class WorkflowTests(unittest.TestCase):
                 0xA0000,
                 4,
                 b"P5\n2 2\n255\n",
+                capture_dac=True,
                 capture_screenshot=True,
             )
             checkpoint = root / "loop_tick-183"
@@ -1651,6 +1664,10 @@ class WorkflowTests(unittest.TestCase):
                 (checkpoint / "remote_runtime_screen.png").read_bytes(),
                 b"checkpoint-screen",
             )
+            self.assertEqual(
+                (checkpoint / "remote_runtime_dac.bin").read_bytes(),
+                bytes(range(256)) * 3,
+            )
             registers = json.loads(
                 (
                     checkpoint / "remote_runtime_registers.json"
@@ -1664,6 +1681,8 @@ class WorkflowTests(unittest.TestCase):
                 registers["screenshot"],
                 str(checkpoint / "remote_runtime_screen.png"),
             )
+            self.assertEqual(registers["dac"]["bits"], 6)
+            self.assertEqual(registers["dac"]["first_changed"], 16)
             self.assertIsNone(registers["screenshot_error"])
             self.assertTrue(registers["screenshot_exact_checkpoint"])
             self.assertFalse(registers["screenshot_deferred_side_effect"])
@@ -1728,6 +1747,52 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(result["data"], palette)
         self.assertEqual(result["bits"], 6)
         self.assertEqual(result["write_index"], 12)
+
+    def test_timed_vga_sample_retains_palette_evidence(self) -> None:
+        from dos_re_harness.remote_capture import (
+            write_vga_dac_sequence_sample,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            sequence_dir = Path(temporary)
+            vga = bytes([1, 2, 3, 4])
+            palette = bytes(range(256)) * 3
+            sample = write_vga_dac_sequence_sample(
+                sequence_dir,
+                7,
+                vga,
+                {
+                    "data": palette,
+                    "bits": 6,
+                    "pel_mask": 255,
+                    "pel_index": 2,
+                    "state": 1,
+                    "write_index": 12,
+                    "read_index": 11,
+                    "first_changed": 16,
+                },
+            )
+
+            self.assertEqual(
+                (sequence_dir / "frame_0007.bin").read_bytes(),
+                vga,
+            )
+            self.assertEqual(
+                (sequence_dir / "frame_0007.dac.bin").read_bytes(),
+                palette,
+            )
+            self.assertEqual(sample["path"], str(sequence_dir / "frame_0007.bin"))
+            self.assertEqual(
+                sample["dac"]["path"],
+                str(sequence_dir / "frame_0007.dac.bin"),
+            )
+            self.assertEqual(sample["dac"]["bits"], 6)
+            self.assertEqual(sample["dac"]["first_changed"], 16)
+            self.assertEqual(sample["dac"]["size"], 768)
+            self.assertEqual(
+                sample["dac"]["sha256"],
+                hashlib.sha256(palette).hexdigest(),
+            )
 
     def test_qmp_screendump_rejects_empty_payload(self) -> None:
         from dos_re_harness.remote_capture import QmpClient
@@ -2703,6 +2768,52 @@ class AudioEvidenceTests(unittest.TestCase):
             self.assertEqual(summary["counts"]["wave_files"], 1)
             self.assertEqual(summary["audio"][0]["path"], "program_000.wav")
             self.assertEqual(summary["audio"][0]["peak"], 1)
+
+    def test_simple_actions_return_final_wave_capture_state(self) -> None:
+        from dos_re_harness.remote_capture import run_simple_key_actions
+
+        class FakeQmp:
+            def __init__(self) -> None:
+                self.capture_operations: list[bool] = []
+
+            def capture_wave(self, start: bool) -> None:
+                self.capture_operations.append(start)
+
+        qmp = FakeQmp()
+        active = run_simple_key_actions(
+            qmp,
+            ["capture-wave:start", "capture-wave:stop", "capture-wave:start"],
+        )
+        self.assertTrue(active)
+        self.assertEqual(qmp.capture_operations, [True, False, True])
+
+        active = run_simple_key_actions(
+            qmp,
+            ["capture-wave:stop"],
+            active,
+        )
+        self.assertFalse(active)
+        self.assertEqual(qmp.capture_operations[-1], False)
+
+    def test_wave_finalization_rejects_placeholder_header(self) -> None:
+        from dos_re_harness.remote_capture import wave_file_is_finalized
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            finalized = root / "finalized.wav"
+            placeholder = root / "placeholder.wav"
+            self._write_wave(finalized, 2, [(1, -1), (2, -2)])
+            payload = finalized.read_bytes()
+            placeholder.write_bytes(
+                payload[:4]
+                + (28).to_bytes(4, "little")
+                + payload[8:40]
+                + bytes(4)
+                + payload[44:]
+            )
+
+            self.assertTrue(wave_file_is_finalized(finalized))
+            self.assertFalse(wave_file_is_finalized(placeholder))
 
 
 class RegisterWriteTraceTests(unittest.TestCase):

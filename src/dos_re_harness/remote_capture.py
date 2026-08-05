@@ -13,6 +13,7 @@ import struct
 import sys
 import threading
 import time
+import wave
 from pathlib import Path
 from typing import Any, Callable
 
@@ -1114,6 +1115,7 @@ def write_state_checkpoint(
     pgm_header: bytes,
     *,
     capture_vga: bool = True,
+    capture_dac: bool = False,
     capture_screenshot: bool = False,
     collision_namespace: str | None = None,
 ) -> dict[str, Any]:
@@ -1133,6 +1135,7 @@ def write_state_checkpoint(
         if capture_vga
         else None
     )
+    dac_dump = qmp.dacdump() if capture_dac else None
     low_memory_dump = (
         qmp.memdump(0x00000, 0xA0000)
         if dump_low_memory
@@ -1142,6 +1145,7 @@ def write_state_checkpoint(
     dump_path = checkpoint_path / "remote_runtime_ds.bin"
     vga_path = checkpoint_path / "remote_runtime_vga.bin"
     vga_pgm_path = checkpoint_path / "remote_runtime_vga.pgm"
+    dac_path = checkpoint_path / "remote_runtime_dac.bin"
     low_memory_path = checkpoint_path / "remote_runtime_lowmem.bin"
     screenshot_path = checkpoint_path / "remote_runtime_screen.png"
     registers_path = checkpoint_path / "remote_runtime_registers.json"
@@ -1149,6 +1153,8 @@ def write_state_checkpoint(
     if vga_dump is not None:
         vga_path.write_bytes(vga_dump)
         vga_pgm_path.write_bytes(pgm_header + vga_dump)
+    if dac_dump is not None:
+        dac_path.write_bytes(dac_dump["data"])
     if low_memory_dump is not None:
         low_memory_path.write_bytes(low_memory_dump)
     screenshot_error = (
@@ -1184,6 +1190,21 @@ def write_state_checkpoint(
                 "vga_pgm": (
                     str(vga_pgm_path)
                     if vga_dump is not None
+                    else None
+                ),
+                "dac": (
+                    {
+                        "dump": str(dac_path),
+                        "size": len(dac_dump["data"]),
+                        "bits": dac_dump["bits"],
+                        "pel_mask": dac_dump["pel_mask"],
+                        "pel_index": dac_dump["pel_index"],
+                        "state": dac_dump["state"],
+                        "write_index": dac_dump["write_index"],
+                        "read_index": dac_dump["read_index"],
+                        "first_changed": dac_dump["first_changed"],
+                    }
+                    if dac_dump is not None
                     else None
                 ),
                 "screenshot": (
@@ -1226,6 +1247,35 @@ def write_state_checkpoint(
             capture_screenshot and screenshot_error is None
         ),
         "screenshot_deferred_side_effect": False,
+    }
+
+
+def write_vga_dac_sequence_sample(
+    sequence_dir: Path,
+    index: int,
+    vga_data: bytes,
+    dac_dump: dict[str, Any],
+) -> dict[str, Any]:
+    frame_path = sequence_dir / f"frame_{index:04d}.bin"
+    dac_path = sequence_dir / f"frame_{index:04d}.dac.bin"
+    frame_path.write_bytes(vga_data)
+    dac_data = dac_dump["data"]
+    dac_path.write_bytes(dac_data)
+    return {
+        "sha256": hashlib.sha256(vga_data).hexdigest(),
+        "path": str(frame_path),
+        "dac": {
+            "sha256": hashlib.sha256(dac_data).hexdigest(),
+            "path": str(dac_path),
+            "size": len(dac_data),
+            "bits": dac_dump["bits"],
+            "pel_mask": dac_dump["pel_mask"],
+            "pel_index": dac_dump["pel_index"],
+            "state": dac_dump["state"],
+            "write_index": dac_dump["write_index"],
+            "read_index": dac_dump["read_index"],
+            "first_changed": dac_dump["first_changed"],
+        },
     }
 
 
@@ -1531,7 +1581,11 @@ def apply_post_resume_pokes(
     )
 
 
-def run_simple_key_actions(qmp: QmpClient, actions: list[str]) -> None:
+def run_simple_key_actions(
+    qmp: QmpClient,
+    actions: list[str],
+    wave_capture_active: bool = False,
+) -> bool:
     for action in actions:
         if action.startswith("wait:"):
             seconds = float(action.split(":", 1)[1])
@@ -1576,11 +1630,48 @@ def run_simple_key_actions(qmp: QmpClient, actions: list[str]) -> None:
                 raise ValueError(
                     f"capture-wave syntax: capture-wave:start|stop, got {action!r}"
                 )
-            qmp.capture_wave(operation == "start")
+            wave_capture_active = operation == "start"
+            qmp.capture_wave(wave_capture_active)
             print(f"post-restore capture wave {operation}", flush=True)
             continue
         qmp.key_hold(action, 0.5)
         print(f"post-restore key hold {action} 0.500s", flush=True)
+    return wave_capture_active
+
+
+def wave_file_is_finalized(path: Path) -> bool:
+    try:
+        size = path.stat().st_size
+        if size < 44:
+            return False
+        with path.open("rb") as source:
+            header = source.read(12)
+        if header[:4] != b"RIFF" or header[8:12] != b"WAVE":
+            return False
+        if int.from_bytes(header[4:8], "little") + 8 != size:
+            return False
+        with wave.open(str(path), "rb") as source:
+            source.getparams()
+        return True
+    except (OSError, EOFError, wave.Error):
+        return False
+
+
+def wait_for_finalized_wave_files(
+    directory: Path,
+    timeout: float,
+) -> list[Path]:
+    deadline = time.time() + timeout
+    paths: list[Path] = []
+    while time.time() < deadline:
+        paths = sorted(directory.glob("*.wav"))
+        if paths and all(wave_file_is_finalized(path) for path in paths):
+            return paths
+        time.sleep(0.05)
+    pending = ", ".join(path.name for path in paths) or "no WAV files"
+    raise RuntimeError(
+        f"timed out waiting for finalized wave capture: {pending}"
+    )
 
 
 def parse_state(data: bytes, fields: list[Field]) -> dict[str, int]:
@@ -2862,6 +2953,7 @@ def main() -> int:
             qmp_load.close()
 
     gdb = RspClient(args.host, args.gdb_port, args.timeout)
+    wave_capture_active = False
     try:
         halted_stop: str | None = None
         halted_regs: dict[str, int] | None = None
@@ -3866,7 +3958,8 @@ def main() -> int:
                                 "capture-wave syntax: capture-wave:start|stop, "
                                 f"got {key!r}"
                             )
-                        qmp_startup.capture_wave(operation == "start")
+                        wave_capture_active = operation == "start"
+                        qmp_startup.capture_wave(wave_capture_active)
                         print(f"capture wave {operation}", flush=True)
                         time.sleep(0.15)
                         continue
@@ -4341,6 +4434,7 @@ def main() -> int:
                                 vga_size,
                                 pgm_header,
                                 capture_vga=not args.omit_checkpoint_vga,
+                                capture_dac=True,
                                 capture_screenshot=args.checkpoint_screenshot,
                             )
                             state_checkpoints.append(record)
@@ -4588,7 +4682,11 @@ def main() -> int:
                 if args.post_restore_key:
                     qmp_post_restore = QmpClient(args.host, args.qmp_port, args.timeout)
                     try:
-                        run_simple_key_actions(qmp_post_restore, args.post_restore_key)
+                        wave_capture_active = run_simple_key_actions(
+                            qmp_post_restore,
+                            args.post_restore_key,
+                            wave_capture_active,
+                        )
                     finally:
                         qmp_post_restore.close()
 
@@ -4698,6 +4796,7 @@ def main() -> int:
             sequence_dir.mkdir(parents=True, exist_ok=True)
             sequence_rows: list[dict[str, Any]] = []
             previous_vga: bytes | None = None
+            previous_dac: bytes | None = None
             sequence_start = time.perf_counter()
             gdb.continue_nowait()
             qmp_sequence = QmpClient(args.host, args.qmp_port, args.timeout)
@@ -4709,8 +4808,13 @@ def main() -> int:
                         time.sleep(remaining)
                     sample_started = time.perf_counter()
                     raw = qmp_sequence.memdump(args.vga_address, vga_size)
-                    frame_path = sequence_dir / f"frame_{index:04d}.bin"
-                    frame_path.write_bytes(raw)
+                    dac_dump = qmp_sequence.dacdump()
+                    sample = write_vga_dac_sequence_sample(
+                        sequence_dir,
+                        index,
+                        raw,
+                        dac_dump,
+                    )
                     screen_path: Path | None = None
                     screenshot_error: str | None = None
                     if args.screenshot:
@@ -4732,7 +4836,15 @@ def main() -> int:
                         if previous_vga is None
                         else sum(left != right for left, right in zip(previous_vga, raw))
                     )
-                    frame_sha256 = hashlib.sha256(raw).hexdigest()
+                    changed_dac_bytes = (
+                        0
+                        if previous_dac is None
+                        else sum(
+                            left != right
+                            for left, right in zip(previous_dac, dac_dump["data"])
+                        )
+                    )
+                    frame_sha256 = sample["sha256"]
                     sequence_rows.append(
                         {
                             "index": index,
@@ -4740,13 +4852,14 @@ def main() -> int:
                             "sample_started_seconds": sample_started - sequence_start,
                             "sample_finished_seconds": sample_finished - sequence_start,
                             "changed_pixels_from_previous": changed_pixels,
-                            "sha256": frame_sha256,
-                            "path": str(frame_path),
+                            "changed_dac_bytes_from_previous": changed_dac_bytes,
+                            **sample,
                             "screenshot": str(screen_path) if screen_path else None,
                             "screenshot_error": screenshot_error,
                         }
                     )
                     previous_vga = raw
+                    previous_dac = dac_dump["data"]
                     if (args.vga_sequence_stop_sha256 and (
                         frame_sha256 == args.vga_sequence_stop_sha256.lower()
                     )):
@@ -4811,6 +4924,12 @@ def main() -> int:
         if stop is None or regs is None:
             raise RuntimeError("internal error: final capture was not halted")
         qmp = QmpClient(args.host, args.qmp_port, args.timeout)
+        wave_capture_stop_queued = False
+        if wave_capture_active:
+            qmp.capture_wave(False)
+            wave_capture_active = False
+            wave_capture_stop_queued = True
+            print("queued capture wave auto-stop at final halt", flush=True)
         dump_segment = regs[args.dump_segment]
         ds_linear = dump_segment << 4
         dump = qmp.memdump(ds_linear, args.dump_size)
@@ -4867,6 +4986,41 @@ def main() -> int:
             args.out_dir,
             state_checkpoints,
         )
+        wave_finalization_path: Path | None = None
+        if wave_capture_stop_queued:
+            # The pinned backend acknowledges QMP input events on its socket
+            # thread but applies them on the emulation thread. Preserve all
+            # halted-state evidence first, then release execution so the
+            # queued stop can close and finalize the RIFF header.
+            gdb.continue_nowait()
+            finalized_waves = wait_for_finalized_wave_files(
+                args.out_dir,
+                args.timeout,
+            )
+            wave_finalization_path = (
+                args.out_dir / "wave-capture-finalization.json"
+            )
+            wave_finalization_path.write_text(
+                json.dumps(
+                    {
+                        "format_version": 1,
+                        "method": (
+                            "queued_qmp_stop_serviced_after_final_"
+                            "halted_state_evidence"
+                        ),
+                        "state_evidence_written_before_continue": True,
+                        "waves": [path.name for path in finalized_waves],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            print(
+                f"finalized {len(finalized_waves)} wave capture(s)",
+                flush=True,
+            )
         summary_path = write_capture_summary(args.out_dir)
 
         print(f"halt stop: {stop}", flush=True)
@@ -4880,6 +5034,8 @@ def main() -> int:
         print(f"wrote {summary_path}", flush=True)
         if screenshot_provenance_path is not None:
             print(f"wrote {screenshot_provenance_path}", flush=True)
+        if wave_finalization_path is not None:
+            print(f"wrote {wave_finalization_path}", flush=True)
         print(f"wrote {dump_path} ({len(dump)} bytes from linear 0x{ds_linear:05x})", flush=True)
         if lowmem_dump is not None:
             print(f"wrote {lowmem_path} ({len(lowmem_dump)} bytes from linear 0x00000)", flush=True)

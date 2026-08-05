@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Any
+from typing import Any, List, Tuple
 
 from .movie import load_movie
 from .remote_capture import load_state_input_script
 
 
-StateInputEvent = tuple[int, bool, list[str]]
+StateInputEvent = Tuple[int, bool, List[str]]
 
 
 def _sha256(path: Path) -> str:
