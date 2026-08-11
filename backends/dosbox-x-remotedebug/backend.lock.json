@@ -6,7 +6,7 @@
   },
   "patch": {
     "path": "dosbox-x-remotedebug.patch",
-    "sha256": "1e21ec13f9b85b9d747b0737d5390eb1f2ef95424dbcc999b76edb553a4cb675"
+    "sha256": "26c34f89a125219d1602f3e98ceb52d531ca1183f3cc5f0dc62e3a2fb86ed3b1"
   },
   "license": "GPL-2.0-only"
 }

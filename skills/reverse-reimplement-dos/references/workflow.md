@@ -135,12 +135,33 @@ Wall-clock sleeps are a fallback, not deterministic replay. Move repeated
 sequences into versioned input movies. For strict parity, tie input changes to
 emulated ticks or explicit state transitions.
 
+Use three execution tiers instead of making every iteration a full proof run:
+
+- portable-only: run headless reimplementation traces and regressions without
+  starting DOSBox-X;
+- scout: use guest-state input and optional DOSBox-X turbo mode to locate
+  visual, simulation, and breakpoint frontiers quickly;
+- proof: use the pinned non-turbo configuration for final framebuffer, device,
+  audio, and timing evidence.
+
+Before accepting turbo for a target domain, compare a short turbo/non-turbo
+pair at the same guest-state boundary. Exact final gameplay state or VGA does
+not prove exact interrupt-driven audio: compare the device write stream
+separately. Never promote turbo audio evidence after the write order or values
+diverge.
+
 For DOSBox-X screenshot side effects, treat an empty QMP payload or a newly
 created zero-byte PNG as missing evidence. Snapshot the root PNG baseline
 before any VRAM dump that can trigger the backend encoder, then accept a
 deferred side effect only after its size is nonzero and stable. Emit a
 per-checkpoint hash/provenance manifest so a later verifier can distinguish
 complete image evidence from a transient file race.
+
+When a timed sequence has already identified a transition framebuffer hash,
+stop on that hash and request a running screenshot only for the matched
+sample. Do not recapture screenshots for every unchanged leading sample.
+Apply the same stable deferred-side-effect recovery and retain the matched
+sample index, time, framebuffer hash, and screenshot hash together.
 
 Capture registers and segment bases with memory. In real mode, record whether
 addresses are segment-relative or linear. Do not compare a DS-relative field
@@ -176,6 +197,21 @@ it. The summary hashes large embedded input scripts and state records instead
 of expanding them. Captured PCM WAVs are summarized by hash, format, duration,
 peak, DC offset, RMS, and per-channel metrics. The full evidence remains
 authoritative on disk.
+
+For a fixed memory or device artifact repeated at `breakpoint_hit-N`, build a
+generic ordered index before decoding target semantics:
+
+```text
+dos-re index-checkpoints CAPTURE \
+  --artifact remote_runtime_lowmem.bin \
+  --offset 0xa0000 --length 64000 \
+  --register cs --register eip \
+  --expected-hits 2,7,12 --out checkpoint-index.json
+```
+
+This validates the declared hit series, hashes each complete artifact and
+slice, and hashes the ordered checkpoint records. Segment interpretation,
+field layouts, and breakpoint meaning remain target-local.
 
 If a breakpoint series exposes a hardware or subsystem write ABI as two
 registers, extract its ordered masked pairs with:

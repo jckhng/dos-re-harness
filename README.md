@@ -350,6 +350,13 @@ Copy-Item .work\dosbox-x-remotedebug\src\dosbox-x `
 .\scripts\dos-re.ps1 doctor tests\fixtures\minimal-project\project.json
 ```
 
+After the first configured build, `-Build` runs incremental `make`. Use
+`-Build -Reconfigure` only after build-system or dependency changes. Override
+the conservative three-job default inside WSL with
+`DOS_RE_HARNESS_BUILD_JOBS` when the host has additional capacity. Successful
+incremental output is retained in the private backend checkout as
+`.dos-re-harness-incremental-build.log`; failures are printed in full.
+
 The source revision, patches, and expected hashes are recorded under
 `backends/dosbox-x-remotedebug/`. If a patched backend binary is distributed,
 follow the corresponding-source obligations recorded in
@@ -466,6 +473,24 @@ Add `--json` for compact structured output or `--out PATH` to write
 represented by counts and SHA-256 identities; the original evidence remains
 unchanged. PCM WAV files below the capture directory are indexed with their
 hash, format, duration, peak, DC offset, RMS, and per-channel metrics.
+
+Index a repeated-breakpoint artifact without writing a target-specific loop:
+
+```powershell
+dos-re index-checkpoints `
+    projects\example\.work\captures\renderer-series `
+    --artifact remote_runtime_lowmem.bin `
+    --offset 0xA0000 `
+    --length 64000 `
+    --register cs --register eip `
+    --expected-hits 2,7,12 `
+    --out projects\example\.work\analysis\renderer-series.index.json
+```
+
+The index validates checkpoint directories against the capture-declared hit
+series, records whole-artifact and selected-slice hashes, includes only the
+requested registers, and emits a stable aggregate series hash. Addresses,
+field decoding, and the breakpoint's meaning remain in the target adapter.
 
 Capture-adapter configuration values and scenario arguments can be overridden
 without editing a tracked scenario:
@@ -596,6 +621,10 @@ Timed VGA sequences retain both the indexed framebuffer and the 256-entry DAC
 palette for every sample. Each row in `vga_sequence.json` records independent
 hashes and change counts for pixels and palette bytes, so palette-only fades,
 flashes, and cycling remain observable even when framebuffer memory is static.
+Pair `-VgaSequenceStopSha256` with `-VgaSequenceScreenshotOnStop` to request
+one running screenshot only when a sample matches the target framebuffer hash.
+This avoids screenshotting every earlier sample and recovers the pinned
+backend's deferred root-PNG side effect into the matched sequence frame.
 Use `-CheckpointSaveState` only when the final startup action is a state
 checkpoint. It writes `remote_runtime.sav` beside that checkpoint and records
 its size, SHA-256, request boundary, post-save registers, and post-save schema
@@ -684,10 +713,32 @@ address, `breakso:<segment>:<offset>` packs the two 16-bit components without
 assuming that the packet accepts a physical linear address.
 `breaksonth:<segment>:<offset>:<positive-hit-count>` combines that packed
 address form with deterministic nth-hit stopping.
+`breakseries:<segment>:<offset>:<hit>+<hit>[+<hit>...]` captures several
+strictly increasing ordinals during one ordinary startup movie. It writes the
+same `checkpoints/breakpoint_hit-<hit>/` evidence as the post-resume series and
+leaves the CPU halted at the final requested hit. Use `+` because commas
+separate startup actions.
 `runfor:<positive-seconds>` resumes an already halted guest for a bounded
 host duration and re-halts it. This is intended for cleanup after an exact
 checkpoint, such as allowing a DOS program to exit and finalize native
 capture files; it is not an emulated-tick synchronization primitive.
+Use the generic launcher's `-RemoteTimeout` only when an individual RSP or QMP
+operation can legitimately exceed the default 10 seconds, such as a blocking
+guest routine under heavy instrumentation. This changes the remote operation
+deadline; it does not change guest time, state predicates, or capture delay.
+
+Use `-Turbo` only as an opt-in scouting accelerator. Establish its validity
+with a short turbo/non-turbo pair at the same guest-state boundary. Exact
+gameplay state and VGA do not establish exact interrupt or audio behavior, so
+device-write and waveform proof captures must remain non-turbo unless those
+domains also compare exactly.
+
+For long deterministic routes, `-StateInputHookLinear`, `-StateInputLinear`,
+and `-StateInputWidth` let the pinned backend apply the input movie at an exact
+guest instruction and monotonically increasing guest state. This removes
+host-side input polling from the route. `-StateInputLogPath` records the
+applied transitions. Keep the hook address and state-field interpretation in
+the target adapter.
 
 The generic WSL launcher also accepts `-CaptureVideo`. It wraps the configured
 DOS program with DOSBox-X `DX-CAPTURE /V`, leaving the resulting native AVI in

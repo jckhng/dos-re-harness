@@ -9,6 +9,9 @@ exposes:
   memory writes;
 - a QMP endpoint for memory reads, keyboard injection, screenshots,
   save-state operations, execution breakpoints, and wave capture.
+- opt-in, file-backed keyboard transitions at an exact physical-linear guest
+  instruction and monotonic 1-, 2-, or 4-byte guest state counter, avoiding a
+  remote stop for every emulated tick while retaining an applied-event log.
 
 The patch and DOSBox-X-derived backend are GPL-2.0-only. See `COPYING`.
 Distributing a patched executable requires satisfying the corresponding-source
@@ -23,7 +26,9 @@ Prepare a pinned checkout and apply the patch from Windows:
 ```
 
 Add `-Build` after installing the upstream Linux build dependencies. The build
-uses `./build-debug --enable-remotedebug` inside WSL.
+uses `./build-debug --enable-remotedebug` inside WSL for initial configuration.
+Later `-Build` invocations use incremental `make`; pass `-Reconfigure` with
+`-Build` only when configuration must be regenerated.
 
 The current proven build runs inside WSL2. This is an execution adapter, not a
 requirement that projects, Ghidra databases, reimplementations, or captures

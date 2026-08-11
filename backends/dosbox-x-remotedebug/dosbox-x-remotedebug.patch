@@ -18,6 +18,17 @@ index 0aff5d9..7aedade 100644
      union {
          KBD_KEYS key;        // For keyboard events
          uint8_t button;      // For mouse button events
+@@ -74,6 +77,10 @@ public:
+     // Process pending input events (called from main thread)
+     void process_pending_input_events();
+ 
++    // Apply file-backed key transitions at an exact guest instruction/state
++    // boundary without pausing the emulator for a remote round trip.
++    static bool process_guest_state_input(uint32_t linear_pc);
++
+ private:
+     int port;
+     int server_fd, client_fd;
 @@ -107,6 +110,8 @@ private:
      void handle_query_commands();
      void handle_memdump(const std::string& cmd);
@@ -27,6 +38,39 @@ index 0aff5d9..7aedade 100644
      void handle_savestate(const std::string& cmd);
      void handle_loadstate(const std::string& cmd);
      void handle_stop();
+@@ -131,6 +140,7 @@ void QMP_StartServer(int port);
+ void QMP_StopServer();
+ bool QMP_IsServerRunning();
+ void QMP_ProcessPendingInputEvents();
++bool QMP_ProcessGuestStateInput(uint32_t linear_pc);
+ 
+ #endif /* C_REMOTEDEBUG */
+ 
+diff --git a/src/cpu/core_normal.cpp b/src/cpu/core_normal.cpp
+index 8cfac5363..6fa30d0b1 100644
+--- a/src/cpu/core_normal.cpp
++++ b/src/cpu/core_normal.cpp
+@@ -44,6 +44,9 @@ extern bool ignore_opcode_63;
+ #if C_DEBUG
+ #include "debug.h"
+ #endif
++#if C_REMOTEDEBUG
++#include "qmp.h"
++#endif
+ 
+ #define LoadMb(off) mem_readb_inline(off)
+ #define LoadMw(off) mem_readw_inline(off)
+@@ -162,6 +165,10 @@ Bits CPU_Core_Normal_Run(void) {
+ 		return CBRET_NONE;
+ 
+ 	while (CPU_Cycles-->0) {
++		#if C_REMOTEDEBUG
++		if (QMP_ProcessGuestStateInput(SegPhys(cs) + reg_eip))
++			return CBRET_NONE;
++		#endif
+ 		LOADIP;
+ 		last_prefix=MP_NONE;
+ 		core.opcode_index=cpu.code.big*(Bitu)0x200u;
 diff --git a/src/debug/gdbserver.cpp b/src/debug/gdbserver.cpp
 index 08d306b..ba744e7 100644
 --- a/src/debug/gdbserver.cpp
@@ -44,10 +88,18 @@ diff --git a/src/debug/qmp.cpp b/src/debug/qmp.cpp
 index 0570082..7782eba 100644
 --- a/src/debug/qmp.cpp
 +++ b/src/debug/qmp.cpp
-@@ -31,10 +31,14 @@
+@@ -27,14 +27,22 @@
+ #include <algorithm>
+ #include <fstream>
+ #include <sstream>
++#include <cstdio>
++#include <cstdlib>
+ #include "qmp.h"
  #include "logging.h"
  #include "debug.h"
  #include "hardware.h"
++#include "mem.h"
++#include "pic.h"
 +#include "vga.h"
  #include "mouse.h"
  
@@ -115,7 +167,7 @@ index 0570082..7782eba 100644
  
          switch (event.type) {
              case QMPInputEventType::KeyPress:
-@@ -494,12 +511,32 @@ void QMPServer::process_pending_input_events() {
+@@ -494,12 +517,262 @@ void QMPServer::process_pending_input_events() {
              case QMPInputEventType::MouseMove:
                  Mouse_CursorMoved(event.move.x, event.move.y, 0, 0, true);
                  break;
@@ -138,6 +190,236 @@ index 0570082..7782eba 100644
      }
  }
  
++bool QMPServer::process_guest_state_input(uint32_t linear_pc) {
++    struct StateInputEvent {
++        uint32_t value;
++        bool pressed;
++        std::vector<KBD_KEYS> keys;
++        std::vector<std::string> qcodes;
++    };
++
++    static bool initialized = false;
++    static bool enabled = false;
++    static bool bootstrapped = false;
++    static uint32_t hook_linear = 0;
++    static PhysPt state_linear = 0;
++    static unsigned int state_width = 0;
++    static std::vector<StateInputEvent> events;
++    static size_t next_event = 0;
++    static FILE *event_log = nullptr;
++
++    const auto fail = [](const std::string& message) {
++        E_Exit("DOS_RE_HARNESS state input: %s", message.c_str());
++    };
++    const auto parse_number = [&fail](const char *text,
++                                      const char *name) -> unsigned long {
++        if (!text || !*text) fail(std::string("missing ") + name);
++        char *end = nullptr;
++        const unsigned long value = strtoul(text, &end, 0);
++        if (end == text || *end != '\0') {
++            fail(std::string("invalid ") + name + ": " + text);
++        }
++        return value;
++    };
++    const auto trim = [](const std::string& value) -> std::string {
++        const size_t first = value.find_first_not_of(" \t\r\n");
++        if (first == std::string::npos) return "";
++        const size_t last = value.find_last_not_of(" \t\r\n");
++        return value.substr(first, last - first + 1);
++    };
++
++    if (!initialized) {
++        initialized = true;
++        const char *script_path = getenv("DOS_RE_HARNESS_STATE_INPUT_SCRIPT");
++        if (!script_path || !*script_path) return false;
++
++        const unsigned long parsed_hook = parse_number(
++            getenv("DOS_RE_HARNESS_STATE_INPUT_HOOK_LINEAR"),
++            "hook linear address");
++        const unsigned long parsed_linear = parse_number(
++            getenv("DOS_RE_HARNESS_STATE_INPUT_LINEAR"),
++            "state linear address");
++        const unsigned long parsed_width = parse_number(
++            getenv("DOS_RE_HARNESS_STATE_INPUT_WIDTH"),
++            "state width");
++        if (parsed_hook > 0xfffffffful || parsed_linear > 0xfffffffful ||
++            (parsed_width != 1ul && parsed_width != 2ul && parsed_width != 4ul)) {
++            fail("hook, state address, or width is out of range");
++        }
++        hook_linear = static_cast<uint32_t>(parsed_hook);
++        state_linear = static_cast<PhysPt>(parsed_linear);
++        state_width = static_cast<unsigned int>(parsed_width);
++
++        std::ifstream script(script_path);
++        if (!script) fail(std::string("cannot open script: ") + script_path);
++        std::string line;
++        bool saw_header = false;
++        uint32_t previous_value = 0;
++        bool have_previous_value = false;
++        std::map<KBD_KEYS, bool> held;
++        unsigned int line_number = 0;
++        while (std::getline(script, line)) {
++            ++line_number;
++            line = trim(line);
++            if (line.empty()) continue;
++            if (!saw_header) {
++                if (line != "dos-re-state-input-script-v1") {
++                    fail("script header is not dos-re-state-input-script-v1");
++                }
++                saw_header = true;
++                continue;
++            }
++            if (line[0] == '#') continue;
++
++            const size_t equals = line.find('=');
++            const size_t dot = line.find('.', equals == std::string::npos
++                                                ? 0 : equals + 1);
++            if (equals == std::string::npos || dot == std::string::npos ||
++                equals == 0 || dot == equals + 1 || dot + 1 >= line.size()) {
++                fail("invalid event at line " + std::to_string(line_number));
++            }
++            const std::string value_text = line.substr(0, equals);
++            const unsigned long parsed_value = parse_number(
++                value_text.c_str(), "event state value");
++            if (parsed_value > 0xfffffffful) {
++                fail("event state value is out of range");
++            }
++            StateInputEvent event;
++            event.value = static_cast<uint32_t>(parsed_value);
++            const std::string transition = line.substr(
++                equals + 1, dot - equals - 1);
++            if (transition == "down") event.pressed = true;
++            else if (transition == "up") event.pressed = false;
++            else fail("invalid transition at line " +
++                      std::to_string(line_number));
++            if (have_previous_value && event.value < previous_value) {
++                fail("event state values are not ordered");
++            }
++            previous_value = event.value;
++            have_previous_value = true;
++
++            size_t key_start = dot + 1;
++            std::map<KBD_KEYS, bool> event_keys;
++            while (key_start <= line.size()) {
++                const size_t plus = line.find('+', key_start);
++                const std::string qcode = line.substr(
++                    key_start,
++                    plus == std::string::npos ? std::string::npos
++                                              : plus - key_start);
++                const KBD_KEYS key = qcode_to_kbd(qcode);
++                if (qcode.empty() || key == KBD_NONE) {
++                    fail("unknown qcode at line " +
++                         std::to_string(line_number) + ": " + qcode);
++                }
++                if (event_keys[key]) {
++                    fail("duplicate qcode at line " +
++                         std::to_string(line_number) + ": " + qcode);
++                }
++                event_keys[key] = true;
++                if (event.pressed && held[key]) {
++                    fail("qcode pressed while held at line " +
++                         std::to_string(line_number) + ": " + qcode);
++                }
++                if (!event.pressed && !held[key]) {
++                    fail("qcode released while not held at line " +
++                         std::to_string(line_number) + ": " + qcode);
++                }
++                held[key] = event.pressed;
++                event.keys.push_back(key);
++                event.qcodes.push_back(qcode);
++                if (plus == std::string::npos) break;
++                key_start = plus + 1;
++            }
++            events.push_back(event);
++        }
++        if (!saw_header || events.empty()) fail("script has no events");
++        for (const auto& item : held) {
++            if (item.second) fail("script ends with held qcodes");
++        }
++
++        const char *log_path = getenv("DOS_RE_HARNESS_STATE_INPUT_LOG");
++        if (log_path && *log_path) {
++            event_log = fopen(log_path, "wb");
++            if (!event_log) fail(std::string("cannot open log: ") + log_path);
++            fputs("tick_ms,state,phase,transition,qcode\n", event_log);
++            fflush(event_log);
++        }
++        enabled = true;
++        LOG(LOG_REMOTE, LOG_NORMAL)(
++            "State input: loaded %u events at linear 0x%08X from %s",
++            static_cast<unsigned int>(events.size()), hook_linear,
++            script_path);
++    }
++
++    if (!enabled || linear_pc != hook_linear) return false;
++    uint32_t state = 0;
++    if (state_width == 1) state = mem_readb(state_linear);
++    else if (state_width == 2) state = mem_readw(state_linear);
++    else state = mem_readd(state_linear);
++
++    bool queued_input = false;
++    const auto apply_event = [state, &queued_input, &fail](
++                                 const StateInputEvent& event,
++                                 const char *phase) {
++        if (!qmpServer) fail("QMP server is unavailable");
++        for (size_t index = 0; index < event.keys.size(); ++index) {
++            QMPInputEvent queued;
++            queued.type = event.pressed ? QMPInputEventType::KeyPress
++                                        : QMPInputEventType::KeyRelease;
++            queued.key = event.keys[index];
++            qmpServer->queue_input_event(queued);
++            queued_input = true;
++            if (event_log) {
++                fprintf(event_log, "%.6f,%u,%s,%s,%s\n",
++                        static_cast<double>(PIC_Ticks),
++                        static_cast<unsigned int>(state), phase,
++                        event.pressed ? "down" : "up",
++                        event.qcodes[index].c_str());
++            }
++        }
++        if (event_log) fflush(event_log);
++    };
++
++    if (!bootstrapped) {
++        std::map<KBD_KEYS, std::string> held;
++        while (next_event < events.size() &&
++               events[next_event].value < state) {
++            const StateInputEvent& event = events[next_event++];
++            for (size_t index = 0; index < event.keys.size(); ++index) {
++                if (event.pressed) held[event.keys[index]] = event.qcodes[index];
++                else held.erase(event.keys[index]);
++            }
++        }
++        if (!held.empty() && !qmpServer) fail("QMP server is unavailable");
++        for (const auto& item : held) {
++            QMPInputEvent queued;
++            queued.type = QMPInputEventType::KeyPress;
++            queued.key = item.first;
++            qmpServer->queue_input_event(queued);
++            queued_input = true;
++            if (event_log) {
++                fprintf(event_log, "%.6f,%u,bootstrap,down,%s\n",
++                        static_cast<double>(PIC_Ticks),
++                        static_cast<unsigned int>(state),
++                        item.second.c_str());
++            }
++        }
++        if (event_log) fflush(event_log);
++        bootstrapped = true;
++    }
++
++    if (next_event < events.size() && events[next_event].value < state) {
++        fail("guest state skipped scheduled value " +
++             std::to_string(events[next_event].value));
++    }
++    while (next_event < events.size() &&
++           events[next_event].value == state) {
++        apply_event(events[next_event], "event");
++        ++next_event;
++    }
++    return queued_input;
++}
++
 +void QMPServer::handle_capture_wave(bool start) {
 +    QMPInputEvent event;
 +    event.type = start ? QMPInputEventType::CaptureWaveStart
@@ -149,7 +431,7 @@ index 0570082..7782eba 100644
  void QMPServer::handle_send_key(const std::string& cmd) {
      // Extract hold-time (default 100ms per QEMU spec)
      // Note: hold-time is now handled by queuing press and release events
-@@ -541,6 +578,7 @@ void QMPServer::handle_send_key(const std::string& cmd) {
+@@ -541,6 +814,7 @@ void QMPServer::handle_send_key(const std::string& cmd) {
      for (auto it = kbd_keys.rbegin(); it != kbd_keys.rend(); ++it) {
          QMPInputEvent event;
          event.type = QMPInputEventType::KeyRelease;
@@ -157,7 +439,7 @@ index 0570082..7782eba 100644
          event.key = *it;
          queue_input_event(event);
      }
-@@ -736,1 +778,25 @@
+@@ -736,1 +1014,25 @@
 +void QMPServer::handle_dacdump() {
 +    std::vector<uint8_t> data;
 +    data.reserve(256u * 3u);
@@ -183,6 +465,15 @@ index 0570082..7782eba 100644
 +}
 +
  void QMPServer::handle_screendump(const std::string& cmd) {
+@@ -1124,4 +1422,8 @@ void QMP_ProcessPendingInputEvents() {
+     }
+ }
+ 
++bool QMP_ProcessGuestStateInput(uint32_t linear_pc) {
++    return QMPServer::process_guest_state_input(linear_pc);
++}
++
+ #endif /* C_REMOTEDEBUG */
 diff --git a/src/gui/sdlmain.cpp b/src/gui/sdlmain.cpp
 index d6b71c0..71a7352 100644
 --- a/src/gui/sdlmain.cpp

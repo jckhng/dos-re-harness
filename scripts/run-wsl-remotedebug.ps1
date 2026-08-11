@@ -11,6 +11,7 @@ param(
     [ValidatePattern("^[A-Za-z0-9_.-]+$")]
     [string]$CpuType = "386",
     [string]$Cycles = "fixed 5000",
+    [switch]$Turbo,
     [double]$DelaySeconds = 4.0,
     [double]$StartupDelaySeconds = 3.0,
     [string]$StartupSequence = "",
@@ -35,6 +36,7 @@ param(
     [string]$PostResumeNextBreakSegmented = "",
     [int]$PostResumeNextBreakHitCount = 1,
     [string]$CallNear = "",
+    [switch]$CallNearContinueAfterReturn,
     [string]$BreakpointLinear = "",
     [switch]$HaltAfterPoke,
     [string]$PostRestoreSequence = "",
@@ -42,9 +44,12 @@ param(
     [string[]]$WaitState = @(),
     [double]$WaitStateTimeout = 30.0,
     [double]$WaitStateInterval = 0.05,
+    [ValidateRange(0.1, 3600.0)]
+    [double]$RemoteTimeout = 10.0,
     [int]$VgaSequenceFrames = 0,
     [double]$VgaSequenceInterval = (1.0 / 70.0),
     [string]$VgaSequenceStopSha256 = "",
+    [switch]$VgaSequenceScreenshotOnStop,
     [uint32]$VgaAddress = 0xA0000,
     [int]$VgaWidth = 320,
     [int]$VgaHeight = 200,
@@ -65,6 +70,11 @@ param(
     [switch]$CaptureSfxOnly,
     [string]$OplLogPath = "",
     [string]$OplTickLinear = "",
+    [string]$StateInputHookLinear = "",
+    [string]$StateInputLinear = "",
+    [ValidateSet(1, 2, 4)]
+    [int]$StateInputWidth = 2,
+    [string]$StateInputLogPath = "",
     [switch]$CaptureVideo,
     [string]$CheckpointPostDisplayBreakSegmented = "",
     [string]$CheckpointPostDisplayPoke = "",
@@ -263,6 +273,9 @@ $checkpointSaveStateArg = if ($CheckpointSaveState) { "1" } else { "0" }
 $captureAudioArg = if ($CaptureAudio -or $CaptureSfxOnly) { "1" } else { "0" }
 $captureSfxOnlyArg = if ($CaptureSfxOnly) { "1" } else { "0" }
 $captureVideoArg = if ($CaptureVideo) { "1" } else { "0" }
+$vgaSequenceScreenshotOnStopArg = if (
+    $VgaSequenceScreenshotOnStop
+) { "1" } else { "0" }
 $checkpointPostDisplayBreakSegmentedArg = if (
     $CheckpointPostDisplayBreakSegmented.Trim().Length -gt 0
 ) { $CheckpointPostDisplayBreakSegmented } else { "__none__" }
@@ -339,7 +352,15 @@ resume_side_break_max_hits="${57}"
 resume_side_break_start_value="${58}"
 opl_log_path="${59}"
 opl_tick_linear="${60}"
-shift 60
+call_near_continue_after_return="${61}"
+remote_timeout="${62}"
+vga_sequence_screenshot_on_stop="${63}"
+state_input_hook_linear="${64}"
+state_input_linear="${65}"
+state_input_width="${66}"
+state_input_log_path="${67}"
+turbo="${68}"
+shift 68
 if [ "$program_arguments" = "__none__" ]; then
     program_arguments=""
 fi
@@ -464,6 +485,8 @@ captures = $out_dir
 cputype = $cpu_type
 core = normal
 cycles = $cycles
+turbo = $turbo
+stop turbo on key = false
 
 [sdl]
 fullscreen = false
@@ -515,6 +538,19 @@ fi
 if [ "$opl_tick_linear" != "__none__" ]; then
     runtime_env+=(DOS_RE_HARNESS_OPL_TICK_LINEAR="$opl_tick_linear")
 fi
+if [ "$state_input_hook_linear" != "__none__" ]; then
+    runtime_env+=(
+        DOS_RE_HARNESS_STATE_INPUT_SCRIPT="$input_script"
+        DOS_RE_HARNESS_STATE_INPUT_HOOK_LINEAR="$state_input_hook_linear"
+        DOS_RE_HARNESS_STATE_INPUT_LINEAR="$state_input_linear"
+        DOS_RE_HARNESS_STATE_INPUT_WIDTH="$state_input_width"
+    )
+    if [ "$state_input_log_path" != "__none__" ]; then
+        runtime_env+=(
+            DOS_RE_HARNESS_STATE_INPUT_LOG="$state_input_log_path"
+        )
+    fi
+fi
 nohup env "${runtime_env[@]}" "$dosbox" -conf "$conf" >"$log" 2>&1 &
 pid="$!"
 echo "$pid" > "$pidfile"
@@ -529,6 +565,7 @@ trap cleanup EXIT
 
 controller_args=(
     --out-dir "$out_dir"
+    --timeout "$remote_timeout"
     --startup-delay "$startup_delay_seconds"
     --delay "$delay_seconds"
     --dump-segment "$dump_segment"
@@ -545,6 +582,9 @@ controller_args=(
 )
 if [ "$vga_sequence_stop_sha256" != "__none__" ]; then
     controller_args+=(--vga-sequence-stop-sha256 "$vga_sequence_stop_sha256")
+fi
+if [ "$vga_sequence_screenshot_on_stop" = "1" ]; then
+    controller_args+=(--vga-sequence-screenshot-on-stop)
 fi
 if [ "$break_linear" != "__none__" ]; then
     controller_args+=(--break-linear "$break_linear")
@@ -616,6 +656,9 @@ if [ "$post_resume_next_break_segmented" != "__none__" ]; then
 fi
 if [ "$call_near" != "__none__" ]; then
     controller_args+=(--call-near "$call_near")
+fi
+if [ "$call_near_continue_after_return" = "1" ]; then
+    controller_args+=(--call-near-continue-after-return)
 fi
 if [ "$halt_after_poke" = "1" ]; then
     controller_args+=(--halt-after-poke)
@@ -747,6 +790,39 @@ try {
     } else {
         "__none__"
     }
+    $stateInputHookLinearArg = if (
+        $StateInputHookLinear.Trim().Length -gt 0
+    ) {
+        if ($InputScript.Trim().Length -eq 0) {
+            throw "StateInputHookLinear requires InputScript"
+        }
+        if ($StateInputLinear.Trim().Length -eq 0) {
+            throw "StateInputHookLinear requires StateInputLinear"
+        }
+        $StateInputHookLinear
+    } else {
+        if ($StateInputLinear.Trim().Length -gt 0) {
+            throw "StateInputLinear requires StateInputHookLinear"
+        }
+        if ($StateInputLogPath.Trim().Length -gt 0) {
+            throw "StateInputLogPath requires StateInputHookLinear"
+        }
+        "__none__"
+    }
+    $stateInputLinearArg = if ($StateInputLinear.Trim().Length -gt 0) {
+        $StateInputLinear
+    } else {
+        "__none__"
+    }
+    $stateInputLogPathWsl = if (
+        $StateInputLogPath.Trim().Length -gt 0
+    ) {
+        Convert-WindowsPathToWsl (
+            Resolve-WorkspacePath $repoRoot $StateInputLogPath -AllowMissing
+        )
+    } else {
+        "__none__"
+    }
     $postResumeBreakLinearArg = if (
         $PostResumeBreakLinear.Trim().Length -gt 0
     ) {
@@ -795,6 +871,10 @@ try {
     $postResumeContinueAfterPokeArg = if (
         $PostResumeContinueAfterPoke
     ) { "1" } else { "0" }
+    $callNearContinueAfterReturnArg = if (
+        $CallNearContinueAfterReturn
+    ) { "1" } else { "0" }
+    $turboArg = if ($Turbo) { "true" } else { "false" }
     $loadSaveStateWsl = if ($LoadSaveState.Trim().Length -gt 0) {
         Convert-WindowsPathToWsl (
             Resolve-WorkspacePath $repoRoot $LoadSaveState
@@ -810,7 +890,7 @@ try {
         "__none__"
     }
     # Keep the legacy $captureVideoArg @StartupKey ordering contract visible.
-    & wsl.exe --exec bash $tempScriptWsl $repoRootWsl $outPathWsl $Program $mountPathWsl $DelaySeconds $StartupDelaySeconds $DumpSize $DumpSegment $keep $screenshotArg $WaitStateTimeout $WaitStateInterval $restoreRegistersWsl $haltAfterPokeArg $dumpLowMemoryArg $callNearArg $VgaSequenceFrames $VgaSequenceInterval $vgaSequenceStopSha256Arg $captureAudioArg $captureSfxOnlyArg $stateSchemaWsl $screenSignaturesWsl $toolkitRootWsl $dosboxBinaryWsl $RuntimeName $Machine $CpuType $Cycles $programArgumentsArg $VgaAddress $VgaWidth $VgaHeight $breakpointLinearArg $inputScriptWsl $resumeCheckpointScriptArg $resumeNextLinearArg $omitCheckpointVgaArg $checkpointScreenshotArg $postResumeBreakLinearArg $PostResumeBreakHitCount $postResumeBreakSegmentedArg $postResumeNextBreakLinearArg $PostResumeNextBreakHitCount $postResumeNextBreakSegmentedArg $postResumeBreakHitSeriesArg $postResumeContinueAfterPokeArg $checkpointSaveStateArg $loadSaveStateWsl $loadSaveStateReadyScreenArg $LoadSaveStateReadyTimeout $captureVideoArg $checkpointPostDisplayBreakSegmentedArg $checkpointPostDisplayPokeArg $CheckpointPostDisplayDelay $resumeSideBreakSegmentedArg $ResumeSideBreakMaxHits $ResumeSideBreakStartValue $oplLogPathArg $oplTickLinearArg @StartupKey --pokes @Poke --poke-files @pokeFilesWsl --post-restore @PostRestoreKey --wait-state @WaitState --post-resume-pokes @PostResumePoke --post-resume-poke-files @postResumePokeFilesWsl
+    & wsl.exe --exec bash $tempScriptWsl $repoRootWsl $outPathWsl $Program $mountPathWsl $DelaySeconds $StartupDelaySeconds $DumpSize $DumpSegment $keep $screenshotArg $WaitStateTimeout $WaitStateInterval $restoreRegistersWsl $haltAfterPokeArg $dumpLowMemoryArg $callNearArg $VgaSequenceFrames $VgaSequenceInterval $vgaSequenceStopSha256Arg $captureAudioArg $captureSfxOnlyArg $stateSchemaWsl $screenSignaturesWsl $toolkitRootWsl $dosboxBinaryWsl $RuntimeName $Machine $CpuType $Cycles $programArgumentsArg $VgaAddress $VgaWidth $VgaHeight $breakpointLinearArg $inputScriptWsl $resumeCheckpointScriptArg $resumeNextLinearArg $omitCheckpointVgaArg $checkpointScreenshotArg $postResumeBreakLinearArg $PostResumeBreakHitCount $postResumeBreakSegmentedArg $postResumeNextBreakLinearArg $PostResumeNextBreakHitCount $postResumeNextBreakSegmentedArg $postResumeBreakHitSeriesArg $postResumeContinueAfterPokeArg $checkpointSaveStateArg $loadSaveStateWsl $loadSaveStateReadyScreenArg $LoadSaveStateReadyTimeout $captureVideoArg $checkpointPostDisplayBreakSegmentedArg $checkpointPostDisplayPokeArg $CheckpointPostDisplayDelay $resumeSideBreakSegmentedArg $ResumeSideBreakMaxHits $ResumeSideBreakStartValue $oplLogPathArg $oplTickLinearArg $callNearContinueAfterReturnArg $RemoteTimeout $vgaSequenceScreenshotOnStopArg $stateInputHookLinearArg $stateInputLinearArg $StateInputWidth $stateInputLogPathWsl $turboArg @StartupKey --pokes @Poke --poke-files @pokeFilesWsl --post-restore @PostRestoreKey --wait-state @WaitState --post-resume-pokes @PostResumePoke --post-resume-poke-files @postResumePokeFilesWsl
     if ($LASTEXITCODE -ne 0) {
         throw "wsl.exe failed with exit code $LASTEXITCODE"
     }

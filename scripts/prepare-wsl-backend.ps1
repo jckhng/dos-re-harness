@@ -1,6 +1,7 @@
 param(
     [string]$ForkDir = ".work\dosbox-x-remotedebug",
-    [switch]$Build
+    [switch]$Build,
+    [switch]$Reconfigure
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,6 +15,10 @@ $forkPath = if ([System.IO.Path]::IsPathRooted($ForkDir)) {
 }
 $patchPath = Join-Path $toolkitRoot `
     "backends\dosbox-x-remotedebug\dosbox-x-remotedebug.patch"
+
+if ($Reconfigure -and -not $Build) {
+    throw "Reconfigure requires Build"
+}
 
 if (-not (Test-Path -LiteralPath (Join-Path $forkPath ".git"))) {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $forkPath) |
@@ -59,14 +64,14 @@ if ($Build) {
     }
     $forkWsl = "/mnt/{0}/{1}" -f $Matches[1].ToLowerInvariant(),
         ($Matches[2] -replace "\\", "/")
-    # Git on Windows may materialize the backend's Unix-oriented source tree
-    # with CRLF endings. Normalize only tracked text files that still contain
-    # CRLF; avoiding a rewrite of already-normalized files preserves build
-    # timestamps and keeps incremental backend rebuilds incremental. NUL
-    # delimiters keep paths with spaces safe, and the private checkout is the
-    # only tree touched.
-    & wsl.exe --exec bash -lc 'cd "$1" && git ls-files -z | xargs -0 grep -IlZ $'"'"'\r'"'"' | xargs -0 -r sed -i "s/\r$//" && ./build-debug --enable-remotedebug' `
-        dos-re-build $forkWsl
+    $reconfigureArg = if ($Reconfigure) { "1" } else { "0" }
+    # Configuration is expensive and rewrites generated files. Perform it
+    # only for a fresh tree or an explicit -Reconfigure request. Once a
+    # Makefile exists, preserve dependency timestamps and use incremental
+    # make. DOS_RE_HARNESS_BUILD_JOBS can override the conservative default.
+    # The CRLF repair is confined to the one-time configuration path.
+    & wsl.exe --exec bash -lc 'cd "$1" && if [ "$2" = "1" ] || [ ! -f Makefile ]; then git ls-files -z | xargs -0 grep -IlZ $''\r'' | xargs -0 -r sed -i "s/\r$//" && ./build-debug --enable-remotedebug; else build_log=".dos-re-harness-incremental-build.log"; if make --silent --no-print-directory -j"${DOS_RE_HARNESS_BUILD_JOBS:-3}" >"$build_log" 2>&1; then echo "Incremental backend build complete (log: $build_log)."; else cat "$build_log"; exit 1; fi; fi' `
+        dos-re-build $forkWsl $reconfigureArg
     if ($LASTEXITCODE -ne 0) {
         throw "WSL DOSBox-X build failed"
     }

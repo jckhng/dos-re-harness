@@ -245,6 +245,22 @@ def parse_segmented_nth_breakpoint_action(
     return pack_segment_offset(segment, offset), hit_count
 
 
+def parse_segmented_breakpoint_series_action(
+    action: str,
+) -> tuple[int, int, list[int]]:
+    parts = action.split(":")
+    if len(parts) != 4 or parts[0] != "breakseries":
+        raise ValueError(
+            "breakseries action syntax: "
+            "breakseries:<segment>:<offset>:<hit>+<hit>[+<hit>...]"
+        )
+    segment = int(parts[1], 0)
+    offset = int(parts[2], 0)
+    pack_segment_offset(segment, offset)
+    hits = parse_breakpoint_hit_series(parts[3].replace("+", ","))
+    return segment, offset, hits
+
+
 def install_running_breakpoint(
     gdb: RspClient, linear_address: int, timeout: float
 ) -> str:
@@ -803,6 +819,33 @@ def capture_optional_screenshot(
     return None
 
 
+def capture_targeted_sequence_screenshot(
+    qmp: Any,
+    path: Path,
+    capture_root: Path,
+) -> tuple[str | None, bool]:
+    """Capture one running sequence frame, recovering a backend root PNG."""
+    before_screens = set(capture_root.glob("*.png"))
+    error = capture_optional_screenshot(qmp, path)
+    if error is None:
+        return None, False
+    side_effects = sorted(
+        (
+            candidate
+            for candidate in capture_root.glob("*.png")
+            if candidate not in before_screens
+        ),
+        key=lambda candidate: candidate.stat().st_mtime_ns,
+        reverse=True,
+    )
+    for side_effect in side_effects:
+        data = _read_stable_nonempty_file(side_effect, 1.0)
+        if data is not None:
+            path.write_bytes(data)
+            return None, True
+    return error, False
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -944,7 +987,10 @@ def recover_checkpoint_screenshot_side_effects(
     requested = [
         record
         for record in state_checkpoints
-        if record.get("screenshot_requested") is True
+        if (
+            record.get("screenshot_requested") is True
+            and record.get("screenshot_exact_checkpoint") is not True
+        )
     ]
     if not requested:
         return 0
@@ -1279,6 +1325,20 @@ def write_vga_dac_sequence_sample(
     }
 
 
+def should_capture_vga_sequence_screenshot(
+    capture_all: bool,
+    capture_on_stop: bool,
+    stop_sha256: str,
+    frame_sha256: str,
+) -> bool:
+    """Return whether this running VGA sample needs a screenshot."""
+    return capture_all or (
+        capture_on_stop
+        and bool(stop_sha256)
+        and frame_sha256 == stop_sha256.lower()
+    )
+
+
 def capture_post_display_screenshot(
     gdb: RspClient,
     qmp: QmpClient,
@@ -1461,6 +1521,74 @@ def capture_post_display_screenshot(
     )
 
 
+def capture_halted_breakpoint_screenshot(
+    gdb: RspClient,
+    qmp: QmpClient,
+    timeout: float,
+    breakpoint_backend_address: int,
+    breakpoint_linear_address: int,
+    vga_address: int,
+    vga_size: int,
+    checkpoint_record: dict[str, Any],
+    delay: float,
+) -> None:
+    """Capture an exact screenshot while preserving a breakpoint series.
+
+    DOSBox-X cannot reliably service QMP screendump while stopped in its GDB
+    loop. Replace the halted instruction with a temporary self-loop, let the
+    emulator run, capture the stable display, then restore both the instruction
+    and breakpoint before the series controller steps to its next hit.
+    """
+    checkpoint_path = Path(checkpoint_record["path"])
+    metadata_path = checkpoint_path / "remote_runtime_registers.json"
+    screenshot_path = checkpoint_path / "remote_runtime_screen.png"
+    poke_bytes = b"\xeb\xfe"
+    gdb.remove_breakpoint(breakpoint_backend_address)
+    original = gdb.read_memory(breakpoint_linear_address, len(poke_bytes))
+    screenshot_error: str | None = None
+    try:
+        gdb.write_memory(breakpoint_linear_address, poke_bytes)
+        gdb.continue_nowait()
+        time.sleep(delay)
+        qmp.memdump(vga_address, vga_size)
+        screenshot_error = capture_optional_screenshot(qmp, screenshot_path)
+    finally:
+        gdb.halt(timeout)
+        gdb.write_memory(breakpoint_linear_address, original)
+        gdb.insert_breakpoint(breakpoint_backend_address)
+    if screenshot_error is not None:
+        raise RuntimeError(screenshot_error)
+    screenshot_poke = {
+        "address": breakpoint_linear_address,
+        "bytes": poke_bytes.hex(),
+        "restored": original.hex(),
+    }
+    checkpoint_record.update(
+        {
+            "screenshot": str(screenshot_path),
+            "screenshot_requested": True,
+            "screenshot_error": None,
+            "screenshot_exact_checkpoint": True,
+            "screenshot_poke": screenshot_poke,
+            "screenshot_deferred_side_effect": False,
+        }
+    )
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata.update(
+        {
+            "screenshot": str(screenshot_path),
+            "screenshot_error": None,
+            "screenshot_exact_checkpoint": True,
+            "screenshot_poke": screenshot_poke,
+            "screenshot_deferred_side_effect": False,
+        }
+    )
+    metadata_path.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
 def capture_configured_post_display(
     gdb: RspClient,
     qmp: QmpClient,
@@ -1525,6 +1653,18 @@ def parse_poke_file(spec: str, regs: dict[str, int]) -> tuple[int, Path]:
     if not path.exists():
         raise FileNotFoundError(f"poke-file path does not exist: {path}")
     return address, path
+
+
+def interrupted_probe_manifest(args: Any) -> dict[str, Any]:
+    """Describe direct controls applied at the initial interrupted stop."""
+    return {
+        "poke": args.poke,
+        "poke_file": args.poke_file,
+        "call_near": args.call_near,
+        "call_near_continue_after_return": (
+            args.call_near_continue_after_return
+        ),
+    }
 
 
 def apply_halted_poke_files(
@@ -2422,6 +2562,15 @@ def main() -> int:
                         help="Restore registers from a remote_runtime_registers.json file after pokes")
     parser.add_argument("--call-near", type=lambda s: int(s, 0),
                         help="Push current IP and continue at a near function offset in the current CS")
+    parser.add_argument(
+        "--call-near-continue-after-return",
+        action="store_true",
+        help=(
+            "After --call-near stops again at its original breakpoint, "
+            "remove that breakpoint, step the return instruction, and "
+            "continue for the normal final delay"
+        ),
+    )
     parser.add_argument("--halt-after-poke", action="store_true",
                         help="Capture immediately after pokes/register restore instead of continuing")
     parser.add_argument("--post-restore-key", action="append", default=[],
@@ -2656,6 +2805,14 @@ def main() -> int:
         default="",
         help="Halt the sequence after capturing a VGA frame with this SHA-256 hash.",
     )
+    parser.add_argument(
+        "--vga-sequence-screenshot-on-stop",
+        action="store_true",
+        help=(
+            "Capture one running screenshot only when the VGA sequence "
+            "matches --vga-sequence-stop-sha256."
+        ),
+    )
     parser.add_argument("--dump-segment", choices=["ds", "ss"], default="ss")
     parser.add_argument("--dump-size", type=lambda s: int(s, 0), default=0x4e00)
     parser.add_argument("--timeout", type=float, default=10.0)
@@ -2688,6 +2845,14 @@ def main() -> int:
         )
     if args.checkpoint_post_display_delay <= 0:
         parser.error("--checkpoint-post-display-delay must be positive")
+    if (
+        args.vga_sequence_screenshot_on_stop
+        and not args.vga_sequence_stop_sha256
+    ):
+        parser.error(
+            "--vga-sequence-screenshot-on-stop requires "
+            "--vga-sequence-stop-sha256"
+        )
     post_resume_break_hit_series = (
         parse_breakpoint_hit_series(args.post_resume_break_hit_series)
         if args.post_resume_break_hit_series is not None
@@ -2827,6 +2992,17 @@ def main() -> int:
         parser.error(
             "post-resume breakpoints require "
             "--resume-checkpoint-script"
+        )
+    if args.call_near_continue_after_return and args.call_near is None:
+        parser.error(
+            "--call-near-continue-after-return requires --call-near"
+        )
+    if args.call_near_continue_after_return and (
+        args.halt_after_poke or args.resume_checkpoint_script
+    ):
+        parser.error(
+            "--call-near-continue-after-return cannot be combined with "
+            "--halt-after-poke or --resume-checkpoint-script"
         )
     if post_resume_break_hit_series is not None and (
         args.post_resume_break_linear is None
@@ -3016,7 +3192,7 @@ def main() -> int:
                         else None
                     ),
                     "break_linear": args.break_linear,
-                    "poke_file": args.poke_file,
+                    **interrupted_probe_manifest(args),
                     "restore_registers": (
                         str(args.restore_registers)
                         if args.restore_registers is not None
@@ -3908,6 +4084,87 @@ def main() -> int:
                             flush=True,
                         )
                         continue
+                    if key.startswith("breakseries:"):
+                        segment, offset, hit_counts = (
+                            parse_segmented_breakpoint_series_action(key)
+                        )
+                        backend_address = pack_segment_offset(segment, offset)
+                        expected_eip = (segment << 4) + offset
+                        if halted_stop is None:
+                            halted_stop = gdb.halt(args.timeout)
+                            halted_regs = gdb.registers()
+                        breakpoint_records: list[dict[str, Any]] = []
+
+                        def capture_startup_breakpoint_hit(
+                            series_hit: int,
+                            series_stop: str,
+                            series_registers: dict[str, int],
+                        ) -> None:
+                            record = write_state_checkpoint(
+                                qmp_startup,
+                                args.out_dir / "checkpoints",
+                                "breakpoint_hit",
+                                series_hit,
+                                series_stop,
+                                series_registers,
+                                {"breakpoint_hit": series_hit},
+                                series_hit,
+                                args.dump_segment,
+                                args.dump_size,
+                                args.dump_low_memory,
+                                args.vga_address,
+                                vga_size,
+                                pgm_header,
+                                capture_vga=not args.omit_checkpoint_vga,
+                                capture_dac=True,
+                                capture_screenshot=False,
+                            )
+                            if args.checkpoint_screenshot:
+                                capture_halted_breakpoint_screenshot(
+                                    gdb,
+                                    qmp_startup,
+                                    args.timeout,
+                                    backend_address,
+                                    expected_eip,
+                                    args.vga_address,
+                                    vga_size,
+                                    record,
+                                    args.checkpoint_post_display_delay,
+                                )
+                            state_checkpoints.append(record)
+                            breakpoint_records.append(record)
+                            print(
+                                "captured startup breakpoint hit "
+                                f"{series_hit}",
+                                flush=True,
+                            )
+
+                        (
+                            halted_stop,
+                            halted_regs,
+                        ) = stop_on_post_resume_segmented_breakpoint_series(
+                            gdb,
+                            segment,
+                            offset,
+                            hit_counts,
+                            args.timeout,
+                            capture_startup_breakpoint_hit,
+                        )
+                        break_state_match = {
+                            "startup_breakpoint_series": {
+                                "segment": segment,
+                                "offset": offset,
+                                "hits": hit_counts,
+                                "checkpoints": breakpoint_records,
+                            }
+                        }
+                        print(
+                            "captured startup breakpoint series "
+                            f"{hit_counts} at {segment:04x}:{offset:04x}: "
+                            f"{halted_stop}",
+                            flush=True,
+                        )
+                        continue
                     if key.startswith("poke:"):
                         parts = key.split(":", 2)
                         if len(parts) != 3:
@@ -4119,6 +4376,7 @@ def main() -> int:
                 print(f"restored registers from {args.restore_registers}", flush=True)
                 regs = gdb.registers()
             if args.call_near is not None:
+                call_near_return_linear = regs["eip"]
                 regs = gdb.call_near(args.call_near, regs)
                 print(
                     f"call-near pushed return IP and set CS:IP to "
@@ -4128,6 +4386,29 @@ def main() -> int:
             if args.halt_after_poke:
                 halted_stop = "after-poke"
                 halted_regs = gdb.registers()
+            elif args.call_near_continue_after_return:
+                gdb.continue_nowait()
+                call_return_stop = gdb.wait_for_stop(args.timeout)
+                call_return_regs = gdb.registers()
+                if call_return_regs["eip"] != call_near_return_linear:
+                    raise RuntimeError(
+                        "call-near returned to the wrong instruction: "
+                        f"expected 0x{call_near_return_linear:05x}, "
+                        f"observed EIP 0x{call_return_regs['eip']:05x}"
+                    )
+                clear_halted_breakpoint(
+                    gdb,
+                    call_near_return_linear,
+                    args.timeout,
+                )
+                gdb.continue_nowait()
+                halted_stop = None
+                halted_regs = None
+                print(
+                    "continued after call-near return breakpoint: "
+                    f"{call_return_stop}",
+                    flush=True,
+                )
             elif args.resume_checkpoint_script:
                 (
                     linear_address,
@@ -4205,7 +4486,10 @@ def main() -> int:
                             vga_size,
                             pgm_header,
                             capture_vga=not args.omit_checkpoint_vga,
-                            capture_screenshot=args.checkpoint_screenshot,
+                            capture_screenshot=(
+                                args.checkpoint_screenshot
+                                and post_resume_break_hit_series is None
+                            ),
                             collision_namespace="resume",
                         )
                         capture_configured_post_display(
@@ -4435,8 +4719,37 @@ def main() -> int:
                                 pgm_header,
                                 capture_vga=not args.omit_checkpoint_vga,
                                 capture_dac=True,
-                                capture_screenshot=args.checkpoint_screenshot,
+                                capture_screenshot=False,
                             )
+                            if args.checkpoint_screenshot:
+                                if post_resume_break_segmented is not None:
+                                    segment, offset = post_resume_break_segmented
+                                    backend_address = pack_segment_offset(
+                                        segment,
+                                        offset,
+                                    )
+                                    screenshot_linear = (segment << 4) + offset
+                                else:
+                                    backend_address = args.post_resume_break_linear
+                                    screenshot_linear = args.post_resume_break_linear
+                                if (
+                                    backend_address is None
+                                    or screenshot_linear is None
+                                ):
+                                    raise RuntimeError(
+                                        "post-resume screenshot has no breakpoint"
+                                    )
+                                capture_halted_breakpoint_screenshot(
+                                    gdb,
+                                    qmp_breakpoints,
+                                    args.timeout,
+                                    backend_address,
+                                    screenshot_linear,
+                                    args.vga_address,
+                                    vga_size,
+                                    record,
+                                    args.checkpoint_post_display_delay,
+                                )
                             state_checkpoints.append(record)
                             breakpoint_records.append(record)
                             print(
@@ -4551,6 +4864,46 @@ def main() -> int:
                             flush=True,
                         )
                     if has_post_resume_next_break:
+                        # Preserve the first boundary before advancing to the
+                        # configured next breakpoint. This is the reusable
+                        # paired-boundary capture path: callers can compare
+                        # DS/VGA/DAC state from both entries in one emulator
+                        # run instead of aligning separate captures.
+                        qmp_first_boundary = QmpClient(
+                            args.host,
+                            args.qmp_port,
+                            args.timeout,
+                        )
+                        try:
+                            first_boundary_record = write_state_checkpoint(
+                                qmp_first_boundary,
+                                args.out_dir / "checkpoints",
+                                "post_resume_first",
+                                1,
+                                halted_stop,
+                                halted_regs,
+                                {"breakpoint_hit": 1},
+                                1,
+                                args.dump_segment,
+                                args.dump_size,
+                                args.dump_low_memory,
+                                args.vga_address,
+                                vga_size,
+                                pgm_header,
+                                capture_vga=not args.omit_checkpoint_vga,
+                                capture_dac=True,
+                                capture_screenshot=args.checkpoint_screenshot,
+                            )
+                        finally:
+                            qmp_first_boundary.close()
+                        state_checkpoints.append(first_boundary_record)
+                        break_state_match[
+                            "post_resume_first_checkpoint"
+                        ] = first_boundary_record
+                        print(
+                            "captured post-resume first-boundary checkpoint",
+                            flush=True,
+                        )
                         poke_writes = apply_post_resume_pokes(
                             gdb,
                             args.post_resume_poke,
@@ -4817,11 +5170,21 @@ def main() -> int:
                     )
                     screen_path: Path | None = None
                     screenshot_error: str | None = None
-                    if args.screenshot:
+                    screenshot_deferred_side_effect = False
+                    if should_capture_vga_sequence_screenshot(
+                        args.screenshot,
+                        args.vga_sequence_screenshot_on_stop,
+                        args.vga_sequence_stop_sha256,
+                        sample["sha256"],
+                    ):
                         screen_path = sequence_dir / f"frame_{index:04d}.png"
-                        screenshot_error = capture_optional_screenshot(
+                        (
+                            screenshot_error,
+                            screenshot_deferred_side_effect,
+                        ) = capture_targeted_sequence_screenshot(
                             qmp_sequence,
                             screen_path,
+                            args.out_dir,
                         )
                         if screenshot_error is not None:
                             screen_path = None
@@ -4856,6 +5219,9 @@ def main() -> int:
                             **sample,
                             "screenshot": str(screen_path) if screen_path else None,
                             "screenshot_error": screenshot_error,
+                            "screenshot_deferred_side_effect": (
+                                screenshot_deferred_side_effect
+                            ),
                         }
                     )
                     previous_vga = raw

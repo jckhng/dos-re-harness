@@ -55,6 +55,12 @@ the required hit ordinals into one capture. Use the harness
 `checkpoints/breakpoint_hit-*` artifacts with a target-local analyzer. Do not
 repeat full emulator startup solely to change the requested hit count.
 
+For the same problem in an ordinary startup movie, use the generic
+`breakseries:<segment>:<offset>:2+9+17` action. Reserve commas for separating
+movie actions. Use portable-only tests for routine iterations, turbo captures
+only for a target domain proven by a short A/B capture, and pinned non-turbo
+proof captures for any domain where turbo diverges.
+
 When a subsystem breakpoint must be correlated with a running state series,
 use the generic concurrent side-breakpoint controls. Arm it at a state value
 that excludes startup noise and cap the number of side hits when the routine
@@ -79,6 +85,11 @@ Read `capture_summary.json` or run `dos-re summarize-capture CAPTURE` before
 opening full register metadata. Load `remote_runtime_registers.json` only when
 the compact counts, hashes, final registers, and checkpoint index are
 insufficient.
+
+Use `dos-re index-checkpoints CAPTURE --artifact FILE` when a repeated
+breakpoint analysis needs ordered whole-file hashes, a fixed artifact slice,
+or selected registers at every `breakpoint_hit-N`. Keep segment arithmetic,
+field names, and subsystem meaning in the target-local analyzer.
 
 When a recovered subsystem has a narrow deterministic ABI, consider a
 controlled hybrid substitution: replace that routine inside a private copy or
@@ -115,6 +126,10 @@ packed executable.
   order before waveform data, and record when the backend exposes only PIC
   timestamps so that an apparent audio mismatch is not mislabelled as a
   simulation mismatch.
+- When a verified blocking guest call exceeds the generic launcher's
+  10-second RSP/QMP deadline under instrumentation, raise `-RemoteTimeout`
+  for that capture only. Do not substitute a longer host wait for an exact
+  guest-state or safe-instruction boundary.
 - Run `dos-re inspect-wave` on captured and portable PCM before opening or
   embedding full sample data. Use `dos-re diff-wave` only with explicit
   mixdown, tolerance, or frame-skip transforms, and retain those transforms

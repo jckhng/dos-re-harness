@@ -16,6 +16,7 @@ from .capture_summary import (
     format_capture_summary_line,
     write_capture_summary,
 )
+from .checkpoint_series import index_checkpoint_series
 from .evidence import write_evidence_manifest
 from .frames import write_raw_diff
 from .movie import load_movie, scenario_actions
@@ -204,6 +205,38 @@ def command_extract_write_trace(args: argparse.Namespace) -> int:
         value_register=args.value_register,
         address_mask=args.address_mask,
         value_mask=args.value_mask,
+    )
+    _emit_json(result, args.out)
+    return 0
+
+
+def _parse_hit_list(value: str) -> list[int]:
+    parts = value.split(",")
+    if any(not item.strip() for item in parts):
+        raise argparse.ArgumentTypeError(
+            "hits must be comma-separated positive integers"
+        )
+    try:
+        hits = [int(item, 0) for item in parts]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "hits must be comma-separated positive integers"
+        ) from error
+    if any(hit < 1 for hit in hits):
+        raise argparse.ArgumentTypeError("hits must be positive")
+    if any(left >= right for left, right in zip(hits, hits[1:])):
+        raise argparse.ArgumentTypeError("hits must be strictly increasing")
+    return hits
+
+
+def command_index_checkpoints(args: argparse.Namespace) -> int:
+    result = index_checkpoint_series(
+        args.capture,
+        artifact=args.artifact,
+        offset=args.offset,
+        length=args.length,
+        registers=args.register,
+        expected_hits=args.expected_hits,
     )
     _emit_json(result, args.out)
     return 0
@@ -536,6 +569,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     write_trace.add_argument("--out", type=Path, required=True)
     write_trace.set_defaults(func=command_extract_write_trace)
+
+    checkpoint_index = subparsers.add_parser(
+        "index-checkpoints",
+        help=(
+            "Hash one artifact slice and selected registers across "
+            "breakpoint_hit-N checkpoints."
+        ),
+    )
+    checkpoint_index.add_argument("capture", type=Path)
+    checkpoint_index.add_argument("--artifact", required=True)
+    checkpoint_index.add_argument(
+        "--offset", type=lambda value: int(value, 0), default=0
+    )
+    checkpoint_index.add_argument("--length", type=lambda value: int(value, 0))
+    checkpoint_index.add_argument(
+        "--register", action="append", default=[], metavar="NAME"
+    )
+    checkpoint_index.add_argument("--expected-hits", type=_parse_hit_list)
+    checkpoint_index.add_argument("--out", type=Path, required=True)
+    checkpoint_index.set_defaults(func=command_index_checkpoints)
 
     audit = subparsers.add_parser("audit-public-tree")
     audit.add_argument("root", type=Path, nargs="?", default=Path("."))
