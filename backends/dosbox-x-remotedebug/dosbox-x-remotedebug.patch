@@ -1,5 +1,37 @@
+diff --git a/include/debug.h b/include/debug.h
+index 2177e5913..e22f5a122 100644
+--- a/include/debug.h
++++ b/include/debug.h
+@@ -56,6 +56,7 @@ const char* DEBUG_GetDebuggerPauseReason(); // Returns reason: "gdb", "breakpoin
+ // Mutual exclusion between GDB and interactive debugger
+ bool DEBUG_IsInteractiveDebuggerActive(); // Returns true if interactive (curses) debugger is active
+ bool DEBUG_IsGDBClientConnected();        // Returns true if GDB client is connected
++bool DEBUG_RequestGDBStop();              // Stop at the current instruction
+ 
+ // GDB-aware program execution (for QMP debug-execute)
+ void DEBUG_SetGDBBreakOnExec(bool enable); // Set flag to break at entry for GDB
+diff --git a/include/dosbox.h b/include/dosbox.h
+index f19ffc88a..642017bd8 100644
+--- a/include/dosbox.h
++++ b/include/dosbox.h
+@@ -491,6 +491,10 @@ void readString(std::istream& stream, std::string& data)
+ // Async save/load state API for QMP
+ void SAVESTATE_RequestSave(const std::string& filepath);
+ void SAVESTATE_RequestLoad(const std::string& filepath);
++void SAVESTATE_RequestLoadPaused(const std::string& filepath);
++bool SAVESTATE_HoldAfterLoad();
++void SAVESTATE_ClearLoadPause();
++bool SAVESTATE_ConsumeLoadPauseRelease();
+ bool SAVESTATE_IsPending();
+ bool SAVESTATE_IsComplete(std::string& error_out);
+ bool SAVESTATE_CheckPendingRequest();
+@@ -501,4 +505,3 @@ int _wmkdir_p(const wchar_t *pathname);
+ #else
+ int mkdir_p(const char *pathname, mode_t mode);
+ #endif
+-
 diff --git a/include/qmp.h b/include/qmp.h
-index 0aff5d9..7aedade 100644
+index 0aff5d957..22818175a 100644
 --- a/include/qmp.h
 +++ b/include/qmp.h
 @@ -47,11 +47,14 @@ enum class QMPInputEventType {
@@ -18,36 +50,121 @@ index 0aff5d9..7aedade 100644
      union {
          KBD_KEYS key;        // For keyboard events
          uint8_t button;      // For mouse button events
-@@ -74,6 +77,10 @@ public:
+@@ -74,6 +77,12 @@ public:
      // Process pending input events (called from main thread)
      void process_pending_input_events();
  
 +    // Apply file-backed key transitions at an exact guest instruction/state
 +    // boundary without pausing the emulator for a remote round trip.
-+    static bool process_guest_state_input(uint32_t linear_pc);
++    static bool process_guest_state_input(uint32_t linear_pc,
++                                          uint32_t instruction_offset,
++                                          uint32_t ds_base);
 +
  private:
      int port;
      int server_fd, client_fd;
-@@ -107,6 +110,8 @@ private:
+@@ -106,9 +115,15 @@ private:
+     void handle_input_send_event(const std::string& cmd);
      void handle_query_commands();
      void handle_memdump(const std::string& cmd);
++    void handle_displaydump();
++    void handle_displayhistory_start(const std::string& cmd);
++    void handle_displayhistory_stop();
      void handle_screendump(const std::string& cmd);
 +    void handle_capture_wave(bool start);
 +    void handle_dacdump();
      void handle_savestate(const std::string& cmd);
-     void handle_loadstate(const std::string& cmd);
+-    void handle_loadstate(const std::string& cmd);
++    void handle_savestate_immediate(const std::string& cmd);
++    void handle_loadstate(const std::string& cmd, bool pause_after_load = false);
      void handle_stop();
-@@ -131,6 +140,7 @@ void QMP_StartServer(int port);
+     void handle_cont();
+     void handle_system_reset(const std::string& cmd);
+@@ -131,6 +146,11 @@ void QMP_StartServer(int port);
  void QMP_StopServer();
  bool QMP_IsServerRunning();
  void QMP_ProcessPendingInputEvents();
-+bool QMP_ProcessGuestStateInput(uint32_t linear_pc);
++bool QMP_ProcessGuestStateInputUsesDs();
++bool QMP_ProcessGuestStateInput(uint32_t linear_pc,
++                                uint32_t instruction_offset,
++                                uint32_t ds_base);
++uint64_t QMP_GetGuestStateInputValue();
  
  #endif /* C_REMOTEDEBUG */
  
+diff --git a/include/render.h b/include/render.h
+index 84aefeec7..11f6da1d2 100644
+--- a/include/render.h
++++ b/include/render.h
+@@ -19,6 +19,9 @@
+ #ifndef DOSBOX_RENDER_H
+ #define DOSBOX_RENDER_H
+ 
++#include <cstdint>
++#include <vector>
++
+ // 0: complex scalers off, scaler cache off, some simple scalers off, memory requirements reduced
+ // 1: complex scalers off, scaler cache off, all simple scalers on
+ // 2: complex scalers off, scaler cache on
+@@ -114,6 +117,16 @@ typedef struct Render_t {
+ 	bool autofit;
+ } Render_t;
+ 
++struct RenderSourceFrame {
++	std::vector<uint8_t> pixels;
++	std::vector<uint8_t> palette;
++	Bitu width = 0;
++	Bitu height = 0;
++	Bitu bpp = 0;
++	Bitu pitch = 0;
++	uint64_t generation = 0;
++};
++
+ #if defined(USE_TTF)
+ #include "SDL_ttf.h"
+ #define txtMaxCols 255
+@@ -190,5 +203,11 @@ void RENDER_EndUpdate(bool abort);
+ void RENDER_SetPal(uint8_t entry,uint8_t red,uint8_t green,uint8_t blue);
+ bool RENDER_GetForceUpdate(void);
+ void RENDER_SetForceUpdate(bool);
++bool RENDER_CopyLastCompletedSourceFrame(RenderSourceFrame &frame);
++uint64_t RENDER_StartCompletedSourceFrameHistory(size_t capacity);
++bool RENDER_TakeCompletedSourceFrameHistory(
++	std::vector<RenderSourceFrame> &frames,
++	size_t &capacity,
++	uint64_t &dropped);
+ 
+ #endif
+diff --git a/src/cpu/core_full.cpp b/src/cpu/core_full.cpp
+index 120d6218d..cdd3d78f5 100644
+--- a/src/cpu/core_full.cpp
++++ b/src/cpu/core_full.cpp
+@@ -27,6 +27,9 @@
+ #include "debug.h"
+ #include "inout.h"
+ #include "callback.h"
++#if C_REMOTEDEBUG
++#include "qmp.h"
++#endif
+ 
+ extern bool do_lds_wraparound;
+ extern bool ignore_opcode_63;
+@@ -77,6 +80,13 @@ Bits CPU_Core_Full_Run(void) {
+ 
+ 	while (CPU_Cycles-->0) {
+ 		cycle_count++;
++		#if C_REMOTEDEBUG
++		const uint32_t guest_ds_base = QMP_ProcessGuestStateInputUsesDs()
++			? SegPhys(ds) : 0;
++		if (QMP_ProcessGuestStateInput(SegPhys(cs) + reg_eip,
++		                               reg_eip, guest_ds_base))
++			return CBRET_NONE;
++		#endif
+ 
+ 		/* this core isn't written to emulate the Trap Flag. at least
+ 		 * let the user know. some demos (Second Reality, Future Crew)
 diff --git a/src/cpu/core_normal.cpp b/src/cpu/core_normal.cpp
-index 8cfac5363..6fa30d0b1 100644
+index 8cfac5363..982f7f894 100644
 --- a/src/cpu/core_normal.cpp
 +++ b/src/cpu/core_normal.cpp
 @@ -44,6 +44,9 @@ extern bool ignore_opcode_63;
@@ -60,38 +177,106 @@ index 8cfac5363..6fa30d0b1 100644
  
  #define LoadMb(off) mem_readb_inline(off)
  #define LoadMw(off) mem_readw_inline(off)
-@@ -162,6 +165,10 @@ Bits CPU_Core_Normal_Run(void) {
+@@ -162,6 +165,13 @@ Bits CPU_Core_Normal_Run(void) {
  		return CBRET_NONE;
  
  	while (CPU_Cycles-->0) {
 +		#if C_REMOTEDEBUG
-+		if (QMP_ProcessGuestStateInput(SegPhys(cs) + reg_eip))
++		const uint32_t guest_ds_base = QMP_ProcessGuestStateInputUsesDs()
++			? SegPhys(ds) : 0;
++		if (QMP_ProcessGuestStateInput(SegPhys(cs) + reg_eip,
++		                               reg_eip, guest_ds_base))
 +			return CBRET_NONE;
 +		#endif
  		LOADIP;
  		last_prefix=MP_NONE;
  		core.opcode_index=cpu.code.big*(Bitu)0x200u;
-diff --git a/src/debug/gdbserver.cpp b/src/debug/gdbserver.cpp
-index 08d306b..ba744e7 100644
---- a/src/debug/gdbserver.cpp
-+++ b/src/debug/gdbserver.cpp
-@@ -64,7 +64,7 @@ void GDBServer::setup_socket() {
-     fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
+@@ -240,4 +250,3 @@ Bits CPU_Core_Normal_Trap_Run(void) {
+ void CPU_Core_Normal_Init(void) {
  
-     address.sin_family = AF_INET;
--    address.sin_addr.s_addr = INADDR_ANY;
-+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-     address.sin_port = htons(port);
+ }
+-
+diff --git a/src/cpu/core_simple.cpp b/src/cpu/core_simple.cpp
+index 67bd6886c..408c56de3 100644
+--- a/src/cpu/core_simple.cpp
++++ b/src/cpu/core_simple.cpp
+@@ -37,6 +37,9 @@ extern bool ignore_opcode_63;
+ #if C_DEBUG
+ #include "debug.h"
+ #endif
++#if C_REMOTEDEBUG
++#include "qmp.h"
++#endif
  
-     if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
+ #include "paging.h"
+ #define SegBase(c)  SegPhys(c)
+@@ -178,6 +181,13 @@ Bits CPU_Core_Simple_Run(void) {
+ 		return CPU_Core_Normal_Run();
+ 
+ 	while (CPU_Cycles-->0) {
++		#if C_REMOTEDEBUG
++		const uint32_t guest_ds_base = QMP_ProcessGuestStateInputUsesDs()
++			? SegPhys(ds) : 0;
++		if (QMP_ProcessGuestStateInput(SegPhys(cs) + reg_eip,
++		                               reg_eip, guest_ds_base))
++			return CBRET_NONE;
++		#endif
+ 		LOADIP;
+ 
+ 		/* Simple core optimizes for non-paged linear memory access and can break (segfault) if beyond end of memory */
+diff --git a/src/cpu/cpu.cpp b/src/cpu/cpu.cpp
+index 1fa6f50fa..2fa2e0416 100644
+--- a/src/cpu/cpu.cpp
++++ b/src/cpu/cpu.cpp
+@@ -1134,6 +1134,7 @@ bool has_printed_triple_fault = false;
+ bool always_report_double_fault = false;
+ bool always_report_triple_fault = false;
+ 
++
+ void On_Software_CPU_Reset();
+ 
+ void CPU_Exception(Bitu which,Bitu error ) {
+diff --git a/src/debug/debug.cpp b/src/debug/debug.cpp
+index 431b82a8a..9d37f5bc5 100644
+--- a/src/debug/debug.cpp
++++ b/src/debug/debug.cpp
+@@ -6252,14 +6252,24 @@ uint32_t DEBUG_GetRegister(int reg) {
+ 
+  #define FP_SEG(x) (uint16_t)((uint32_t)(x) >> 16)
+  #define FP_OFF(x) (uint16_t)((uint32_t)(x))
+- bool DEBUG_SetBreakpoint(uint32_t address) {
++bool DEBUG_SetBreakpoint(uint32_t address) {
+      uint16_t seg = FP_SEG(address);
+      uint16_t off = FP_OFF(address);
+      DEBUG_ShowMsg("Adding Breakpoint %x:%x", seg, off);
+      return CBreakpoint::AddBreakpoint(seg, off, false);
+- }
++}
++
++bool DEBUG_RequestGDBStop() {
++    if (gdbServer == nullptr || !gdbServer->is_running() ||
++        !gdbServer->has_client()) {
++        return false;
++    }
++    gdbServer->send_stop_reply(5);
++    gdb_cpu_paused = true;
++    return true;
++}
+ 
+- bool DEBUG_RemoveBreakpoint(uint32_t address) {
++bool DEBUG_RemoveBreakpoint(uint32_t address) {
+      uint16_t seg = address >> 16;
+      uint16_t off = address;
+      DEBUG_ShowMsg("Removing Breakpoint %x:%x", seg, off);
 diff --git a/src/debug/qmp.cpp b/src/debug/qmp.cpp
-index 0570082..7782eba 100644
+index 0570082b4..32a88dbc8 100644
 --- a/src/debug/qmp.cpp
 +++ b/src/debug/qmp.cpp
-@@ -27,14 +27,22 @@
+@@ -27,13 +27,25 @@
  #include <algorithm>
  #include <fstream>
  #include <sstream>
++#include <zlib.h>
 +#include <cstdio>
 +#include <cstdlib>
  #include "qmp.h"
@@ -100,18 +285,20 @@ index 0570082..7782eba 100644
  #include "hardware.h"
 +#include "mem.h"
 +#include "pic.h"
++#include "render.h"
 +#include "vga.h"
  #include "mouse.h"
  
  static QMPServer* qmpServer = nullptr;
- 
++static uint64_t dos_re_harness_guest_state = 0;
++
 +void CAPTURE_StartWave(void);
 +void CAPTURE_StopWave(void);
-+
++std::string SAVESTATE_SaveImmediate(const std::string& filepath);
+ 
  // Base64 encoding table
  static const char base64_chars[] =
-     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-@@ -296,7 +299,7 @@ void QMPServer::setup_socket() {
+@@ -296,7 +308,7 @@ void QMPServer::setup_socket() {
      }
  
      address.sin_family = AF_INET;
@@ -120,8 +307,16 @@ index 0570082..7782eba 100644
      address.sin_port = htons(port);
  
      if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-@@ -413,6 +416,12 @@ void QMPServer::process_command(const std::string& cmd) {
+@@ -411,12 +423,28 @@ void QMPServer::process_command(const std::string& cmd) {
+         handle_query_commands();
+     } else if (execute == "memdump") {
          handle_memdump(cmd);
++    } else if (execute == "displaydump") {
++        handle_displaydump();
++    } else if (execute == "displayhistory-start") {
++        handle_displayhistory_start(cmd);
++    } else if (execute == "displayhistory-stop") {
++        handle_displayhistory_stop();
 +    } else if (execute == "dacdump") {
 +        handle_dacdump();
      } else if (execute == "screendump") {
@@ -132,18 +327,76 @@ index 0570082..7782eba 100644
 +        handle_capture_wave(false);
      } else if (execute == "savestate") {
          handle_savestate(cmd);
++    } else if (execute == "savestate-immediate") {
++        handle_savestate_immediate(cmd);
      } else if (execute == "loadstate") {
-@@ -451,6 +458,9 @@ void QMPServer::handle_query_commands() {
+         handle_loadstate(cmd);
++    } else if (execute == "loadstate-paused") {
++        handle_loadstate(cmd, true);
+     } else if (execute == "stop") {
+         handle_stop();
+     } else if (execute == "cont") {
+@@ -450,9 +478,17 @@ void QMPServer::handle_query_commands() {
+         "{\"name\": \"query-commands\"},"
          "{\"name\": \"query-status\"},"
          "{\"name\": \"memdump\"},"
++        "{\"name\": \"displaydump\"},"
++        "{\"name\": \"displayhistory-start\"},"
++        "{\"name\": \"displayhistory-stop\"},"
 +        "{\"name\": \"dacdump\"},"
          "{\"name\": \"screendump\"},"
 +        "{\"name\": \"capture-wave-start\"},"
 +        "{\"name\": \"capture-wave-stop\"},"
          "{\"name\": \"savestate\"},"
++        "{\"name\": \"savestate-immediate\"},"
          "{\"name\": \"loadstate\"},"
++        "{\"name\": \"loadstate-paused\"},"
          "{\"name\": \"stop\"},"
-@@ -469,6 +478,7 @@ void QMPServer::queue_input_event(const QMPInputEvent& event) {
+         "{\"name\": \"cont\"},"
+         "{\"name\": \"system_reset\"},"
+@@ -461,6 +497,41 @@ void QMPServer::handle_query_commands() {
+     send_response(response);
+ }
+ 
++void QMPServer::handle_savestate_immediate(const std::string& cmd) {
++    std::string args_str = extract_string(cmd, "arguments");
++    if (args_str.empty()) {
++        size_t args_pos = cmd.find("\"arguments\"");
++        if (args_pos != std::string::npos) {
++            size_t brace = cmd.find("{", args_pos);
++            if (brace != std::string::npos) {
++                int depth = 1;
++                size_t end = brace + 1;
++                while (end < cmd.size() && depth > 0) {
++                    if (cmd[end] == '{') depth++;
++                    else if (cmd[end] == '}') depth--;
++                    end++;
++                }
++                args_str = cmd.substr(brace, end - brace);
++            }
++        }
++    }
++
++    std::string file = extract_string(args_str, "file");
++    if (file.empty()) {
++        send_error("GenericError", "Missing required 'file' argument");
++        return;
++    }
++
++    std::string error = SAVESTATE_SaveImmediate(file);
++    if (error.empty()) {
++        std::ostringstream response;
++        response << "{\"return\": {\"file\": \"" << file << "\"}}\r\n";
++        send_response(response.str());
++    } else {
++        send_error("GenericError", error);
++    }
++}
++
+ void QMPServer::queue_input_event(const QMPInputEvent& event) {
+     std::lock_guard<std::mutex> lock(input_queue_mutex);
+     input_queue.push(event);
+@@ -469,6 +540,7 @@ void QMPServer::queue_input_event(const QMPInputEvent& event) {
  void QMPServer::process_pending_input_events() {
      // Process all queued events - this runs on the main thread
      std::queue<QMPInputEvent> events_to_process;
@@ -151,7 +404,7 @@ index 0570082..7782eba 100644
  
      {
          std::lock_guard<std::mutex> lock(input_queue_mutex);
-@@ -476,7 +486,14 @@ void QMPServer::process_pending_input_events() {
+@@ -476,7 +548,14 @@ void QMPServer::process_pending_input_events() {
      }
  
      while (!events_to_process.empty()) {
@@ -167,7 +420,7 @@ index 0570082..7782eba 100644
  
          switch (event.type) {
              case QMPInputEventType::KeyPress:
-@@ -494,12 +517,262 @@ void QMPServer::process_pending_input_events() {
+@@ -494,10 +573,528 @@ void QMPServer::process_pending_input_events() {
              case QMPInputEventType::MouseMove:
                  Mouse_CursorMoved(event.move.x, event.move.y, 0, 0, true);
                  break;
@@ -187,12 +440,14 @@ index 0570082..7782eba 100644
 +            input_queue.push(delayed_events.front());
 +            delayed_events.pop();
 +        }
-     }
- }
- 
-+bool QMPServer::process_guest_state_input(uint32_t linear_pc) {
++    }
++}
++
++bool QMPServer::process_guest_state_input(uint32_t linear_pc,
++                                          uint32_t instruction_offset,
++                                          uint32_t ds_base) {
 +    struct StateInputEvent {
-+        uint32_t value;
++        uint64_t value;
 +        bool pressed;
 +        std::vector<KBD_KEYS> keys;
 +        std::vector<std::string> qcodes;
@@ -201,12 +456,39 @@ index 0570082..7782eba 100644
 +    static bool initialized = false;
 +    static bool enabled = false;
 +    static bool bootstrapped = false;
++    static bool restored_initial_held_applied = false;
 +    static uint32_t hook_linear = 0;
++    static bool hook_cs_relative = false;
++    static uint32_t hook_cs_offset = 0;
++    static bool hook_alt_enabled = false;
++    static uint32_t hook_alt_offset = 0;
++    static bool primary_hook_seen = false;
 +    static PhysPt state_linear = 0;
++    static bool state_ds_relative = false;
++    static uint32_t state_ds_offset = 0;
 +    static unsigned int state_width = 0;
++    static bool state_unwrap = false;
++    static bool have_last_raw_state = false;
++    static uint32_t last_raw_state = 0;
++    static uint64_t state_epoch_base = 0;
++    static bool configured_state_epoch_base = false;
++    static bool preapplied_enabled = false;
++    static uint64_t preapplied_through = 0;
++    static bool stop_enabled = false;
++    static uint64_t stop_value = 0;
++    static bool stop_armed = false;
++    static bool state_input_write_enabled = false;
++    static bool state_input_write_ds_relative = false;
++    static PhysPt state_input_write_linear = 0;
++    static uint32_t state_input_write_offset = 0;
++    static unsigned int state_input_write_width = 0;
++    static uint32_t state_input_write_value = 0;
 +    static std::vector<StateInputEvent> events;
++    static std::map<KBD_KEYS, std::string> initial_held;
++    static std::vector<std::pair<KBD_KEYS, std::string>> initial_held_order;
 +    static size_t next_event = 0;
 +    static FILE *event_log = nullptr;
++    static FILE *trace_log = nullptr;
 +
 +    const auto fail = [](const std::string& message) {
 +        E_Exit("DOS_RE_HARNESS state input: %s", message.c_str());
@@ -227,18 +509,43 @@ index 0570082..7782eba 100644
 +        const size_t last = value.find_last_not_of(" \t\r\n");
 +        return value.substr(first, last - first + 1);
 +    };
++    const auto parse_event_value = [&fail](const std::string& text) -> uint64_t {
++        if (text.empty() || text[0] == '-') fail("invalid event state value");
++        char *end = nullptr;
++        const unsigned long long value = strtoull(text.c_str(), &end, 0);
++        if (end == text.c_str() || *end != '\0') {
++            fail("invalid event state value: " + text);
++        }
++        return static_cast<uint64_t>(value);
++    };
 +
 +    if (!initialized) {
 +        initialized = true;
 +        const char *script_path = getenv("DOS_RE_HARNESS_STATE_INPUT_SCRIPT");
-+        if (!script_path || !*script_path) return false;
++        const bool have_script = script_path && *script_path;
++        const char *stop_text = getenv(
++            "DOS_RE_HARNESS_STATE_INPUT_STOP_VALUE");
++        const bool have_stop = stop_text && *stop_text;
++        if (!have_script && !have_stop) return false;
 +
-+        const unsigned long parsed_hook = parse_number(
-+            getenv("DOS_RE_HARNESS_STATE_INPUT_HOOK_LINEAR"),
-+            "hook linear address");
-+        const unsigned long parsed_linear = parse_number(
-+            getenv("DOS_RE_HARNESS_STATE_INPUT_LINEAR"),
-+            "state linear address");
++        const char *hook_offset_text =
++            getenv("DOS_RE_HARNESS_STATE_INPUT_HOOK_OFFSET");
++        const char *state_ds_offset_text =
++            getenv("DOS_RE_HARNESS_STATE_INPUT_DS_OFFSET");
++        const bool have_hook_offset = hook_offset_text && *hook_offset_text;
++        const bool have_state_ds_offset =
++            state_ds_offset_text && *state_ds_offset_text;
++        if (have_hook_offset != have_state_ds_offset) {
++            fail("CS-relative hook and DS-relative state must be configured together");
++        }
++        const unsigned long parsed_hook = have_hook_offset
++            ? parse_number(hook_offset_text, "hook instruction offset")
++            : parse_number(getenv("DOS_RE_HARNESS_STATE_INPUT_HOOK_LINEAR"),
++                           "hook linear address");
++        const unsigned long parsed_linear = have_state_ds_offset
++            ? parse_number(state_ds_offset_text, "state DS offset")
++            : parse_number(getenv("DOS_RE_HARNESS_STATE_INPUT_LINEAR"),
++                           "state linear address");
 +        const unsigned long parsed_width = parse_number(
 +            getenv("DOS_RE_HARNESS_STATE_INPUT_WIDTH"),
 +            "state width");
@@ -247,94 +554,202 @@ index 0570082..7782eba 100644
 +            fail("hook, state address, or width is out of range");
 +        }
 +        hook_linear = static_cast<uint32_t>(parsed_hook);
-+        state_linear = static_cast<PhysPt>(parsed_linear);
-+        state_width = static_cast<unsigned int>(parsed_width);
-+
-+        std::ifstream script(script_path);
-+        if (!script) fail(std::string("cannot open script: ") + script_path);
-+        std::string line;
-+        bool saw_header = false;
-+        uint32_t previous_value = 0;
-+        bool have_previous_value = false;
-+        std::map<KBD_KEYS, bool> held;
-+        unsigned int line_number = 0;
-+        while (std::getline(script, line)) {
-+            ++line_number;
-+            line = trim(line);
-+            if (line.empty()) continue;
-+            if (!saw_header) {
-+                if (line != "dos-re-state-input-script-v1") {
-+                    fail("script header is not dos-re-state-input-script-v1");
-+                }
-+                saw_header = true;
-+                continue;
++        hook_cs_relative = have_hook_offset;
++        hook_cs_offset = static_cast<uint32_t>(parsed_hook);
++        const char *hook_alt_text =
++            getenv("DOS_RE_HARNESS_STATE_INPUT_HOOK_OFFSET_ALT");
++        if (hook_alt_text && *hook_alt_text) {
++            const unsigned long parsed_alt = parse_number(
++                hook_alt_text, "alternate hook instruction offset");
++            if (parsed_alt > 0xfffful) {
++                fail("alternate hook instruction offset is out of range");
 +            }
-+            if (line[0] == '#') continue;
-+
-+            const size_t equals = line.find('=');
-+            const size_t dot = line.find('.', equals == std::string::npos
-+                                                ? 0 : equals + 1);
-+            if (equals == std::string::npos || dot == std::string::npos ||
-+                equals == 0 || dot == equals + 1 || dot + 1 >= line.size()) {
-+                fail("invalid event at line " + std::to_string(line_number));
-+            }
-+            const std::string value_text = line.substr(0, equals);
-+            const unsigned long parsed_value = parse_number(
-+                value_text.c_str(), "event state value");
-+            if (parsed_value > 0xfffffffful) {
-+                fail("event state value is out of range");
-+            }
-+            StateInputEvent event;
-+            event.value = static_cast<uint32_t>(parsed_value);
-+            const std::string transition = line.substr(
-+                equals + 1, dot - equals - 1);
-+            if (transition == "down") event.pressed = true;
-+            else if (transition == "up") event.pressed = false;
-+            else fail("invalid transition at line " +
-+                      std::to_string(line_number));
-+            if (have_previous_value && event.value < previous_value) {
-+                fail("event state values are not ordered");
-+            }
-+            previous_value = event.value;
-+            have_previous_value = true;
-+
-+            size_t key_start = dot + 1;
-+            std::map<KBD_KEYS, bool> event_keys;
-+            while (key_start <= line.size()) {
-+                const size_t plus = line.find('+', key_start);
-+                const std::string qcode = line.substr(
-+                    key_start,
-+                    plus == std::string::npos ? std::string::npos
-+                                              : plus - key_start);
-+                const KBD_KEYS key = qcode_to_kbd(qcode);
-+                if (qcode.empty() || key == KBD_NONE) {
-+                    fail("unknown qcode at line " +
-+                         std::to_string(line_number) + ": " + qcode);
-+                }
-+                if (event_keys[key]) {
-+                    fail("duplicate qcode at line " +
-+                         std::to_string(line_number) + ": " + qcode);
-+                }
-+                event_keys[key] = true;
-+                if (event.pressed && held[key]) {
-+                    fail("qcode pressed while held at line " +
-+                         std::to_string(line_number) + ": " + qcode);
-+                }
-+                if (!event.pressed && !held[key]) {
-+                    fail("qcode released while not held at line " +
-+                         std::to_string(line_number) + ": " + qcode);
-+                }
-+                held[key] = event.pressed;
-+                event.keys.push_back(key);
-+                event.qcodes.push_back(qcode);
-+                if (plus == std::string::npos) break;
-+                key_start = plus + 1;
-+            }
-+            events.push_back(event);
++            hook_alt_enabled = true;
++            hook_alt_offset = static_cast<uint32_t>(parsed_alt);
 +        }
-+        if (!saw_header || events.empty()) fail("script has no events");
-+        for (const auto& item : held) {
-+            if (item.second) fail("script ends with held qcodes");
++        state_linear = static_cast<PhysPt>(parsed_linear);
++        state_ds_relative = have_state_ds_offset;
++        state_ds_offset = static_cast<uint32_t>(parsed_linear);
++        state_width = static_cast<unsigned int>(parsed_width);
++        if (have_stop) {
++            stop_value = parse_event_value(stop_text);
++            stop_enabled = true;
++        }
++        const char *write_offset_text = getenv(
++            "DOS_RE_HARNESS_STATE_INPUT_WRITE_OFFSET");
++        const char *write_linear_text = getenv(
++            "DOS_RE_HARNESS_STATE_INPUT_WRITE_LINEAR");
++        const bool have_write_offset = write_offset_text && *write_offset_text;
++        const bool have_write_linear = write_linear_text && *write_linear_text;
++        if (have_write_offset && have_write_linear) {
++            fail("state-input write offset and linear address are mutually exclusive");
++        }
++        if (have_write_offset || have_write_linear) {
++            state_input_write_ds_relative = have_write_offset;
++            const unsigned long parsed_write_address = have_write_offset
++                ? parse_number(write_offset_text, "state-input write DS offset")
++                : parse_number(write_linear_text, "state-input write linear address");
++            const unsigned long parsed_write_width = parse_number(
++                getenv("DOS_RE_HARNESS_STATE_INPUT_WRITE_WIDTH"),
++                "state-input write width");
++            const unsigned long parsed_write_value = parse_number(
++                getenv("DOS_RE_HARNESS_STATE_INPUT_WRITE_VALUE"),
++                "state-input write value");
++            if (parsed_write_address > 0xfffffffful ||
++                (parsed_write_width != 1ul && parsed_write_width != 2ul &&
++                 parsed_write_width != 4ul) ||
++                parsed_write_value > 0xfffffffful) {
++                fail("state-input write address, width, or value is out of range");
++            }
++            if (state_input_write_ds_relative) {
++                state_input_write_offset = static_cast<uint32_t>(
++                    parsed_write_address);
++            } else {
++                state_input_write_linear = static_cast<PhysPt>(
++                    parsed_write_address);
++            }
++            state_input_write_width = static_cast<unsigned int>(
++                parsed_write_width);
++            state_input_write_value = static_cast<uint32_t>(parsed_write_value);
++            state_input_write_enabled = true;
++        }
++
++        if (have_script) {
++            std::ifstream script(script_path);
++            if (!script) fail(std::string("cannot open script: ") + script_path);
++            std::string line;
++            bool saw_header = false;
++            uint64_t previous_value = 0;
++            bool have_previous_value = false;
++            std::map<KBD_KEYS, bool> held;
++            unsigned int line_number = 0;
++            while (std::getline(script, line)) {
++                ++line_number;
++                line = trim(line);
++                if (line.empty()) continue;
++                if (!saw_header) {
++                    if (line != "dos-re-state-input-script-v1") {
++                        fail("script header is not dos-re-state-input-script-v1");
++                    }
++                    saw_header = true;
++                    continue;
++                }
++                if (line == "# state_unwrap=1") {
++                    state_unwrap = true;
++                    continue;
++                }
++                const std::string epoch_base_prefix = "# state_epoch_base=";
++                if (line.compare(0, epoch_base_prefix.size(),
++                                 epoch_base_prefix) == 0) {
++                    if (configured_state_epoch_base) {
++                        fail("state_epoch_base was configured more than once");
++                    }
++                    state_epoch_base = parse_event_value(
++                        line.substr(epoch_base_prefix.size()));
++                    configured_state_epoch_base = true;
++                    continue;
++                }
++                const std::string preapplied_prefix = "# preapplied_through=";
++                if (line.compare(0, preapplied_prefix.size(),
++                                 preapplied_prefix) == 0) {
++                    preapplied_through = parse_event_value(
++                        line.substr(preapplied_prefix.size()));
++                    preapplied_enabled = true;
++                    continue;
++                }
++                const std::string initial_held_prefix =
++                    "# initial_held_qcodes=";
++                if (line.compare(0, initial_held_prefix.size(),
++                                 initial_held_prefix) == 0) {
++                    size_t key_start = initial_held_prefix.size();
++                    if (key_start == line.size()) continue;
++                    while (key_start <= line.size()) {
++                        const size_t plus = line.find('+', key_start);
++                        const std::string qcode = line.substr(
++                            key_start,
++                            plus == std::string::npos ? std::string::npos
++                                                      : plus - key_start);
++                        const KBD_KEYS key = qcode_to_kbd(qcode);
++                        if (qcode.empty() || key == KBD_NONE || held[key]) {
++                            fail("invalid initial held qcode at line " +
++                                 std::to_string(line_number) + ": " + qcode);
++                        }
++                        held[key] = true;
++                        initial_held[key] = qcode;
++                        initial_held_order.push_back({key, qcode});
++                        if (plus == std::string::npos) break;
++                        key_start = plus + 1;
++                    }
++                    continue;
++                }
++                if (line[0] == '#') continue;
++
++                const size_t equals = line.find('=');
++                const size_t dot = line.find('.', equals == std::string::npos
++                                                    ? 0 : equals + 1);
++                if (equals == std::string::npos || dot == std::string::npos ||
++                    equals == 0 || dot == equals + 1 || dot + 1 >= line.size()) {
++                    fail("invalid event at line " + std::to_string(line_number));
++                }
++                const std::string value_text = line.substr(0, equals);
++                StateInputEvent event;
++                event.value = parse_event_value(value_text);
++                const std::string transition = line.substr(
++                    equals + 1, dot - equals - 1);
++                if (transition == "down") event.pressed = true;
++                else if (transition == "up") event.pressed = false;
++                else fail("invalid transition at line " +
++                          std::to_string(line_number));
++                if (have_previous_value && event.value < previous_value) {
++                    fail("event state values are not ordered");
++                }
++                previous_value = event.value;
++                have_previous_value = true;
++
++                size_t key_start = dot + 1;
++                std::map<KBD_KEYS, bool> event_keys;
++                while (key_start <= line.size()) {
++                    const size_t plus = line.find('+', key_start);
++                    const std::string qcode = line.substr(
++                        key_start,
++                        plus == std::string::npos ? std::string::npos
++                                                  : plus - key_start);
++                    const KBD_KEYS key = qcode_to_kbd(qcode);
++                    if (qcode.empty() || key == KBD_NONE) {
++                        fail("unknown qcode at line " +
++                             std::to_string(line_number) + ": " + qcode);
++                    }
++                    if (event_keys[key]) {
++                        fail("duplicate qcode at line " +
++                             std::to_string(line_number) + ": " + qcode);
++                    }
++                    event_keys[key] = true;
++                    if (event.pressed && held[key]) {
++                        fail("qcode pressed while held at line " +
++                             std::to_string(line_number) + ": " + qcode);
++                    }
++                    if (!event.pressed && !held[key]) {
++                        fail("qcode released while not held at line " +
++                             std::to_string(line_number) + ": " + qcode);
++                    }
++                    held[key] = event.pressed;
++                    event.keys.push_back(key);
++                    event.qcodes.push_back(qcode);
++                    if (plus == std::string::npos) break;
++                    key_start = plus + 1;
++                }
++                events.push_back(event);
++            }
++            if (!saw_header || events.empty()) fail("script has no events");
++            for (const auto& item : held) {
++                if (item.second) fail("script ends with held qcodes");
++            }
++            if (preapplied_enabled) {
++                while (next_event < events.size() &&
++                       events[next_event].value <= preapplied_through) {
++                    ++next_event;
++                }
++            }
 +        }
 +
 +        const char *log_path = getenv("DOS_RE_HARNESS_STATE_INPUT_LOG");
@@ -344,18 +759,95 @@ index 0570082..7782eba 100644
 +            fputs("tick_ms,state,phase,transition,qcode\n", event_log);
 +            fflush(event_log);
 +        }
++        const char *trace_path = getenv("DOS_RE_HARNESS_STATE_INPUT_TRACE");
++        if (trace_path && *trace_path) {
++            trace_log = fopen(trace_path, "wb");
++            if (!trace_log) fail(std::string("cannot open trace: ") + trace_path);
++            fputs("tick_ms,state,raw_state,linear_pc,instruction_offset,ds_base,state_address\n",
++                  trace_log);
++            fflush(trace_log);
++        }
 +        enabled = true;
-+        LOG(LOG_REMOTE, LOG_NORMAL)(
-+            "State input: loaded %u events at linear 0x%08X from %s",
-+            static_cast<unsigned int>(events.size()), hook_linear,
-+            script_path);
++        if (have_script) {
++            LOG(LOG_REMOTE, LOG_NORMAL)(
++                "State input: loaded %u events at %s 0x%08X from %s",
++                static_cast<unsigned int>(events.size()),
++                hook_cs_relative ? "CS-offset" : "linear",
++                hook_linear, script_path);
++        } else {
++            LOG(LOG_REMOTE, LOG_NORMAL)(
++                "Guest state stop: armed value %llu at %s 0x%08X",
++                static_cast<unsigned long long>(stop_value),
++                hook_cs_relative ? "CS-offset" : "linear", hook_linear);
++        }
 +    }
 +
-+    if (!enabled || linear_pc != hook_linear) return false;
-+    uint32_t state = 0;
-+    if (state_width == 1) state = mem_readb(state_linear);
-+    else if (state_width == 2) state = mem_readw(state_linear);
-+    else state = mem_readd(state_linear);
++    if (!enabled) return false;
++    if (!bootstrapped && !restored_initial_held_applied &&
++        SAVESTATE_ConsumeLoadPauseRelease()) {
++        for (const auto& item : initial_held_order) {
++            KEYBOARD_AddKey(item.first, true);
++            if (event_log) {
++                fprintf(event_log, "%.6f,0,restore-bootstrap,down,%s\n",
++                        static_cast<double>(PIC_Ticks), item.second.c_str());
++            }
++        }
++        restored_initial_held_applied = !initial_held_order.empty();
++        if (event_log) fflush(event_log);
++    }
++    const PhysPt active_state_linear = state_ds_relative
++        ? static_cast<PhysPt>(ds_base + state_ds_offset) : state_linear;
++    if (hook_cs_relative) {
++        const bool primary_match = instruction_offset == hook_cs_offset ||
++                                   linear_pc == hook_cs_offset;
++        const bool alternate_match = hook_alt_enabled && primary_hook_seen &&
++                                     (instruction_offset == hook_alt_offset ||
++                                      linear_pc == hook_alt_offset);
++        if (!primary_match && !alternate_match) return false;
++        if (primary_match) primary_hook_seen = true;
++    } else if (linear_pc != hook_linear) {
++        return false;
++    }
++    if (state_input_write_enabled) {
++        const PhysPt write_address = state_input_write_ds_relative
++            ? static_cast<PhysPt>(ds_base + state_input_write_offset)
++            : state_input_write_linear;
++        if (state_input_write_width == 1) {
++            mem_writeb(write_address,
++                       static_cast<uint8_t>(state_input_write_value));
++        } else if (state_input_write_width == 2) {
++            mem_writew(write_address,
++                       static_cast<uint16_t>(state_input_write_value));
++        } else {
++            mem_writed(write_address, state_input_write_value);
++        }
++    }
++    uint32_t raw_state = 0;
++    if (state_width == 1) raw_state = mem_readb(active_state_linear);
++    else if (state_width == 2) raw_state = mem_readw(active_state_linear);
++    else raw_state = mem_readd(active_state_linear);
++    if (state_unwrap && have_last_raw_state && raw_state < last_raw_state) {
++        const uint64_t modulus = uint64_t{1} << (state_width * 8u);
++        if (state_epoch_base + modulus < state_epoch_base) {
++            fail("unwrapped guest state overflowed");
++        }
++        state_epoch_base += modulus;
++    }
++    last_raw_state = raw_state;
++    have_last_raw_state = true;
++    const uint64_t state = state_epoch_base + raw_state;
++    dos_re_harness_guest_state = state;
++    if (trace_log) {
++        fprintf(trace_log, "%.6f,%llu,%u,0x%08X,0x%08X,0x%08X,0x%08X\n",
++                static_cast<double>(PIC_Ticks),
++                static_cast<unsigned long long>(state),
++                static_cast<unsigned int>(raw_state),
++                static_cast<unsigned int>(linear_pc),
++                static_cast<unsigned int>(instruction_offset),
++                static_cast<unsigned int>(ds_base),
++                static_cast<unsigned int>(active_state_linear));
++        fflush(trace_log);
++    }
 +
 +    bool queued_input = false;
 +    const auto apply_event = [state, &queued_input, &fail](
@@ -370,9 +862,9 @@ index 0570082..7782eba 100644
 +            qmpServer->queue_input_event(queued);
 +            queued_input = true;
 +            if (event_log) {
-+                fprintf(event_log, "%.6f,%u,%s,%s,%s\n",
++                fprintf(event_log, "%.6f,%llu,%s,%s,%s\n",
 +                        static_cast<double>(PIC_Ticks),
-+                        static_cast<unsigned int>(state), phase,
++                        static_cast<unsigned long long>(state), phase,
 +                        event.pressed ? "down" : "up",
 +                        event.qcodes[index].c_str());
 +            }
@@ -381,7 +873,7 @@ index 0570082..7782eba 100644
 +    };
 +
 +    if (!bootstrapped) {
-+        std::map<KBD_KEYS, std::string> held;
++        std::map<KBD_KEYS, std::string> held = initial_held;
 +        while (next_event < events.size() &&
 +               events[next_event].value < state) {
 +            const StateInputEvent& event = events[next_event++];
@@ -391,17 +883,35 @@ index 0570082..7782eba 100644
 +            }
 +        }
 +        if (!held.empty() && !qmpServer) fail("QMP server is unavailable");
++        std::map<KBD_KEYS, bool> applied;
++        std::vector<KBD_KEYS> bootstrap_order;
++        for (const auto& item : initial_held_order) {
++            if (held.count(item.first) && !applied[item.first]) {
++                bootstrap_order.push_back(item.first);
++                applied[item.first] = true;
++            }
++        }
 +        for (const auto& item : held) {
-+            QMPInputEvent queued;
-+            queued.type = QMPInputEventType::KeyPress;
-+            queued.key = item.first;
-+            qmpServer->queue_input_event(queued);
++            if (!applied[item.first]) {
++                bootstrap_order.push_back(item.first);
++                applied[item.first] = true;
++            }
++        }
++        for (const KBD_KEYS key : bootstrap_order) {
++            const auto item = held.find(key);
++            if (item == held.end()) continue;
++            if (restored_initial_held_applied && initial_held.count(item->first)) {
++                continue;
++            }
++            KEYBOARD_AddKey(item->first, true);
 +            queued_input = true;
 +            if (event_log) {
-+                fprintf(event_log, "%.6f,%u,bootstrap,down,%s\n",
++                fprintf(event_log, "%.6f,%llu,bootstrap,down,%s\n",
 +                        static_cast<double>(PIC_Ticks),
-+                        static_cast<unsigned int>(state),
-+                        item.second.c_str());
++                        static_cast<unsigned long long>(state),
++                        initial_held.count(item->first)
++                            ? initial_held[item->first].c_str()
++                            : "");
 +            }
 +        }
 +        if (event_log) fflush(event_log);
@@ -417,6 +927,17 @@ index 0570082..7782eba 100644
 +        apply_event(events[next_event], "event");
 +        ++next_event;
 +    }
++    if (stop_enabled && !stop_armed && state == stop_value) {
++        if (!DEBUG_RequestGDBStop()) {
++            fail("cannot stop GDB client at guest state");
++        }
++        stop_armed = true;
++        queued_input = true;
++        LOG(LOG_REMOTE, LOG_NORMAL)(
++            "State input: stopped at state %llu on linear 0x%08X",
++            static_cast<unsigned long long>(state),
++            linear_pc);
+     }
 +    return queued_input;
 +}
 +
@@ -426,12 +947,10 @@ index 0570082..7782eba 100644
 +                       : QMPInputEventType::CaptureWaveStop;
 +    queue_input_event(event);
 +    send_success();
-+}
-+
+ }
+ 
  void QMPServer::handle_send_key(const std::string& cmd) {
-     // Extract hold-time (default 100ms per QEMU spec)
-     // Note: hold-time is now handled by queuing press and release events
-@@ -541,6 +814,7 @@ void QMPServer::handle_send_key(const std::string& cmd) {
+@@ -541,6 +1138,7 @@ void QMPServer::handle_send_key(const std::string& cmd) {
      for (auto it = kbd_keys.rbegin(); it != kbd_keys.rend(); ++it) {
          QMPInputEvent event;
          event.type = QMPInputEventType::KeyRelease;
@@ -439,7 +958,10 @@ index 0570082..7782eba 100644
          event.key = *it;
          queue_input_event(event);
      }
-@@ -736,1 +1014,25 @@
+@@ -733,6 +1331,120 @@ void QMPServer::handle_memdump(const std::string& cmd) {
+     send_response(response.str());
+ }
+ 
 +void QMPServer::handle_dacdump() {
 +    std::vector<uint8_t> data;
 +    data.reserve(256u * 3u);
@@ -464,18 +986,284 @@ index 0570082..7782eba 100644
 +    send_response(response.str());
 +}
 +
++void QMPServer::handle_displaydump() {
++    RenderSourceFrame frame;
++    if (!RENDER_CopyLastCompletedSourceFrame(frame)) {
++        send_error("GenericError", "No completed display frame is available");
++        return;
++    }
++
++    std::ostringstream response;
++    response << "{\"return\":{\"data\":\""
++             << base64_encode(frame.pixels)
++             << "\",\"size\": " << frame.pixels.size()
++             << ",\"palette\":\"" << base64_encode(frame.palette)
++             << "\",\"palette_size\":" << frame.palette.size()
++             << ",\"width\": " << static_cast<unsigned long>(frame.width)
++             << ",\"height\": " << static_cast<unsigned long>(frame.height)
++             << ",\"bpp\": " << static_cast<unsigned long>(frame.bpp)
++             << ",\"pitch\": " << static_cast<unsigned long>(frame.pitch)
++             << ",\"generation\": "
++             << static_cast<unsigned long long>(frame.generation)
++             << "}}\r\n";
++    send_response(response.str());
++}
++
++void QMPServer::handle_displayhistory_start(const std::string& cmd) {
++    const int capacity = extract_int(cmd, "capacity", 0);
++    if (capacity < 1 || capacity > 64) {
++        send_error("GenericError", "display history capacity must be in 1..64");
++        return;
++    }
++    const uint64_t generation = RENDER_StartCompletedSourceFrameHistory(
++        static_cast<size_t>(capacity));
++    std::ostringstream response;
++    response << "{\"return\":{\"capacity\":" << capacity
++             << ",\"generation\":"
++             << static_cast<unsigned long long>(generation)
++             << "}}\r\n";
++    send_response(response.str());
++}
++
++void QMPServer::handle_displayhistory_stop() {
++    std::vector<RenderSourceFrame> frames;
++    size_t capacity = 0;
++    uint64_t dropped = 0;
++    if (!RENDER_TakeCompletedSourceFrameHistory(frames, capacity, dropped)) {
++        send_error("GenericError", "Completed display history is not active");
++        return;
++    }
++
++    std::ostringstream response;
++    response << "{\"return\":{\"capacity\":"
++             << static_cast<unsigned long>(capacity)
++             << ",\"dropped\":"
++             << static_cast<unsigned long long>(dropped)
++             << ",\"frames\":[";
++    for (size_t index = 0; index < frames.size(); ++index) {
++        const RenderSourceFrame &frame = frames[index];
++        std::vector<uint8_t> compressed(compressBound(frame.pixels.size()));
++        uLongf compressed_size = compressed.size();
++        const int compression_status = compress2(
++            compressed.data(),
++            &compressed_size,
++            frame.pixels.data(),
++            frame.pixels.size(),
++            Z_BEST_SPEED);
++        const bool use_compressed = compression_status == Z_OK &&
++                                    compressed_size < frame.pixels.size();
++        compressed.resize(use_compressed ? compressed_size : 0);
++        const std::vector<uint8_t> &payload = use_compressed
++            ? compressed
++            : frame.pixels;
++        if (index != 0)
++            response << ',';
++        response << "{\"data\":\"" << base64_encode(payload)
++                 << "\",\"encoding\":\""
++                 << (use_compressed ? "zlib" : "raw")
++                 << "\",\"size\":" << frame.pixels.size()
++                 << ",\"palette\":\"" << base64_encode(frame.palette)
++                 << "\",\"palette_size\":" << frame.palette.size()
++                 << ",\"width\":" << static_cast<unsigned long>(frame.width)
++                 << ",\"height\":" << static_cast<unsigned long>(frame.height)
++                 << ",\"bpp\":" << static_cast<unsigned long>(frame.bpp)
++                 << ",\"pitch\":" << static_cast<unsigned long>(frame.pitch)
++                 << ",\"generation\":"
++                 << static_cast<unsigned long long>(frame.generation)
++                 << '}';
++    }
++    response << "]}}\r\n";
++    send_response(response.str());
++}
++
  void QMPServer::handle_screendump(const std::string& cmd) {
-@@ -1124,4 +1422,8 @@ void QMP_ProcessPendingInputEvents() {
+     // Extract optional file argument
+     std::string args_str = extract_string(cmd, "arguments");
+@@ -885,7 +1597,7 @@ void QMPServer::handle_savestate(const std::string& cmd) {
      }
  }
  
-+bool QMP_ProcessGuestStateInput(uint32_t linear_pc) {
-+    return QMPServer::process_guest_state_input(linear_pc);
+-void QMPServer::handle_loadstate(const std::string& cmd) {
++void QMPServer::handle_loadstate(const std::string& cmd, bool pause_after_load) {
+     // Extract file argument (required)
+     std::string args_str = extract_string(cmd, "arguments");
+     if (args_str.empty()) {
+@@ -920,7 +1632,11 @@ void QMPServer::handle_loadstate(const std::string& cmd) {
+     check.close();
+ 
+     // Request load state (async, processed by main thread)
+-    SAVESTATE_RequestLoad(file);
++    if (pause_after_load) {
++        SAVESTATE_RequestLoadPaused(file);
++    } else {
++        SAVESTATE_RequestLoad(file);
++    }
+ 
+     // Wait for completion with timeout
+     const int timeout_ms = 30000;  // 30 second timeout for load
+@@ -981,6 +1697,7 @@ void QMPServer::handle_stop() {
+ 
+ void QMPServer::handle_cont() {
+     // Resume the emulator
++    SAVESTATE_ClearLoadPause();
+     if (!EMULATOR_IsPaused()) {
+         // Already running - return success anyway for idempotency
+         send_success();
+@@ -1124,4 +1841,27 @@ void QMP_ProcessPendingInputEvents() {
+     }
+ }
+ 
++bool QMP_ProcessGuestStateInputUsesDs() {
++    static const bool uses_ds = [] {
++        const char *hook_offset =
++            getenv("DOS_RE_HARNESS_STATE_INPUT_HOOK_OFFSET");
++        const char *state_ds_offset =
++            getenv("DOS_RE_HARNESS_STATE_INPUT_DS_OFFSET");
++        return (hook_offset && *hook_offset) ||
++               (state_ds_offset && *state_ds_offset);
++    }();
++    return uses_ds;
++}
++
++bool QMP_ProcessGuestStateInput(uint32_t linear_pc,
++                                uint32_t instruction_offset,
++                                uint32_t ds_base) {
++    return QMPServer::process_guest_state_input(linear_pc, instruction_offset,
++                                                ds_base);
++}
++
++uint64_t QMP_GetGuestStateInputValue() {
++    return dos_re_harness_guest_state;
 +}
 +
  #endif /* C_REMOTEDEBUG */
+diff --git a/src/dosbox.cpp b/src/dosbox.cpp
+index ad04ace82..4e2924773 100644
+--- a/src/dosbox.cpp
++++ b/src/dosbox.cpp
+@@ -472,6 +472,12 @@ static Bitu Normal_Loop(void) {
+             }
+             // Check for save/load state requests from QMP
+             SAVESTATE_CheckPendingRequest();
++            // Keep the loaded CPU/device boundary exact while the controller
++            // attaches GDB.  The next loop iteration still services GDB
++            // packets; QMP cont clears this hold before guest execution.
++            if (SAVESTATE_HoldAfterLoad()) {
++                return 0;
++            }
+             // Check for emulator control requests from QMP (pause/reset)
+             EMULATOR_CheckPendingControl();
+             // Process pending QMP input events (keyboard, mouse) - thread-safe queue
+diff --git a/src/gui/render.cpp b/src/gui/render.cpp
+index 59cde983e..133a0d9a3 100644
+--- a/src/gui/render.cpp
++++ b/src/gui/render.cpp
+@@ -21,6 +21,9 @@
+ #include <assert.h>
+ #include <math.h>
+ #include <fstream>
++#include <deque>
++#include <iterator>
++#include <mutex>
+ #include <sstream>
+ 
+ #include "dosbox.h"
+@@ -61,6 +64,13 @@ int                                     aspect_ratio_y = 0;
+ Bitu                                    last_gfx_flags = 0;
+ ScalerLineHandler_t                     RENDER_DrawLine;
+ 
++static std::mutex completed_source_frame_mutex;
++static RenderSourceFrame completed_source_frame;
++static std::deque<RenderSourceFrame> completed_source_frame_history;
++static size_t completed_source_frame_history_capacity = 0;
++static uint64_t completed_source_frame_history_dropped = 0;
++static bool completed_source_frame_history_enabled = false;
++
+ uint32_t                                GFX_palette32bpp[256] = {0};
+ 
+ unsigned int                            GFX_GetBShift();
+@@ -400,6 +410,38 @@ void RENDER_EndUpdate( bool abort ) {
+     if (!abort && render.active && RENDER_DrawLine == RENDER_ClearCacheHandler)
+         render.scale.clearCache = false;
+ 
++    if (!abort && render.active && render.src.width && render.src.height &&
++        render.scale.cachePitch) {
++        const size_t frame_size = static_cast<size_t>(render.scale.cachePitch) *
++                                  static_cast<size_t>(render.src.height);
++        std::lock_guard<std::mutex> lock(completed_source_frame_mutex);
++        const uint8_t *source = reinterpret_cast<const uint8_t *>(
++            &scalerSourceCache);
++        completed_source_frame.pixels.assign(source, source + frame_size);
++        completed_source_frame.palette.resize(256 * 3);
++        for (size_t index = 0; index < 256; ++index) {
++            completed_source_frame.palette[index * 3] =
++                render.pal.rgb[index].red;
++            completed_source_frame.palette[index * 3 + 1] =
++                render.pal.rgb[index].green;
++            completed_source_frame.palette[index * 3 + 2] =
++                render.pal.rgb[index].blue;
++        }
++        completed_source_frame.width = render.src.width;
++        completed_source_frame.height = render.src.height;
++        completed_source_frame.bpp = render.src.bpp;
++        completed_source_frame.pitch = render.scale.cachePitch;
++        ++completed_source_frame.generation;
++        if (completed_source_frame_history_enabled) {
++            if (completed_source_frame_history.size() >=
++                completed_source_frame_history_capacity) {
++                completed_source_frame_history.pop_front();
++                ++completed_source_frame_history_dropped;
++            }
++            completed_source_frame_history.push_back(completed_source_frame);
++        }
++    }
++
+     RENDER_DrawLine = RENDER_EmptyLineHandler;
+     if (GCC_UNLIKELY(CaptureState & (CAPTURE_IMAGE|CAPTURE_VIDEO))) {
+         Bitu pitch, flags;
+@@ -443,6 +485,40 @@ void RENDER_EndUpdate( bool abort ) {
+     }
+ }
+ 
++bool RENDER_CopyLastCompletedSourceFrame(RenderSourceFrame &frame) {
++    std::lock_guard<std::mutex> lock(completed_source_frame_mutex);
++    if (completed_source_frame.pixels.empty())
++        return false;
++    frame = completed_source_frame;
++    return true;
++}
++
++uint64_t RENDER_StartCompletedSourceFrameHistory(size_t capacity) {
++    std::lock_guard<std::mutex> lock(completed_source_frame_mutex);
++    completed_source_frame_history.clear();
++    completed_source_frame_history_capacity = capacity;
++    completed_source_frame_history_dropped = 0;
++    completed_source_frame_history_enabled = capacity > 0;
++    return completed_source_frame.generation;
++}
++
++bool RENDER_TakeCompletedSourceFrameHistory(
++        std::vector<RenderSourceFrame> &frames,
++        size_t &capacity,
++        uint64_t &dropped) {
++    std::lock_guard<std::mutex> lock(completed_source_frame_mutex);
++    if (!completed_source_frame_history_enabled)
++        return false;
++    completed_source_frame_history_enabled = false;
++    capacity = completed_source_frame_history_capacity;
++    dropped = completed_source_frame_history_dropped;
++    frames.assign(
++        std::make_move_iterator(completed_source_frame_history.begin()),
++        std::make_move_iterator(completed_source_frame_history.end()));
++    completed_source_frame_history.clear();
++    return true;
++}
++
+ static Bitu MakeAspectTable(Bitu skip,Bitu height,double scaley,Bitu miny) {
+     Bitu i;
+     double lines=0;
 diff --git a/src/gui/sdlmain.cpp b/src/gui/sdlmain.cpp
-index d6b71c0..71a7352 100644
+index d6b71c0d3..71a735248 100644
 --- a/src/gui/sdlmain.cpp
 +++ b/src/gui/sdlmain.cpp
 @@ -3844,7 +3844,9 @@ static void GUI_StartUp() {
@@ -507,24 +1295,40 @@ index d6b71c0..71a7352 100644
  
          if (grabbed)
 diff --git a/src/hardware/adlib.cpp b/src/hardware/adlib.cpp
-index 3d739c9..b11da44 100644
+index 3d739c92d..761eb1d8b 100644
 --- a/src/hardware/adlib.cpp
 +++ b/src/hardware/adlib.cpp
-@@ -49,6 +49,47 @@ bool systemmessagebox(char const * aTitle, char const * aMessage, char const * a
+@@ -48,6 +48,70 @@ bool adlib_force_timer_overflow_on_polling = false;
+ bool systemmessagebox(char const * aTitle, char const * aMessage, char const * aDialogType, char const * aIconType, int aDefaultButton);
  extern bool show_recorded_filename;
  extern std::string pathopl;
- 
++#if C_REMOTEDEBUG
++#include "qmp.h"
++#endif
++
 +static void DosReHarness_LogOplWrite(uint32_t reg, uint8_t val) {
 +    static FILE *log = nullptr;
 +    static bool initialized = false;
 +    static bool include_loop_tick = false;
++    static bool loop_tick_ds_relative = false;
++    static uint32_t loop_tick_ds_offset = 0;
 +    static PhysPt loop_tick_address = 0;
 +
 +    if (!initialized) {
 +        initialized = true;
 +        const char *path = getenv("DOS_RE_HARNESS_OPL_LOG");
 +        const char *loop_tick = getenv("DOS_RE_HARNESS_OPL_TICK_LINEAR");
-+        if (loop_tick && *loop_tick) {
++        const char *loop_tick_ds = getenv("DOS_RE_HARNESS_OPL_TICK_DS_OFFSET");
++        if (loop_tick_ds && *loop_tick_ds) {
++            char *end = nullptr;
++            const unsigned long parsed = strtoul(loop_tick_ds, &end, 0);
++            if (end != loop_tick_ds && *end == '\0') {
++                include_loop_tick = true;
++                loop_tick_ds_relative = true;
++                loop_tick_ds_offset = static_cast<uint32_t>(parsed);
++            }
++        }
++        if (!loop_tick_ds_relative && loop_tick && *loop_tick) {
 +            char *end = nullptr;
 +            const unsigned long parsed = strtoul(loop_tick, &end, 0);
 +            if (end != loop_tick && *end == '\0') {
@@ -547,18 +1351,25 @@ index 3d739c9..b11da44 100644
 +
 +    if (log) {
 +        if (include_loop_tick) {
-+            fprintf(log, "%.6f,%u,0x%03x,0x%02x\n", static_cast<double>(PIC_Ticks), static_cast<unsigned>(mem_readw(loop_tick_address)), static_cast<unsigned>(reg), static_cast<unsigned>(val));
++            const PhysPt address = loop_tick_ds_relative
++                ? static_cast<PhysPt>(SegPhys(ds) + loop_tick_ds_offset)
++                : loop_tick_address;
++            uint64_t sampled_loop_tick = mem_readw(address);
++#if C_REMOTEDEBUG
++            const uint64_t state_input_tick = QMP_GetGuestStateInputValue();
++            if (state_input_tick != 0) sampled_loop_tick = state_input_tick;
++#endif
++            fprintf(log, "%.6f,%u,0x%03x,0x%02x\n", static_cast<double>(PIC_Ticks), static_cast<unsigned>(sampled_loop_tick), static_cast<unsigned>(reg), static_cast<unsigned>(val));
 +        } else {
 +            fprintf(log, "%.6f,0x%03x,0x%02x\n", static_cast<double>(PIC_Ticks), static_cast<unsigned>(reg), static_cast<unsigned>(val));
 +        }
 +        fflush(log);
 +    }
 +}
-+
+ 
  namespace OPL2 {
  	#include "opl.cpp"
- 
-@@ -870,6 +892,8 @@ Chip::Chip() : timer0(80), timer1(320) {
+@@ -870,6 +934,8 @@ Chip::Chip() : timer0(80), timer1(320) {
  }
  
  bool Chip::Write( uint32_t reg, uint8_t val ) {
@@ -567,3 +1378,129 @@ index 3d739c9..b11da44 100644
  	if (adlib_force_timer_overflow_on_polling) {
  		/* detect end of polling loop by whether it writes */
  		last_poll = PIC_FullIndex();
+diff --git a/src/misc/savestates.cpp b/src/misc/savestates.cpp
+index c6bb8d81d..039419211 100644
+--- a/src/misc/savestates.cpp
++++ b/src/misc/savestates.cpp
+@@ -59,11 +59,13 @@ std::string saveloaderr="";
+ #include <mutex>
+ #include <condition_variable>
+ 
+-enum class SaveStateRequest { NONE, SAVE, LOAD };
++enum class SaveStateRequest { NONE, SAVE, LOAD, LOAD_PAUSED };
+ static std::atomic<SaveStateRequest> pending_savestate_request{SaveStateRequest::NONE};
+ static std::string pending_savestate_path;
+ static std::string savestate_result_error;
+ static std::atomic<bool> savestate_request_complete{false};
++static std::atomic<bool> hold_after_load{false};
++static std::atomic<bool> load_pause_released{false};
+ static std::mutex savestate_mutex;
+ static std::condition_variable savestate_cv;
+ #endif
+@@ -336,6 +338,14 @@ void SAVESTATE_RequestLoad(const std::string& filepath) {
+     pending_savestate_request.store(SaveStateRequest::LOAD);
+ }
+ 
++void SAVESTATE_RequestLoadPaused(const std::string& filepath) {
++    std::lock_guard<std::mutex> lock(savestate_mutex);
++    pending_savestate_path = filepath;
++    savestate_result_error.clear();
++    savestate_request_complete.store(false);
++    pending_savestate_request.store(SaveStateRequest::LOAD_PAUSED);
++}
++
+ // Check if request is still pending
+ bool SAVESTATE_IsPending() {
+     return pending_savestate_request.load() != SaveStateRequest::NONE;
+@@ -351,6 +361,62 @@ bool SAVESTATE_IsComplete(std::string& error_out) {
+     return false;
+ }
+ 
++bool SAVESTATE_HoldAfterLoad() {
++    return hold_after_load.load();
++}
++
++void SAVESTATE_ClearLoadPause() {
++    hold_after_load.store(false);
++    load_pause_released.store(true);
++}
++
++bool SAVESTATE_ConsumeLoadPauseRelease() {
++    return load_pause_released.exchange(false);
++}
++
++// Save synchronously from the remote-debugger thread while the emulated CPU
++// is halted.  The normal request path is intentionally serviced by the main
++// loop, which is not running at a debugger stop and therefore advances the
++// guest when the caller resumes it to service the request.  Remote capture
++// uses this only for an explicitly halted boundary.
++std::string SAVESTATE_SaveImmediate(const std::string& filepath) {
++    std::lock_guard<std::mutex> lock(savestate_mutex);
++    if (pending_savestate_request.load() != SaveStateRequest::NONE) {
++        return "another savestate request is pending";
++    }
++
++    std::string old_savefilename = savefilename;
++    bool old_use_save_file = use_save_file;
++    bool old_noremark_save_state = noremark_save_state;
++    bool old_force_load_state = force_load_state;
++    savefilename = filepath;
++    use_save_file = true;
++    noremark_save_state = true;
++    force_load_state = true;
++
++    std::string error;
++    try {
++        LOG_MSG("SAVESTATE: Saving immediate halted state to file: %s",
++                filepath.c_str());
++        SaveState::instance().save(0);
++    } catch (const SaveState::Error& err) {
++        error = err;
++        LOG_MSG("SAVESTATE: Error: %s", err.c_str());
++    } catch (const std::exception& e) {
++        error = e.what();
++        LOG_MSG("SAVESTATE: Exception: %s", e.what());
++    } catch (...) {
++        error = "Unknown exception";
++        LOG_MSG("SAVESTATE: Unknown exception caught");
++    }
++
++    savefilename = old_savefilename;
++    use_save_file = old_use_save_file;
++    noremark_save_state = old_noremark_save_state;
++    force_load_state = old_force_load_state;
++    return error;
++}
++
+ // Called from main loop to process pending save/load requests
+ bool SAVESTATE_CheckPendingRequest() {
+     SaveStateRequest req = pending_savestate_request.load();
+@@ -379,7 +445,8 @@ bool SAVESTATE_CheckPendingRequest() {
+         if (req == SaveStateRequest::SAVE) {
+             LOG_MSG("SAVESTATE: Saving to file: %s", filepath.c_str());
+             SaveState::instance().save(0);  // Slot doesn't matter when use_save_file is true
+-        } else if (req == SaveStateRequest::LOAD) {
++        } else if (req == SaveStateRequest::LOAD ||
++                   req == SaveStateRequest::LOAD_PAUSED) {
+             LOG_MSG("SAVESTATE: Loading from file: %s", filepath.c_str());
+             if (!GFX_IsFullscreen() && render.aspect) GFX_LosingFocus();
+             SaveState::instance().load(0);
+@@ -409,10 +476,13 @@ bool SAVESTATE_CheckPendingRequest() {
+         std::lock_guard<std::mutex> lock(savestate_mutex);
+         savestate_result_error = error;
+     }
++    const bool pause_after_load = req == SaveStateRequest::LOAD_PAUSED && error.empty();
++    hold_after_load.store(pause_after_load);
+     pending_savestate_request.store(SaveStateRequest::NONE);
+     savestate_request_complete.store(true);
+     savestate_cv.notify_all();
+ 
++
+     return true;
+ }
+ #endif
+@@ -1042,4 +1112,3 @@ std::string SaveState::getName(size_t slot, bool nl) const {
+     unzClose(zf);
+ 	return ret;
+ }
+-

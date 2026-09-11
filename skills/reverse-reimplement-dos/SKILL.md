@@ -55,6 +55,29 @@ the required hit ordinals into one capture. Use the harness
 `checkpoints/breakpoint_hit-*` artifacts with a target-local analyzer. Do not
 repeat full emulator startup solely to change the requested hit count.
 
+When a paired-boundary capture uses a preparatory state series only to absorb
+save-state drift, set `--checkpoint-post-display-scope post-resume-next` if
+only the final paired boundary needs exact running-screen evidence. This
+retains the preparatory state checkpoints while avoiding a display stop,
+self-loop, DAC dump, and screenshot for each candidate value.
+
+Inspect `capture.stop_boundary` in every `plan-state-tail` report. If
+`requires_explicit_input_phase` is true, the requested terminal value shares
+one or more input transitions. Select a transition-free boundary when the
+question permits it; otherwise prove whether the capture is before input,
+after input is queued, or after input is consumed. Do not compare such a stop
+as an unqualified logical-tick state.
+
+For a restored late-state capture, prefer `plan-state-tail` with
+`--sliced-input-out` and `--sliced-input-manifest`. Use the generated capture
+arguments unchanged. This reconstructs held keys, binds only the validated
+post-resume input stream, and prevents accidental replay of pre-resume events.
+
+When a restored state needs no further input transitions, omit the input
+script and configure only the state-input hook, state address, width, and stop
+value. Prefer an immediate halted save at that stop so checkpoint creation
+does not execute an extra guest instruction.
+
 For the same problem in an ordinary startup movie, use the generic
 `breakseries:<segment>:<offset>:2+9+17` action. Reserve commas for separating
 movie actions. Use portable-only tests for routine iterations, turbo captures

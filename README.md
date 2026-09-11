@@ -71,6 +71,18 @@ directories.
 
 ## Agent Skill
 
+Recent reusable additions:
+
+- [Strict presentation and audio-clock contracts](docs/presentation-contract.md)
+  compare ordered boundary hashes and rational hold durations independently;
+  matching screenshots cannot conceal cadence errors.
+- [Evidence boundaries and recovery lessons](docs/evidence-boundaries.md)
+  cover hardware-state restoration, prepared versus submitted audio, negative
+  controls, and safe delegation/integration.
+- [Ghidra query cookbook](docs/ghidra-query-cookbook.md) includes explicit
+  read-only execution, segmented displacement candidates, and bounded raw
+  instruction decoding when auto-analysis misses code.
+
 `skills/reverse-reimplement-dos/SKILL.md` packages the evidence-first workflow
 for Codex-compatible agents. It covers specimen control, static/runtime
 analysis, asset and audio recovery, deterministic capture, presenter
@@ -487,6 +499,10 @@ dos-re index-checkpoints `
     --out projects\example\.work\analysis\renderer-series.index.json
 ```
 
+Use `--expected-hit-count 96` instead of `--expected-hits` when the required
+series is contiguous from hit 1 through hit 96. The two validation forms are
+mutually exclusive.
+
 The index validates checkpoint directories against the capture-declared hit
 series, records whole-artifact and selected-slice hashes, includes only the
 requested registers, and emits a stable aggregate series hash. Addresses,
@@ -519,6 +535,8 @@ Preflight a changed state-input-script tail before starting DOSBox-X:
     --state-field tick --breakpoint 0x850c `
     --movie projects\example\.work\movies\resume.movie.json `
     --capture-out projects\example\.work\captures\tail-v2 `
+    --sliced-input-out projects\example\.work\routes\v2.tail-500.input.script `
+    --sliced-input-manifest projects\example\.work\routes\v2.tail-500.input.json `
     --transition-breakpoint 0x1234:0x5678 `
     --transition-out projects\example\.work\captures\tail-v2-transition `
     --out projects\example\.work\plans\tail-v2.json
@@ -528,8 +546,12 @@ The planner does not launch the backend. It validates the project, scenario,
 scripts, tick-1 bootstrap movie, snapshot dump size, registers, output-path
 freshness, adapter argument names, and transition address. Its JSON records
 the first input-state difference and ready-to-run `capture_cli_args` for the
-continuous tail and optional transition probe. Pass `--allow-existing-output`
-only when intentionally reusing retained evidence.
+continuous tail and optional transition probe. When `--sliced-input-out` is
+provided, the planner also reconstructs keys held at the resume boundary,
+writes the backend-ready input tail, records its hash manifest, and binds that
+tail into every generated capture command. This avoids replaying pre-resume
+events and removes the separate slice-and-edit step. Pass
+`--allow-existing-output` only when intentionally reusing retained evidence.
 
 ## Generic State Tools
 
@@ -617,6 +639,32 @@ the backend writes a PNG only after a timed-out request resumes, the harness
 retains it as a deferred side effect with
 `screenshot_exact_checkpoint: false`; it is not state-aligned regression
 evidence.
+Use `-CheckpointDisplayDump` with the pinned remotedebug backend to retain its
+last completed renderer source frame without resuming a halted guest. The
+checkpoint metadata records width, height, bpp, pitch, and renderer generation;
+pair it with `-CheckpointDac` when palette state is behaviorally relevant.
+
+Use `-DisplaySequenceFrames N -DisplaySequenceInterval SECONDS` to continue
+from the selected boundary and sample completed renderer frames plus DAC state
+while the guest runs. `display_sequence.json` records generation deltas,
+display/DAC hashes, byte-change counts, and actual sample times. This avoids
+the QMP screenshot completion wait, but it is a wall-clock sampler: a backend
+running faster than real time can complete multiple renderer generations
+between samples. Use frame-synchronous native video when every intervening
+frame is required.
+
+Use `-PostResumeDisplayHistoryCapacity N` with a resumed-state breakpoint to
+retain every completed renderer source frame between the final resumed state
+checkpoint and the first post-resume breakpoint. The opt-in backend ring is
+bounded to 64 frames, does not poll or resume the guest, and is written as
+`post_resume_display_history.json` plus generation-ordered raw frame files.
+Frame payloads use zlib transfer compression when that is smaller; the stored
+files remain the exact uncompressed renderer bytes. Every frame also retains
+the synchronized 256-entry RGB renderer palette, permitting exact indexed
+recovery when the displayed colors map uniquely to palette entries.
+This is the preferred probe for short visual bursts that complete faster than
+the host can sample them.
+
 Timed VGA sequences retain both the indexed framebuffer and the 256-entry DAC
 palette for every sample. Each row in `vga_sequence.json` records independent
 hashes and change counts for pixels and palette bytes, so palette-only fades,
@@ -625,6 +673,15 @@ Pair `-VgaSequenceStopSha256` with `-VgaSequenceScreenshotOnStop` to request
 one running screenshot only when a sample matches the target framebuffer hash.
 This avoids screenshotting every earlier sample and recovers the pinned
 backend's deferred root-PNG side effect into the matched sequence frame.
+Use `-VgaSequenceScreenshotAll` when the visible RGB page is needed for every
+sample (for example, Mode-X/planar VGA where the raw `A0000` bytes are not a
+chunky display image). The harness retries short in-flight PNG responses and
+records a screenshot error instead of retaining a truncated file.
+When a VGA sequence is active and `-DumpSize` is nonzero, each sample also
+records a halted post-sample dump of the selected `-DumpSegment` as
+`frame_NNNN.<segment>.bin`, including its segment value and CS:EIP metadata.
+This supplies a bounded semantic snapshot beside the visual sample; frames
+halted in BIOS or interrupt code remain explicitly identifiable.
 Use `-CheckpointSaveState` only when the final startup action is a state
 checkpoint. It writes `remote_runtime.sav` beside that checkpoint and records
 its size, SHA-256, request boundary, post-save registers, and post-save schema
@@ -670,6 +727,9 @@ DOSBox-X startup per ordinal. Series values must be positive and strictly
 increasing. Every selected hit retains the VGA DAC as well as the indexed
 framebuffer. A series is read-only and cannot be combined with post-resume
 poke files or the staged next-breakpoint path.
+A backend `--state-input-stop-value` may also serve as the resumed
+boundary, allowing the same post-resume breakpoint series without a second
+state-schema resume script.
 The controller arms this breakpoint only after restoration and removes the
 state-boundary breakpoint first when the resume script advanced through more
 than one state. This avoids replaying startup solely to inspect code reached
@@ -683,9 +743,23 @@ or inline memory writes while the CPU remains halted. Pair them with
 `--post-resume-next-break-hit-count` to step off the first breakpoint and
 stop at a later instruction. The second breakpoint is also valid without a
 poke, which supports entry-to-exit captures inside one function invocation.
+Use `--post-resume-next-break-hit-series 1,4,12` instead of the single hit
+count when the post-poke experiment needs several increasing ordinals from
+that second breakpoint. The controller retains each selected second-boundary
+hit under `checkpoints/next_breakpoint_hit-*` in the same emulator run.
+When `--checkpoint-post-display-break-segmented` is used with a preparatory
+state series and only the paired next boundary needs a running screenshot,
+set `--checkpoint-post-display-scope post-resume-next`. The preparatory
+checkpoints still retain their requested state artifacts, but the controller
+skips their display breakpoint, self-loop, DAC, and screenshot work. The
+default scope is `all` for compatibility.
 Use `--post-resume-continue-after-poke` instead when the write creates a
 controlled running state for a timed VGA or screenshot sequence and no second
 breakpoint is required.
+Use `--post-resume-continue` when the same running sequence must begin without
+any guest-memory mutation. The controller clears the first post-resume
+breakpoint, resumes execution, and records that non-mutating continuation in
+the capture arguments and break-state metadata.
 Metadata records each poke's resolved address, byte count, and SHA-256, plus
 both breakpoint selections.
 `clearbreak:<linear-address>` removes a halted linear breakpoint, single-steps
@@ -722,6 +796,15 @@ separate startup actions.
 host duration and re-halts it. This is intended for cleanup after an exact
 checkpoint, such as allowing a DOS program to exit and finalize native
 capture files; it is not an emulated-tick synchronization primitive.
+`runtap:<qcode>[:<positive-seconds>]` resumes an already halted guest, sends
+the key press while the CPU is running, releases it after the requested hold
+(default 0.2 seconds), and re-halts the guest. Use it when a key must cross a
+real guest execution interval before chaining into another state breakpoint.
+`rununtilstop:<positive-timeout-seconds>` resumes an already halted guest and
+waits for the remote debugger/backend to report a stop. This is useful with a
+backend state-input stop because it returns at the event instead of sleeping
+until a guessed wall-clock duration. The timeout remains a host-side safety
+bound; it does not define the guest state at which the run stops.
 Use the generic launcher's `-RemoteTimeout` only when an individual RSP or QMP
 operation can legitimately exceed the default 10 seconds, such as a blocking
 guest routine under heavy instrumentation. This changes the remote operation
@@ -739,6 +822,28 @@ guest instruction and monotonically increasing guest state. This removes
 host-side input polling from the route. `-StateInputLogPath` records the
 applied transitions. Keep the hook address and state-field interpretation in
 the target adapter.
+
+When no input transitions are required, omit `-InputScript` and provide
+`-StateInputStopValue` with the same hook, state address, and width. The
+backend runs directly to that logical value and stops without host polling.
+With `-CheckpointSaveState`, capable pinned backends serialize the already
+halted machine immediately, so the saved checkpoint remains on the exact
+state-stop boundary instead of advancing one instruction.
+
+When resuming from a late snapshot, create a backend-ready route tail without
+host polling:
+
+```powershell
+.\scripts\dos-re.ps1 slice-state-input route.input.script tail.input.script `
+    --resume-value 10231 --manifest tail.input.json
+```
+
+The slicer declares keys held before the resume value, retains transitions at
+that value as preapplied events, and retains all later transitions. A
+state-only resume checkpoint restores the held set and applies the preapplied
+events once, in order, before handing execution to the backend. The backend
+validates the complete tail but skips replaying the preapplied prefix. The
+manifest records content hashes without exposing the source path.
 
 The generic WSL launcher also accepts `-CaptureVideo`. It wraps the configured
 DOS program with DOSBox-X `DX-CAPTURE /V`, leaving the resulting native AVI in

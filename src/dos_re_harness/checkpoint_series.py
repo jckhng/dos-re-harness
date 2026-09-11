@@ -72,6 +72,7 @@ def index_checkpoint_series(
     length: int | None = None,
     registers: Iterable[str] = (),
     expected_hits: Iterable[int] | None = None,
+    expected_hit_count: int | None = None,
 ) -> dict[str, Any]:
     """Index and hash one artifact slice across breakpoint checkpoints."""
 
@@ -87,11 +88,18 @@ def index_checkpoint_series(
     paths = _checkpoint_paths(capture)
     hits = [hit for hit, _ in paths]
     declared_hits = _declared_hits(capture)
-    required_hits = (
-        [int(hit) for hit in expected_hits]
-        if expected_hits is not None
-        else declared_hits
-    )
+    if expected_hits is not None and expected_hit_count is not None:
+        raise ValueError(
+            "expected_hits and expected_hit_count are mutually exclusive"
+        )
+    if expected_hit_count is not None:
+        if expected_hit_count < 1:
+            raise ValueError("expected_hit_count must be positive")
+        required_hits = list(range(1, expected_hit_count + 1))
+    elif expected_hits is not None:
+        required_hits = [int(hit) for hit in expected_hits]
+    else:
+        required_hits = declared_hits
     if required_hits is not None and hits != required_hits:
         raise ValueError(
             f"{capture}: checkpoint hits {hits} do not match expected {required_hits}"
@@ -157,6 +165,7 @@ def index_checkpoint_series(
         "slice": {"offset": offset, "length": length},
         "register_names": register_names,
         "declared_hits": declared_hits,
+        "expected_hit_count": expected_hit_count,
         "hit_count": len(hits),
         "hits": hits,
         "series_sha256": _sha256_bytes(encoded),

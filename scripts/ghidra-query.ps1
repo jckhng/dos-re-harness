@@ -32,7 +32,8 @@ param(
     [string[]]$AdditionalScriptPath = @(),
     [string]$JavaHome = "",
     [string]$OutputPath = "",
-    [switch]$NoAnalysis
+    [switch]$NoAnalysis,
+    [switch]$ReadOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -96,21 +97,31 @@ try {
         $env:JAVA_HOME = (Resolve-Path $JavaHome).Path
     }
 
-    $scriptPaths = if ($Query -eq "custom") {
-        @()
-    } else {
-        @($genericScriptPath)
+    # A one-element PowerShell array is unwrapped on assignment.  Appending
+    # with += would then concatenate the next path into the string, producing
+    # an invalid Ghidra -scriptPath.  Keep an explicit collection so custom
+    # target script directories remain independently addressable.
+    $scriptPaths = [System.Collections.Generic.List[string]]::new()
+    if ($Query -ne "custom") {
+        $scriptPaths.Add($genericScriptPath)
     }
     foreach ($path in $AdditionalScriptPath) {
         if (-not (Test-Path -LiteralPath $path -PathType Container)) {
             throw "Missing Ghidra script directory: $path"
         }
-        $scriptPaths += (Resolve-Path $path).Path
+        $scriptPaths.Add((Resolve-Path $path).Path)
     }
     if ($scriptPaths.Count -eq 0) {
         throw "No Ghidra script directory was configured"
     }
+    # analyzeHeadless.bat is a cmd wrapper.  cmd splits an unquoted
+    # semicolon-delimited -scriptPath value into separate arguments, so keep
+    # the complete Windows path list quoted.  Unix launchers receive the
+    # platform-native separator directly and must not receive literal quotes.
     $scriptPath = $scriptPaths -join [IO.Path]::PathSeparator
+    if ([IO.Path]::PathSeparator -eq ';') {
+        $scriptPath = '"' + $scriptPath + '"'
+    }
     $headlessArgs = @(
         (Resolve-Path $ProjectDir).Path,
         $ProjectName,
@@ -121,6 +132,9 @@ try {
     )
     if ($NoAnalysis) {
         $headlessArgs += "-noanalysis"
+    }
+    if ($ReadOnly) {
+        $headlessArgs += "-readOnly"
     }
     $headlessArgs += @("-postScript", $script) + $Args
 

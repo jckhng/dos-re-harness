@@ -16,6 +16,7 @@ param(
     [double]$StartupDelaySeconds = 3.0,
     [string]$StartupSequence = "",
     [string]$InputScript = "",
+    [string]$BackendInputScript = "",
     [string[]]$StartupKey = @(),
     [string[]]$Poke = @(),
     [string[]]$PokeFile = @(),
@@ -25,22 +26,30 @@ param(
     [string]$ResumeSideBreakSegmented = "",
     [int]$ResumeSideBreakMaxHits = 0,
     [int]$ResumeSideBreakStartValue = 0,
+    [string[]]$ResumeSideBreakPoke = @(),
     [string]$PostResumeBreakLinear = "",
     [string]$PostResumeBreakSegmented = "",
     [int]$PostResumeBreakHitCount = 1,
     [string]$PostResumeBreakHitSeries = "",
+    [int]$PostResumeDisplayHistoryCapacity = 0,
     [string[]]$PostResumePoke = @(),
     [string[]]$PostResumePokeFile = @(),
     [switch]$PostResumeContinueAfterPoke,
+    [switch]$PostResumeContinue,
     [string]$PostResumeNextBreakLinear = "",
     [string]$PostResumeNextBreakSegmented = "",
     [int]$PostResumeNextBreakHitCount = 1,
+    [string]$PostResumeNextBreakHitSeries = "",
     [string]$CallNear = "",
+    [string]$CallNearBreakLinear = "",
+    [string]$CallNearBreakSegmented = "",
+    [string]$CallNearBreakOffset = "",
     [switch]$CallNearContinueAfterReturn,
     [string]$BreakpointLinear = "",
     [switch]$HaltAfterPoke,
     [string]$PostRestoreSequence = "",
     [string[]]$PostRestoreKey = @(),
+    [string[]]$PostWaitKey = @(),
     [string[]]$WaitState = @(),
     [double]$WaitStateTimeout = 30.0,
     [double]$WaitStateInterval = 0.05,
@@ -48,8 +57,11 @@ param(
     [double]$RemoteTimeout = 10.0,
     [int]$VgaSequenceFrames = 0,
     [double]$VgaSequenceInterval = (1.0 / 70.0),
+    [int]$DisplaySequenceFrames = 0,
+    [double]$DisplaySequenceInterval = (1.0 / 70.0),
     [string]$VgaSequenceStopSha256 = "",
     [switch]$VgaSequenceScreenshotOnStop,
+    [switch]$VgaSequenceScreenshotAll,
     [uint32]$VgaAddress = 0xA0000,
     [int]$VgaWidth = 320,
     [int]$VgaHeight = 200,
@@ -61,24 +73,47 @@ param(
     [switch]$Screenshot,
     [switch]$DumpLowMemory,
     [switch]$OmitCheckpointVga,
+    [switch]$CheckpointDac,
+    [switch]$CheckpointDisplayDump,
     [switch]$CheckpointScreenshot,
+    [string[]]$CheckpointScreenshotPreserveMemory = @(),
     [switch]$CheckpointSaveState,
+    [switch]$CheckpointSaveStateFirst,
     [string]$LoadSaveState = "",
+    [switch]$LoadSaveStateContinue,
+    [switch]$LoadSaveStatePaused,
     [string]$LoadSaveStateReadyScreen = "",
     [double]$LoadSaveStateReadyTimeout = 45.0,
     [switch]$CaptureAudio,
     [switch]$CaptureSfxOnly,
     [string]$OplLogPath = "",
     [string]$OplTickLinear = "",
+    [string]$OplTickDsOffset = "",
     [string]$StateInputHookLinear = "",
     [string]$StateInputLinear = "",
+    [string]$StateInputHookOffset = "",
+    [string]$StateInputDsOffset = "",
+    [string]$StateInputHookOffsetAlt = "",
     [ValidateSet(1, 2, 4)]
     [int]$StateInputWidth = 2,
     [string]$StateInputLogPath = "",
+    [string]$StateInputTracePath = "",
+    [string]$StateInputStopValue = "",
+    [string]$StateInputWriteOffset = "",
+    [string]$StateInputWriteLinear = "",
+    [string]$StateInputWriteValue = "",
+    [ValidateSet(1, 2, 4)]
+    [int]$StateInputWriteWidth = 2,
+    [switch]$StateInputObserveOnly,
     [switch]$CaptureVideo,
     [string]$CheckpointPostDisplayBreakSegmented = "",
     [string]$CheckpointPostDisplayPoke = "",
     [double]$CheckpointPostDisplayDelay = 0.05,
+    [ValidateSet("all", "post-resume-next")]
+    [string]$CheckpointPostDisplayScope = "all",
+    [string]$FinalPostDisplayBreakSegmented = "",
+    [string]$FinalPostDisplayPoke = "",
+    [double]$FinalPostDisplayDelay = 0.05,
     [Parameter(Mandatory = $true)]
     [string]$StateSchema,
     [Parameter(Mandatory = $true)]
@@ -88,6 +123,10 @@ param(
     [string]$DosboxBinary,
     [ValidatePattern("^[A-Za-z0-9_.-]+$")]
     [string]$RuntimeName = "dos_re_runtime",
+    [ValidateRange(0, 65535)]
+    [int]$GdbPort = 0,
+    [ValidateRange(0, 65535)]
+    [int]$QmpPort = 0,
     [switch]$KeepRunning
 )
 
@@ -120,6 +159,84 @@ function Convert-WindowsPathToWsl {
     $drive = $Matches[1].ToLowerInvariant()
     $rest = $Matches[2] -replace "\\", "/"
     return "/mnt/$drive/$rest"
+}
+
+function Test-RemoteDebugPort {
+    param(
+        [Parameter(Mandatory = $true)][int]$Port
+    )
+
+    $listener = $null
+    try {
+        $listener = New-Object System.Net.Sockets.TcpListener(
+            [System.Net.IPAddress]::Loopback,
+            $Port
+        )
+        $listener.Start()
+        return $true
+    }
+    catch [System.Net.Sockets.SocketException] {
+        return $false
+    }
+    finally {
+        if ($null -ne $listener) {
+            $listener.Stop()
+        }
+    }
+}
+
+function Resolve-RemoteDebugPorts {
+    param(
+        [Parameter(Mandatory = $true)][ValidatePattern("^[A-Za-z0-9_.-]+$")]
+        [string]$Name,
+        [Parameter(Mandatory = $true)][ValidateRange(0, 65535)]
+        [int]$RequestedGdbPort,
+        [Parameter(Mandatory = $true)][ValidateRange(0, 65535)]
+        [int]$RequestedQmpPort
+    )
+
+    if ($RequestedGdbPort -eq 0 -and $RequestedQmpPort -eq 0) {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($Name)
+            $digest = $sha.ComputeHash($bytes)
+        }
+        finally {
+            $sha.Dispose()
+        }
+        $seed = [BitConverter]::ToUInt16($digest, 0)
+        $candidate = 20000 + ($seed % 20000)
+        for ($attempt = 0; $attempt -lt 10000; ++$attempt) {
+            $gdb = $candidate + 2 * $attempt
+            $qmp = $gdb + 1
+            if ($qmp -gt 65535) {
+                break
+            }
+            if ((Test-RemoteDebugPort $gdb) -and
+                (Test-RemoteDebugPort $qmp)) {
+                return @{ GdbPort = $gdb; QmpPort = $qmp; Automatic = $true }
+            }
+        }
+        throw "Unable to allocate isolated GDB/QMP ports for runtime '$Name'"
+    }
+
+    $gdb = $RequestedGdbPort
+    $qmp = $RequestedQmpPort
+    if ($gdb -eq 0) {
+        $gdb = $qmp - 1
+    }
+    if ($qmp -eq 0) {
+        $qmp = $gdb + 1
+    }
+    if ($gdb -lt 1 -or $qmp -lt 1 -or $gdb -gt 65535 -or
+        $qmp -gt 65535 -or $gdb -eq $qmp) {
+        throw "GDB and QMP ports must be distinct values in the range 1..65535"
+    }
+    if (-not (Test-RemoteDebugPort $gdb) -or
+        -not (Test-RemoteDebugPort $qmp)) {
+        throw "Requested GDB/QMP ports are unavailable: $gdb/$qmp"
+    }
+    return @{ GdbPort = $gdb; QmpPort = $qmp; Automatic = $false }
 }
 
 function Convert-PokeFileSpecToWsl {
@@ -204,6 +321,12 @@ $repoRoot = if ($WorkspaceRoot.Trim().Length -gt 0) {
 }
 $outPath = Resolve-WorkspacePath $repoRoot $OutDir -AllowMissing
 New-Item -ItemType Directory -Force -Path $outPath | Out-Null
+$remoteDebugPorts = Resolve-RemoteDebugPorts `
+    -Name $RuntimeName `
+    -RequestedGdbPort $GdbPort `
+    -RequestedQmpPort $QmpPort
+$GdbPort = $remoteDebugPorts.GdbPort
+$QmpPort = $remoteDebugPorts.QmpPort
 
 $repoRootWsl = Convert-WindowsPathToWsl $repoRoot
 $mountPath = Resolve-WorkspacePath $repoRoot $MountDir
@@ -282,6 +405,12 @@ $checkpointPostDisplayBreakSegmentedArg = if (
 $checkpointPostDisplayPokeArg = if (
     $CheckpointPostDisplayPoke.Trim().Length -gt 0
 ) { $CheckpointPostDisplayPoke } else { "__none__" }
+$finalPostDisplayBreakSegmentedArg = if (
+    $FinalPostDisplayBreakSegmented.Trim().Length -gt 0
+) { $FinalPostDisplayBreakSegmented } else { "__none__" }
+$finalPostDisplayPokeArg = if (
+    $FinalPostDisplayPoke.Trim().Length -gt 0
+) { $FinalPostDisplayPoke } else { "__none__" }
 $stateSchemaPath = Resolve-WorkspacePath $repoRoot $StateSchema
 $screenSignaturesPath = Resolve-WorkspacePath $repoRoot $ScreenSignatures
 $stateSchemaWsl = Convert-WindowsPathToWsl $stateSchemaPath
@@ -339,6 +468,7 @@ post_resume_next_break_hit_count="${44}"
 post_resume_next_break_segmented="${45}"
 post_resume_break_hit_series="${46}"
 post_resume_continue_after_poke="${47}"
+post_resume_continue="0"
 checkpoint_save_state="${48}"
 load_save_state="${49}"
 load_save_state_ready_screen="${50}"
@@ -360,7 +490,207 @@ state_input_linear="${65}"
 state_input_width="${66}"
 state_input_log_path="${67}"
 turbo="${68}"
-shift 68
+checkpoint_post_display_scope="${69}"
+state_input_stop_value="${70}"
+gdb_port="${71}"
+qmp_port="${72}"
+checkpoint_dac="${73}"
+shift 70
+shift 2
+shift
+opl_tick_ds_offset="__none__"
+state_input_hook_offset="__none__"
+state_input_ds_offset="__none__"
+state_input_hook_offset_alt="__none__"
+state_input_trace_path="__none__"
+state_input_write_offset="__none__"
+state_input_write_linear="__none__"
+state_input_write_value="__none__"
+state_input_write_width="2"
+final_post_display_break_segmented="__none__"
+final_post_display_poke="__none__"
+final_post_display_delay="0.05"
+final_post_display_value="__none__"
+vga_sequence_screenshot_all="0"
+call_near_break_linear="__none__"
+call_near_break_segmented="__none__"
+call_near_break_offset="__none__"
+load_save_state_continue="0"
+load_save_state_paused="0"
+checkpoint_save_state_first="0"
+post_resume_next_break_hit_series="__none__"
+checkpoint_screenshot_preserve_memory=()
+checkpoint_displaydump="0"
+display_sequence_frames="0"
+display_sequence_interval="0.0142857142857143"
+post_resume_display_history_capacity="0"
+state_input_observe_only="0"
+backend_input_script="__same__"
+filtered_args=()
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--backend-input-script" ]; then
+        if [ "$#" -lt 2 ]; then
+            echo "--backend-input-script requires PATH" >&2
+            exit 2
+        fi
+        backend_input_script="$2"
+        shift 2
+    elif [ "$1" = "--state-input-observe-only" ]; then
+        state_input_observe_only="1"
+        shift
+    elif [ "$1" = "--load-save-state-continue" ]; then
+        load_save_state_continue="1"
+        shift
+    elif [ "$1" = "--load-save-state-paused" ]; then
+        load_save_state_paused="1"
+        shift
+    elif [ "$1" = "--checkpoint-save-state-first" ]; then
+        checkpoint_save_state_first="1"
+        shift
+    elif [ "$1" = "--checkpoint-displaydump" ]; then
+        checkpoint_displaydump="1"
+        shift
+    elif [ "$1" = "--display-sequence-frames" ]; then
+        if [ "$#" -lt 2 ]; then
+            echo "--display-sequence-frames requires COUNT" >&2
+            exit 2
+        fi
+        display_sequence_frames="$2"
+        shift 2
+    elif [ "$1" = "--display-sequence-interval" ]; then
+        if [ "$#" -lt 2 ]; then
+            echo "--display-sequence-interval requires SECONDS" >&2
+            exit 2
+        fi
+        display_sequence_interval="$2"
+        shift 2
+    elif [ "$1" = "--post-resume-display-history-capacity" ]; then
+        if [ "$#" -lt 2 ]; then
+            echo "--post-resume-display-history-capacity requires COUNT" >&2
+            exit 2
+        fi
+        post_resume_display_history_capacity="$2"
+        shift 2
+    elif [ "$1" = "--post-resume-continue" ]; then
+        post_resume_continue="1"
+        shift
+    elif [ "$1" = "--post-resume-next-break-hit-series" ]; then
+        if [ "$#" -lt 2 ]; then
+            echo "--post-resume-next-break-hit-series requires HITS" >&2
+            exit 2
+        fi
+        post_resume_next_break_hit_series="$2"
+        shift 2
+    elif [ "$1" = "--checkpoint-screenshot-preserve-memory" ]; then
+        if [ "$#" -lt 2 ]; then
+            echo "--checkpoint-screenshot-preserve-memory requires REGION" >&2
+            exit 2
+        fi
+        checkpoint_screenshot_preserve_memory+=("$2")
+        shift 2
+    elif [ "$1" = "--call-near-break-linear" ]; then
+        if [ "$#" -lt 2 ]; then
+            echo "--call-near-break-linear requires ADDRESS" >&2
+            exit 2
+        fi
+        call_near_break_linear="$2"
+        shift 2
+    elif [ "$1" = "--vga-sequence-screenshot-all" ]; then
+        vga_sequence_screenshot_all="1"
+        shift
+    elif [ "$1" = "--call-near-break-segmented" ]; then
+        if [ "$#" -lt 2 ]; then
+            echo "--call-near-break-segmented requires SEGMENT:OFFSET" >&2
+            exit 2
+        fi
+        call_near_break_segmented="$2"
+        shift 2
+    elif [ "$1" = "--call-near-break-offset" ]; then
+        if [ "$#" -lt 2 ]; then
+            echo "--call-near-break-offset requires OFFSET" >&2
+            exit 2
+        fi
+        call_near_break_offset="$2"
+        shift 2
+    elif [ "$1" = "--opl-tick-ds-offset" ]; then
+        if [ "$#" -lt 2 ]; then
+            echo "--opl-tick-ds-offset requires OFFSET" >&2
+            exit 2
+        fi
+        opl_tick_ds_offset="$2"
+        shift 2
+    elif [ "$1" = "--state-input-hook-offset" ]; then
+        if [ "$#" -lt 2 ]; then
+            echo "--state-input-hook-offset requires OFFSET" >&2
+            exit 2
+        fi
+        state_input_hook_offset="$2"
+        shift 2
+    elif [ "$1" = "--state-input-ds-offset" ]; then
+        if [ "$#" -lt 2 ]; then
+            echo "--state-input-ds-offset requires OFFSET" >&2
+            exit 2
+        fi
+        state_input_ds_offset="$2"
+        shift 2
+    elif [ "$1" = "--state-input-hook-offset-alt" ]; then
+        if [ "$#" -lt 2 ]; then
+            echo "--state-input-hook-offset-alt requires OFFSET" >&2
+            exit 2
+        fi
+        state_input_hook_offset_alt="$2"
+        shift 2
+    elif [ "$1" = "--state-input-trace" ]; then
+        if [ "$#" -lt 2 ]; then
+            echo "--state-input-trace requires PATH" >&2
+            exit 2
+        fi
+        state_input_trace_path="$2"
+        shift 2
+    elif [ "$1" = "--state-input-write-offset" ]; then
+        if [ "$#" -lt 2 ]; then
+            echo "--state-input-write-offset requires OFFSET" >&2
+            exit 2
+        fi
+        state_input_write_offset="$2"
+        shift 2
+    elif [ "$1" = "--state-input-write-linear" ]; then
+        if [ "$#" -lt 2 ]; then
+            echo "--state-input-write-linear requires ADDRESS" >&2
+            exit 2
+        fi
+        state_input_write_linear="$2"
+        shift 2
+    elif [ "$1" = "--state-input-write-value" ]; then
+        if [ "$#" -lt 2 ]; then
+            echo "--state-input-write-value requires VALUE" >&2
+            exit 2
+        fi
+        state_input_write_value="$2"
+        shift 2
+    elif [ "$1" = "--state-input-write-width" ]; then
+        if [ "$#" -lt 2 ]; then
+            echo "--state-input-write-width requires WIDTH" >&2
+            exit 2
+        fi
+        state_input_write_width="$2"
+        shift 2
+    elif [ "$1" = "--final-post-display" ]; then
+        if [ "$#" -lt 5 ]; then
+            echo "--final-post-display requires BREAK POKE DELAY VALUE" >&2
+            exit 2
+        fi
+        final_post_display_break_segmented="$2"
+        final_post_display_poke="$3"
+        final_post_display_delay="$4"
+        final_post_display_value="$5"
+        shift 5
+    else
+        filtered_args+=("$1")
+        shift
+    fi
+done
+set -- "${filtered_args[@]}"
 if [ "$program_arguments" = "__none__" ]; then
     program_arguments=""
 fi
@@ -368,20 +698,25 @@ startup_keys=()
 poke_specs=()
 poke_file_specs=()
 post_restore_keys=()
+post_wait_keys=()
 wait_state_specs=()
 post_resume_poke_specs=()
 post_resume_poke_file_specs=()
+state_side_break_poke_specs=()
 parsing_pokes=0
 parsing_poke_files=0
 parsing_post_restore=0
+parsing_post_wait=0
 parsing_wait_state=0
 parsing_post_resume_pokes=0
 parsing_post_resume_poke_files=0
+parsing_state_side_break_pokes=0
 for arg in "$@"; do
     if [ "$arg" = "--" ] || [ "$arg" = "--pokes" ]; then
         parsing_pokes=1
         parsing_poke_files=0
         parsing_post_restore=0
+        parsing_post_wait=0
         parsing_wait_state=0
         parsing_post_resume_pokes=0
         parsing_post_resume_poke_files=0
@@ -391,6 +726,7 @@ for arg in "$@"; do
         parsing_pokes=0
         parsing_poke_files=1
         parsing_post_restore=0
+        parsing_post_wait=0
         parsing_wait_state=0
         parsing_post_resume_pokes=0
         parsing_post_resume_poke_files=0
@@ -400,6 +736,17 @@ for arg in "$@"; do
         parsing_pokes=0
         parsing_poke_files=0
         parsing_post_restore=1
+        parsing_post_wait=0
+        parsing_wait_state=0
+        parsing_post_resume_pokes=0
+        parsing_post_resume_poke_files=0
+        continue
+    fi
+    if [ "$arg" = "--post-wait-key" ]; then
+        parsing_pokes=0
+        parsing_poke_files=0
+        parsing_post_restore=0
+        parsing_post_wait=1
         parsing_wait_state=0
         parsing_post_resume_pokes=0
         parsing_post_resume_poke_files=0
@@ -409,6 +756,7 @@ for arg in "$@"; do
         parsing_pokes=0
         parsing_poke_files=0
         parsing_post_restore=0
+        parsing_post_wait=0
         parsing_wait_state=1
         parsing_post_resume_pokes=0
         parsing_post_resume_poke_files=0
@@ -418,6 +766,7 @@ for arg in "$@"; do
         parsing_pokes=0
         parsing_poke_files=0
         parsing_post_restore=0
+        parsing_post_wait=0
         parsing_wait_state=0
         parsing_post_resume_pokes=1
         parsing_post_resume_poke_files=0
@@ -427,12 +776,26 @@ for arg in "$@"; do
         parsing_pokes=0
         parsing_poke_files=0
         parsing_post_restore=0
+        parsing_post_wait=0
         parsing_wait_state=0
         parsing_post_resume_pokes=0
         parsing_post_resume_poke_files=1
         continue
     fi
-    if [ "$parsing_post_resume_poke_files" = "1" ]; then
+    if [ "$arg" = "--state-side-break-pokes" ]; then
+        parsing_pokes=0
+        parsing_poke_files=0
+        parsing_post_restore=0
+        parsing_post_wait=0
+        parsing_wait_state=0
+        parsing_post_resume_pokes=0
+        parsing_post_resume_poke_files=0
+        parsing_state_side_break_pokes=1
+        continue
+    fi
+    if [ "$parsing_state_side_break_pokes" = "1" ]; then
+        state_side_break_poke_specs+=("$arg")
+    elif [ "$parsing_post_resume_poke_files" = "1" ]; then
         post_resume_poke_file_specs+=("$arg")
     elif [ "$parsing_post_resume_pokes" = "1" ]; then
         post_resume_poke_specs+=("$arg")
@@ -440,6 +803,8 @@ for arg in "$@"; do
         wait_state_specs+=("$arg")
     elif [ "$parsing_post_restore" = "1" ]; then
         post_restore_keys+=("$arg")
+    elif [ "$parsing_post_wait" = "1" ]; then
+        post_wait_keys+=("$arg")
     elif [ "$parsing_poke_files" = "1" ]; then
         poke_file_specs+=("$arg")
     elif [ "$parsing_pokes" = "1" ]; then
@@ -478,7 +843,9 @@ cat > "$conf" <<EOF
 [dosbox]
 machine = $machine
 gdbserver = true
+gdbserver port = $gdb_port
 qmpserver = true
+qmpserver port = $qmp_port
 captures = $out_dir
 
 [cpu]
@@ -538,18 +905,68 @@ fi
 if [ "$opl_tick_linear" != "__none__" ]; then
     runtime_env+=(DOS_RE_HARNESS_OPL_TICK_LINEAR="$opl_tick_linear")
 fi
-if [ "$state_input_hook_linear" != "__none__" ]; then
-    runtime_env+=(
-        DOS_RE_HARNESS_STATE_INPUT_SCRIPT="$input_script"
-        DOS_RE_HARNESS_STATE_INPUT_HOOK_LINEAR="$state_input_hook_linear"
-        DOS_RE_HARNESS_STATE_INPUT_LINEAR="$state_input_linear"
-        DOS_RE_HARNESS_STATE_INPUT_WIDTH="$state_input_width"
-    )
+if [ "$opl_tick_ds_offset" != "__none__" ]; then
+    runtime_env+=(DOS_RE_HARNESS_OPL_TICK_DS_OFFSET="$opl_tick_ds_offset")
+fi
+if [ "$state_input_hook_linear" != "__none__" ] || [ "$state_input_hook_offset" != "__none__" ]; then
+    runtime_env+=(DOS_RE_HARNESS_STATE_INPUT_WIDTH="$state_input_width")
+    if [ "$input_script" != "__none__" ]; then
+        if [ "$state_input_observe_only" != "1" ]; then
+            if [ "$backend_input_script" = "__same__" ]; then
+                runtime_env+=(DOS_RE_HARNESS_STATE_INPUT_SCRIPT="$input_script")
+            else
+                runtime_env+=(DOS_RE_HARNESS_STATE_INPUT_SCRIPT="$backend_input_script")
+            fi
+        fi
+    fi
+    if [ "$state_input_hook_offset" != "__none__" ]; then
+        runtime_env+=(
+            DOS_RE_HARNESS_STATE_INPUT_HOOK_OFFSET="$state_input_hook_offset"
+            DOS_RE_HARNESS_STATE_INPUT_DS_OFFSET="$state_input_ds_offset"
+        )
+        if [ "$state_input_hook_offset_alt" != "__none__" ]; then
+            runtime_env+=(
+                DOS_RE_HARNESS_STATE_INPUT_HOOK_OFFSET_ALT="$state_input_hook_offset_alt"
+            )
+        fi
+    else
+        runtime_env+=(
+            DOS_RE_HARNESS_STATE_INPUT_HOOK_LINEAR="$state_input_hook_linear"
+            DOS_RE_HARNESS_STATE_INPUT_LINEAR="$state_input_linear"
+        )
+    fi
     if [ "$state_input_log_path" != "__none__" ]; then
         runtime_env+=(
             DOS_RE_HARNESS_STATE_INPUT_LOG="$state_input_log_path"
         )
     fi
+    if [ "$state_input_trace_path" != "__none__" ]; then
+        runtime_env+=(
+            DOS_RE_HARNESS_STATE_INPUT_TRACE="$state_input_trace_path"
+        )
+    fi
+fi
+if [ "$state_input_stop_value" != "__none__" ]; then
+    runtime_env+=(DOS_RE_HARNESS_STATE_INPUT_STOP_VALUE="$state_input_stop_value")
+fi
+if [ "$state_input_write_offset" != "__none__" ] || [ "$state_input_write_linear" != "__none__" ]; then
+    if [ "$state_input_write_offset" != "__none__" ] && [ "$state_input_write_linear" != "__none__" ]; then
+        echo "state-input write offset and linear address are mutually exclusive" >&2
+        exit 2
+    fi
+    if [ "$state_input_write_value" = "__none__" ]; then
+        echo "state-input write requires a value" >&2
+        exit 2
+    fi
+    if [ "$state_input_write_offset" != "__none__" ]; then
+        runtime_env+=(DOS_RE_HARNESS_STATE_INPUT_WRITE_OFFSET="$state_input_write_offset")
+    else
+        runtime_env+=(DOS_RE_HARNESS_STATE_INPUT_WRITE_LINEAR="$state_input_write_linear")
+    fi
+    runtime_env+=(
+        DOS_RE_HARNESS_STATE_INPUT_WRITE_VALUE="$state_input_write_value"
+        DOS_RE_HARNESS_STATE_INPUT_WRITE_WIDTH="$state_input_write_width"
+    )
 fi
 nohup env "${runtime_env[@]}" "$dosbox" -conf "$conf" >"$log" 2>&1 &
 pid="$!"
@@ -564,6 +981,8 @@ cleanup() {
 trap cleanup EXIT
 
 controller_args=(
+    --gdb-port "$gdb_port"
+    --qmp-port "$qmp_port"
     --out-dir "$out_dir"
     --timeout "$remote_timeout"
     --startup-delay "$startup_delay_seconds"
@@ -586,6 +1005,9 @@ fi
 if [ "$vga_sequence_screenshot_on_stop" = "1" ]; then
     controller_args+=(--vga-sequence-screenshot-on-stop)
 fi
+if [ "$vga_sequence_screenshot_all" = "1" ]; then
+    controller_args+=(--vga-sequence-screenshot-all)
+fi
 if [ "$break_linear" != "__none__" ]; then
     controller_args+=(--break-linear "$break_linear")
 fi
@@ -607,11 +1029,29 @@ done
 for key in "${post_restore_keys[@]}"; do
     controller_args+=(--post-restore-key "$key")
 done
+for key in "${post_wait_keys[@]}"; do
+    controller_args+=(--post-wait-key "$key")
+done
+for poke in "${state_side_break_poke_specs[@]}"; do
+    controller_args+=(--state-side-break-poke "$poke")
+done
 if [ "$restore_registers" != "__none__" ]; then
     controller_args+=(--restore-registers "$restore_registers")
 fi
 if [ "$resume_checkpoint_script" != "__none__" ]; then
     controller_args+=(--resume-checkpoint-script "$resume_checkpoint_script")
+    if [ "$input_script" != "__none__" ] && {
+        [ "$state_input_hook_linear" != "__none__" ] ||
+        [ "$state_input_hook_offset" != "__none__" ];
+    }; then
+        if [ "$state_input_observe_only" = "1" ]; then
+            controller_args+=(--resume-script-event-owner controller)
+        elif [ "$backend_input_script" != "__same__" ]; then
+            controller_args+=(--resume-script-event-owner controller)
+        else
+            controller_args+=(--resume-script-event-owner backend)
+        fi
+    fi
 fi
 if [ "$resume_next_linear" != "__none__" ]; then
     controller_args+=(--resume-next-linear "$resume_next_linear")
@@ -642,6 +1082,9 @@ done
 if [ "$post_resume_continue_after_poke" = "1" ]; then
     controller_args+=(--post-resume-continue-after-poke)
 fi
+if [ "$post_resume_continue" = "1" ]; then
+    controller_args+=(--post-resume-continue)
+fi
 if [ "$post_resume_next_break_linear" != "__none__" ]; then
     controller_args+=(
         --post-resume-next-break-linear "$post_resume_next_break_linear"
@@ -657,6 +1100,15 @@ fi
 if [ "$call_near" != "__none__" ]; then
     controller_args+=(--call-near "$call_near")
 fi
+if [ "$call_near_break_linear" != "__none__" ]; then
+    controller_args+=(--call-near-break-linear "$call_near_break_linear")
+fi
+if [ "$call_near_break_segmented" != "__none__" ]; then
+    controller_args+=(--call-near-break-segmented "$call_near_break_segmented")
+fi
+if [ "$call_near_break_offset" != "__none__" ]; then
+    controller_args+=(--call-near-break-offset "$call_near_break_offset")
+fi
 if [ "$call_near_continue_after_return" = "1" ]; then
     controller_args+=(--call-near-continue-after-return)
 fi
@@ -669,9 +1121,30 @@ fi
 if [ "$omit_checkpoint_vga" = "1" ]; then
     controller_args+=(--omit-checkpoint-vga)
 fi
+if [ "$checkpoint_dac" = "1" ]; then
+    controller_args+=(--checkpoint-dac)
+fi
+if [ "$checkpoint_displaydump" = "1" ]; then
+    controller_args+=(--checkpoint-displaydump)
+fi
+if [ "$display_sequence_frames" -gt 0 ]; then
+    controller_args+=(--display-sequence-frames "$display_sequence_frames")
+    controller_args+=(--display-sequence-interval "$display_sequence_interval")
+fi
+if [ "$post_resume_display_history_capacity" -gt 0 ]; then
+    controller_args+=(
+        --post-resume-display-history-capacity
+        "$post_resume_display_history_capacity"
+    )
+fi
 if [ "$checkpoint_screenshot" = "1" ]; then
     controller_args+=(--checkpoint-screenshot)
 fi
+for region in "${checkpoint_screenshot_preserve_memory[@]}"; do
+    controller_args+=(
+        --checkpoint-screenshot-preserve-memory "$region"
+    )
+done
 if [ "$checkpoint_post_display_break_segmented" != "__none__" ]; then
     controller_args+=(
         --checkpoint-post-display-break-segmented
@@ -680,7 +1153,30 @@ if [ "$checkpoint_post_display_break_segmented" != "__none__" ]; then
         "$checkpoint_post_display_poke"
         --checkpoint-post-display-delay
         "$checkpoint_post_display_delay"
+        --checkpoint-post-display-scope
+        "$checkpoint_post_display_scope"
     )
+fi
+if [ "$post_resume_next_break_hit_series" != "__none__" ]; then
+    controller_args+=(
+        --post-resume-next-break-hit-series \
+        "$post_resume_next_break_hit_series"
+    )
+fi
+if [ "$final_post_display_break_segmented" != "__none__" ]; then
+    controller_args+=(
+        --final-post-display-break-segmented
+        "$final_post_display_break_segmented"
+        --final-post-display-poke
+        "$final_post_display_poke"
+        --final-post-display-delay
+        "$final_post_display_delay"
+    )
+    if [ "$final_post_display_value" != "__none__" ]; then
+        controller_args+=(
+            --final-post-display-value "$final_post_display_value"
+        )
+    fi
 fi
 if [ "$resume_side_break_segmented" != "__none__" ]; then
     controller_args+=(
@@ -700,8 +1196,20 @@ fi
 if [ "$checkpoint_save_state" = "1" ]; then
     controller_args+=(--checkpoint-save-state)
 fi
+    if [ "$checkpoint_save_state_first" = "1" ]; then
+    controller_args+=(--checkpoint-save-state-first)
+fi
+if [ "$state_input_stop_value" != "__none__" ]; then
+    controller_args+=(--state-input-stop-value "$state_input_stop_value")
+fi
 if [ "$load_save_state" != "__none__" ]; then
     controller_args+=(--load-save-state "$load_save_state")
+fi
+if [ "$load_save_state_continue" = "1" ]; then
+    controller_args+=(--load-save-state-continue)
+fi
+if [ "$load_save_state_paused" = "1" ]; then
+    controller_args+=(--load-save-state-paused)
 fi
 if [ "$load_save_state_ready_screen" != "__none__" ]; then
     controller_args+=(
@@ -730,6 +1238,7 @@ fi
 
 $tempScript = Join-Path $env:TEMP ("dos_re_runtime_{0}.sh" -f ([Guid]::NewGuid().ToString("N")))
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$bash = $bash.Replace("`r`n", "`n").Replace("`r", "`n")
 [System.IO.File]::WriteAllText($tempScript, $bash, $utf8NoBom)
 try {
     $tempScriptWsl = Convert-WindowsPathToWsl $tempScript
@@ -790,11 +1299,57 @@ try {
     } else {
         "__none__"
     }
+    $backendInputScriptWsl = if ($BackendInputScript.Trim().Length -gt 0) {
+        $resolvedBackendInputScript = Resolve-WorkspacePath `
+            $repoRoot $BackendInputScript
+        Convert-WindowsPathToWsl $resolvedBackendInputScript
+    } else {
+        "__same__"
+    }
+    $oplTickDsOffsetArg = if ($OplTickDsOffset.Trim().Length -gt 0) {
+        $OplTickDsOffset
+    } else {
+        "__none__"
+    }
+    $stateInputDynamicRequested = (
+        $StateInputHookOffset.Trim().Length -gt 0 -or
+        $StateInputDsOffset.Trim().Length -gt 0 -or
+        $StateInputHookOffsetAlt.Trim().Length -gt 0
+    )
+    $stateInputStopRequested = $StateInputStopValue.Trim().Length -gt 0
+    if (
+        ($StateInputHookOffset.Trim().Length -gt 0) -ne
+        ($StateInputDsOffset.Trim().Length -gt 0)
+    ) {
+        throw "StateInputHookOffset and StateInputDsOffset must be supplied together"
+    }
+    if ($stateInputDynamicRequested -and (
+        $StateInputHookLinear.Trim().Length -gt 0 -or
+        $StateInputLinear.Trim().Length -gt 0
+    )) {
+        throw "Dynamic state-input offsets cannot be combined with linear addresses"
+    }
+    if (
+        $stateInputDynamicRequested -and
+        $InputScript.Trim().Length -eq 0 -and
+        -not $stateInputStopRequested
+    ) {
+        throw "Dynamic state-input offsets require InputScript or StateInputStopValue"
+    }
+    if (
+        $StateInputHookOffsetAlt.Trim().Length -gt 0 -and
+        $StateInputHookOffset.Trim().Length -eq 0
+    ) {
+        throw "StateInputHookOffsetAlt requires StateInputHookOffset"
+    }
     $stateInputHookLinearArg = if (
         $StateInputHookLinear.Trim().Length -gt 0
     ) {
-        if ($InputScript.Trim().Length -eq 0) {
-            throw "StateInputHookLinear requires InputScript"
+        if (
+            $InputScript.Trim().Length -eq 0 -and
+            -not $stateInputStopRequested
+        ) {
+            throw "StateInputHookLinear requires InputScript or StateInputStopValue"
         }
         if ($StateInputLinear.Trim().Length -eq 0) {
             throw "StateInputHookLinear requires StateInputLinear"
@@ -804,7 +1359,7 @@ try {
         if ($StateInputLinear.Trim().Length -gt 0) {
             throw "StateInputLinear requires StateInputHookLinear"
         }
-        if ($StateInputLogPath.Trim().Length -gt 0) {
+        if ($StateInputLogPath.Trim().Length -gt 0 -and -not $stateInputDynamicRequested) {
             throw "StateInputLogPath requires StateInputHookLinear"
         }
         "__none__"
@@ -890,7 +1445,195 @@ try {
         "__none__"
     }
     # Keep the legacy $captureVideoArg @StartupKey ordering contract visible.
-    & wsl.exe --exec bash $tempScriptWsl $repoRootWsl $outPathWsl $Program $mountPathWsl $DelaySeconds $StartupDelaySeconds $DumpSize $DumpSegment $keep $screenshotArg $WaitStateTimeout $WaitStateInterval $restoreRegistersWsl $haltAfterPokeArg $dumpLowMemoryArg $callNearArg $VgaSequenceFrames $VgaSequenceInterval $vgaSequenceStopSha256Arg $captureAudioArg $captureSfxOnlyArg $stateSchemaWsl $screenSignaturesWsl $toolkitRootWsl $dosboxBinaryWsl $RuntimeName $Machine $CpuType $Cycles $programArgumentsArg $VgaAddress $VgaWidth $VgaHeight $breakpointLinearArg $inputScriptWsl $resumeCheckpointScriptArg $resumeNextLinearArg $omitCheckpointVgaArg $checkpointScreenshotArg $postResumeBreakLinearArg $PostResumeBreakHitCount $postResumeBreakSegmentedArg $postResumeNextBreakLinearArg $PostResumeNextBreakHitCount $postResumeNextBreakSegmentedArg $postResumeBreakHitSeriesArg $postResumeContinueAfterPokeArg $checkpointSaveStateArg $loadSaveStateWsl $loadSaveStateReadyScreenArg $LoadSaveStateReadyTimeout $captureVideoArg $checkpointPostDisplayBreakSegmentedArg $checkpointPostDisplayPokeArg $CheckpointPostDisplayDelay $resumeSideBreakSegmentedArg $ResumeSideBreakMaxHits $ResumeSideBreakStartValue $oplLogPathArg $oplTickLinearArg $callNearContinueAfterReturnArg $RemoteTimeout $vgaSequenceScreenshotOnStopArg $stateInputHookLinearArg $stateInputLinearArg $StateInputWidth $stateInputLogPathWsl $turboArg @StartupKey --pokes @Poke --poke-files @pokeFilesWsl --post-restore @PostRestoreKey --wait-state @WaitState --post-resume-pokes @PostResumePoke --post-resume-poke-files @postResumePokeFilesWsl
+    # The fixed positional prefix remains available to wrappers that inspect
+    # this launcher text; waitStateBreakLinearArg extends it before variadic
+    # startup keys.
+    # Legacy textual prefix: $oplLogPathArg $oplTickLinearArg $callNearContinueAfterReturnArg $RemoteTimeout $vgaSequenceScreenshotOnStopArg $stateInputHookLinearArg $stateInputLinearArg $StateInputWidth $stateInputLogPathWsl $turboArg $CheckpointPostDisplayScope $stateInputStopValueArg $GdbPort $QmpPort @StartupKey
+    $stateInputStopValueArg = if ($StateInputStopValue.Trim().Length -gt 0) {
+        $StateInputStopValue
+    } else {
+        "__none__"
+    }
+    $checkpointDacArg = if ($CheckpointDac) { "1" } else { "0" }
+    $waitStateBreakLinearArg = $checkpointDacArg
+    if (
+        $stateInputStopRequested -and
+        $StateInputHookLinear.Trim().Length -eq 0 -and
+        -not $stateInputDynamicRequested
+    ) {
+        throw "StateInputStopValue requires a state-input hook and state address"
+    }
+    $stateInputHookOffsetArg = if (
+        $StateInputHookOffset.Trim().Length -gt 0
+    ) {
+        $StateInputHookOffset
+    } else {
+        "__none__"
+    }
+    $stateInputDsOffsetArg = if (
+        $StateInputDsOffset.Trim().Length -gt 0
+    ) {
+        $StateInputDsOffset
+    } else {
+        "__none__"
+    }
+    $backendRuntimeArgs = @()
+    if ($backendInputScriptWsl -ne "__same__") {
+        $backendRuntimeArgs += @(
+            "--backend-input-script", $backendInputScriptWsl
+        )
+    }
+    if ($StateInputObserveOnly) {
+        $backendRuntimeArgs += "--state-input-observe-only"
+    }
+    if ($VgaSequenceScreenshotAll) {
+        $backendRuntimeArgs += "--vga-sequence-screenshot-all"
+    }
+    if ($CallNearBreakLinear.Trim().Length -gt 0) {
+        $backendRuntimeArgs += @(
+            "--call-near-break-linear",
+            $CallNearBreakLinear
+        )
+    }
+    if ($CallNearBreakSegmented.Trim().Length -gt 0) {
+        $backendRuntimeArgs += @(
+            "--call-near-break-segmented",
+            $CallNearBreakSegmented
+        )
+    }
+    if ($CallNearBreakOffset.Trim().Length -gt 0) {
+        $backendRuntimeArgs += @(
+            "--call-near-break-offset",
+            $CallNearBreakOffset
+        )
+    }
+    if ($LoadSaveStateContinue) {
+        $backendRuntimeArgs += "--load-save-state-continue"
+    }
+    if ($LoadSaveStatePaused) {
+        $backendRuntimeArgs += "--load-save-state-paused"
+    }
+    if ($CheckpointSaveStateFirst) {
+        $backendRuntimeArgs += "--checkpoint-save-state-first"
+    }
+    if ($CheckpointDisplayDump) {
+        $backendRuntimeArgs += "--checkpoint-displaydump"
+    }
+    if ($DisplaySequenceFrames -gt 0) {
+        $backendRuntimeArgs += @(
+            "--display-sequence-frames", $DisplaySequenceFrames,
+            "--display-sequence-interval", $DisplaySequenceInterval
+        )
+    }
+    if ($PostResumeDisplayHistoryCapacity -gt 0) {
+        $backendRuntimeArgs += @(
+            "--post-resume-display-history-capacity",
+            $PostResumeDisplayHistoryCapacity
+        )
+    }
+    foreach ($region in $CheckpointScreenshotPreserveMemory) {
+        $backendRuntimeArgs += @(
+            "--checkpoint-screenshot-preserve-memory",
+            $region
+        )
+    }
+    if ($PostResumeNextBreakHitSeries.Trim().Length -gt 0) {
+        $backendRuntimeArgs += @(
+            "--post-resume-next-break-hit-series",
+            $PostResumeNextBreakHitSeries
+        )
+    }
+    if ($PostResumeContinue) {
+        $backendRuntimeArgs += "--post-resume-continue"
+    }
+    if ($OplTickDsOffset.Trim().Length -gt 0) {
+        $backendRuntimeArgs += @("--opl-tick-ds-offset", $OplTickDsOffset)
+    }
+    if ($StateInputHookOffset.Trim().Length -gt 0) {
+        $backendRuntimeArgs += @(
+            "--state-input-hook-offset", $StateInputHookOffset,
+            "--state-input-ds-offset", $StateInputDsOffset
+        )
+    }
+    if ($StateInputHookOffsetAlt.Trim().Length -gt 0) {
+        $backendRuntimeArgs += @(
+            "--state-input-hook-offset-alt", $StateInputHookOffsetAlt
+        )
+    }
+    if ($StateInputTracePath.Trim().Length -gt 0) {
+        $tracePathWsl = Convert-WindowsPathToWsl (
+            Resolve-WorkspacePath $repoRoot $StateInputTracePath -AllowMissing
+        )
+        $backendRuntimeArgs += @(
+            "--state-input-trace", $tracePathWsl
+        )
+    }
+    if ($StateInputWriteOffset.Trim().Length -gt 0) {
+        $backendRuntimeArgs += @(
+            "--state-input-write-offset", $StateInputWriteOffset
+        )
+    }
+    if ($StateInputWriteLinear.Trim().Length -gt 0) {
+        $backendRuntimeArgs += @(
+            "--state-input-write-linear", $StateInputWriteLinear
+        )
+    }
+    if ($StateInputWriteValue.Trim().Length -gt 0) {
+        $backendRuntimeArgs += @(
+            "--state-input-write-value", $StateInputWriteValue,
+            "--state-input-write-width", $StateInputWriteWidth
+        )
+    }
+    $variadicControllerArgs = @()
+    if ($StartupKey.Count -gt 0) {
+        # The generated WSL wrapper treats unmarked variadic arguments as
+        # startup actions.  Do not pass the controller option marker through
+        # that wrapper; it would be re-emitted as a startup action and could
+        # leave remote_capture with a dangling --startup-key.
+        $variadicControllerArgs += $StartupKey
+    }
+    if ($Poke.Count -gt 0) {
+        $variadicControllerArgs += "--pokes"
+        $variadicControllerArgs += $Poke
+    }
+    if ($pokeFilesWsl.Count -gt 0) {
+        $variadicControllerArgs += "--poke-files"
+        $variadicControllerArgs += $pokeFilesWsl
+    }
+    if ($PostRestoreKey.Count -gt 0) {
+        $variadicControllerArgs += "--post-restore"
+        $variadicControllerArgs += $PostRestoreKey
+    }
+    if ($WaitState.Count -gt 0) {
+        $variadicControllerArgs += "--wait-state"
+        $variadicControllerArgs += $WaitState
+    }
+    if ($PostWaitKey.Count -gt 0) {
+        $variadicControllerArgs += "--post-wait-key"
+        $variadicControllerArgs += $PostWaitKey
+    }
+    if ($PostResumePoke.Count -gt 0) {
+        $variadicControllerArgs += "--post-resume-pokes"
+        $variadicControllerArgs += $PostResumePoke
+    }
+    if ($postResumePokeFilesWsl.Count -gt 0) {
+        $variadicControllerArgs += "--post-resume-poke-files"
+        $variadicControllerArgs += $postResumePokeFilesWsl
+    }
+    if ($ResumeSideBreakPoke.Count -gt 0) {
+        $variadicControllerArgs += "--state-side-break-pokes"
+        $variadicControllerArgs += $ResumeSideBreakPoke
+    }
+    if ($finalPostDisplayBreakSegmentedArg -ne "__none__") {
+        $variadicControllerArgs += @(
+            "--final-post-display",
+            $finalPostDisplayBreakSegmentedArg,
+            $finalPostDisplayPokeArg,
+            $FinalPostDisplayDelay,
+            $stateInputStopValueArg
+        )
+    }
+    & wsl.exe --exec bash $tempScriptWsl $repoRootWsl $outPathWsl $Program $mountPathWsl $DelaySeconds $StartupDelaySeconds $DumpSize $DumpSegment $keep $screenshotArg $WaitStateTimeout $WaitStateInterval $restoreRegistersWsl $haltAfterPokeArg $dumpLowMemoryArg $callNearArg $VgaSequenceFrames $VgaSequenceInterval $vgaSequenceStopSha256Arg $captureAudioArg $captureSfxOnlyArg $stateSchemaWsl $screenSignaturesWsl $toolkitRootWsl $dosboxBinaryWsl $RuntimeName $Machine $CpuType $Cycles $programArgumentsArg $VgaAddress $VgaWidth $VgaHeight $breakpointLinearArg $inputScriptWsl $resumeCheckpointScriptArg $resumeNextLinearArg $omitCheckpointVgaArg $checkpointScreenshotArg $postResumeBreakLinearArg $PostResumeBreakHitCount $postResumeBreakSegmentedArg $postResumeNextBreakLinearArg $PostResumeNextBreakHitCount $postResumeNextBreakSegmentedArg $postResumeBreakHitSeriesArg $postResumeContinueAfterPokeArg $checkpointSaveStateArg $loadSaveStateWsl $loadSaveStateReadyScreenArg $LoadSaveStateReadyTimeout $captureVideoArg $checkpointPostDisplayBreakSegmentedArg $checkpointPostDisplayPokeArg $CheckpointPostDisplayDelay $resumeSideBreakSegmentedArg $ResumeSideBreakMaxHits $ResumeSideBreakStartValue $oplLogPathArg $oplTickLinearArg $callNearContinueAfterReturnArg $RemoteTimeout $vgaSequenceScreenshotOnStopArg $stateInputHookLinearArg $stateInputLinearArg $StateInputWidth $stateInputLogPathWsl $turboArg $CheckpointPostDisplayScope $stateInputStopValueArg $GdbPort $QmpPort $waitStateBreakLinearArg @variadicControllerArgs @backendRuntimeArgs
     if ($LASTEXITCODE -ne 0) {
         throw "wsl.exe failed with exit code $LASTEXITCODE"
     }

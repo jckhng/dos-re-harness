@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 import wave
 import zlib
 from pathlib import Path
@@ -36,6 +37,15 @@ from dos_re_harness.traces import (
 
 
 class CaptureAdapterTests(unittest.TestCase):
+    def test_wsl_runtime_script_normalizes_windows_newlines(self) -> None:
+        launcher = (
+            TOOLKIT_ROOT / "scripts" / "run-wsl-remotedebug.ps1"
+        ).read_text(encoding="utf-8")
+        normalization = '$bash = $bash.Replace("`r`n", "`n").Replace("`r", "`n")'
+        write = "[System.IO.File]::WriteAllText($tempScript, $bash, $utf8NoBom)"
+        self.assertIn(normalization, launcher)
+        self.assertLess(launcher.index(normalization), launcher.index(write))
+
     def test_powershell_launcher_forwards_positionals_out_and_help(self) -> None:
         powershell = shutil.which("pwsh")
         if powershell is None:
@@ -206,6 +216,17 @@ class CaptureAdapterTests(unittest.TestCase):
         self.assertEqual(plan["capture"]["first_value"], 5)
         self.assertEqual(plan["capture"]["last_value"], 11)
         self.assertEqual(plan["capture"]["value_count"], 7)
+        self.assertEqual(
+            plan["capture"]["stop_boundary"],
+            {
+                "value": 11,
+                "input_transitions": [],
+                "transition_count": 0,
+                "requires_explicit_input_phase": False,
+                "nearest_transition_free_before": 11,
+                "nearest_transition_free_after": 11,
+            },
+        )
         self.assertIn(
             "resume_checkpoint_script=checkpointstatescriptfile:"
             "0x850c:loop_tick:"
@@ -216,6 +237,73 @@ class CaptureAdapterTests(unittest.TestCase):
             plan["transition"]["breakpoint"],
             "0x0824:0x6f52",
         )
+
+    def test_state_tail_plan_flags_stop_on_input_transition(self) -> None:
+        from dos_re_harness.state_tail import state_input_boundary
+
+        events = [
+            (9, True, ["left"]),
+            (10, False, ["left"]),
+            (10, True, ["right"]),
+            (11, False, ["right"]),
+        ]
+
+        boundary = state_input_boundary(events, 10)
+
+        self.assertEqual(boundary["transition_count"], 2)
+        self.assertTrue(boundary["requires_explicit_input_phase"])
+        self.assertEqual(boundary["nearest_transition_free_before"], 8)
+        self.assertEqual(boundary["nearest_transition_free_after"], 12)
+        self.assertEqual(
+            boundary["input_transitions"],
+            [
+                {"pressed": False, "qcodes": ["left"]},
+                {"pressed": True, "qcodes": ["right"]},
+            ],
+        )
+
+    def test_state_input_slice_reconstructs_held_keys(self) -> None:
+        from dos_re_harness.remote_capture import load_state_input_script
+        from dos_re_harness.state_tail import slice_state_input_script
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "route.input.script"
+            output = root / "tail.input.script"
+            manifest = root / "tail.json"
+            source.write_text(
+                "dos-re-state-input-script-v1\n"
+                "# state_field=loop_tick\n"
+                "1=down.left\n"
+                "3=down.spc\n"
+                "5=up.left\n"
+                "5=down.right\n"
+                "7=up.right\n"
+                "9=up.spc\n",
+                encoding="utf-8",
+            )
+
+            report = slice_state_input_script(
+                source,
+                output,
+                resume_value=5,
+                manifest=manifest,
+            )
+            metadata, events = load_state_input_script(output)
+
+            self.assertNotIn(
+                str(source),
+                manifest.read_text(encoding="utf-8"),
+            )
+
+        self.assertEqual(report["initial_held_qcodes"], ["left", "spc"])
+        self.assertEqual(report["event_count"], 4)
+        self.assertEqual(metadata["resume_value"], "5")
+        self.assertEqual(metadata["first_hook_value"], "6")
+        self.assertEqual(metadata["initial_held_qcodes"], "left+spc")
+        self.assertEqual(metadata["preapplied_through"], "5")
+        self.assertEqual(events[0], (5, False, ["left"]))
+        self.assertEqual(events[1], (5, True, ["right"]))
 
     def test_state_tail_plan_rejects_invalid_snapshot_and_bootstrap(self) -> None:
         from dos_re_harness.state_tail import build_state_tail_plan
@@ -331,6 +419,10 @@ class CaptureAdapterTests(unittest.TestCase):
                 "resume.movie.json",
                 "--capture-out",
                 "capture",
+                "--sliced-input-out",
+                "tail.input.script",
+                "--sliced-input-manifest",
+                "tail.input.json",
                 "--out",
                 "plan.json",
             ]
@@ -338,6 +430,106 @@ class CaptureAdapterTests(unittest.TestCase):
         self.assertEqual(args.checkpoint_value, 40)
         self.assertEqual(args.end_value, 90)
         self.assertEqual(args.maximum_hit_margin, 62)
+        self.assertEqual(args.sliced_input_out, Path("tail.input.script"))
+        self.assertEqual(args.sliced_input_manifest, Path("tail.input.json"))
+
+    def test_state_tail_plan_uses_generated_input_slice(self) -> None:
+        from dos_re_harness.cli import build_parser
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            project_root = root / "project"
+            shutil.copytree(FIXTURE_ROOT, project_root)
+            project_path = project_root / "project.json"
+            project = json.loads(project_path.read_text(encoding="utf-8"))
+            project["capture_adapter"]["configuration"] = {
+                "poke_file": "",
+                "resume_checkpoint_script": "",
+                "resume_next_linear": "",
+                "checkpoint_vga": "1",
+            }
+            project_path.write_text(
+                json.dumps(project),
+                encoding="utf-8",
+            )
+            script = root / "route.input.script"
+            script.write_text(
+                "dos-re-state-input-script-v1\n"
+                "# state_field=loop_tick\n"
+                "1=down.left\n"
+                "5=up.left\n"
+                "7=down.right\n"
+                "9=up.right\n",
+                encoding="utf-8",
+            )
+            snapshot = root / "loop_tick-5"
+            snapshot.mkdir()
+            (snapshot / "remote_runtime_ds.bin").write_bytes(bytes(8))
+            (snapshot / "remote_runtime_registers.json").write_text(
+                "{}\n",
+                encoding="utf-8",
+            )
+            movie = root / "resume.movie.json"
+            movie.write_text(
+                json.dumps(
+                    {
+                        "format_version": 1,
+                        "actions": [
+                            "breakstate:0x850c:loop_tick==1:63",
+                            "clearbreak:0x850c",
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            tail = root / "tail.input.script"
+            tail_manifest = root / "tail.input.json"
+            plan_path = root / "plan.json"
+            args = build_parser().parse_args(
+                [
+                    "plan-state-tail",
+                    str(project_path),
+                    "boot",
+                    "--previous-input-script",
+                    str(script),
+                    "--input-script",
+                    str(script),
+                    "--resume-from",
+                    str(snapshot),
+                    "--checkpoint-value",
+                    "5",
+                    "--end-value",
+                    "8",
+                    "--state-field",
+                    "loop_tick",
+                    "--breakpoint",
+                    "0x850c",
+                    "--movie",
+                    str(movie),
+                    "--capture-out",
+                    str(root / "capture"),
+                    "--sliced-input-out",
+                    str(tail),
+                    "--sliced-input-manifest",
+                    str(tail_manifest),
+                    "--dump-size",
+                    "8",
+                    "--out",
+                    str(plan_path),
+                ]
+            )
+
+            self.assertEqual(args.func(args), 0)
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+
+            self.assertTrue(tail.is_file())
+            self.assertTrue(tail_manifest.is_file())
+            self.assertEqual(plan["scripts"]["capture_slice"]["resume_value"], 5)
+            capture_args = plan["commands"]["capture_cli_args"]
+            self.assertEqual(
+                capture_args[capture_args.index("--input-script") + 1],
+                str(tail.resolve()),
+            )
 
     def test_audio_and_write_trace_commands_are_exposed(self) -> None:
         from dos_re_harness.cli import build_parser
@@ -385,6 +577,19 @@ class CaptureAdapterTests(unittest.TestCase):
         self.assertEqual(checkpoint_index.length, 320)
         self.assertEqual(checkpoint_index.register, ["cs"])
         self.assertEqual(checkpoint_index.expected_hits, [2, 7])
+        contiguous_index = parser.parse_args(
+            [
+                "index-checkpoints",
+                "capture",
+                "--artifact",
+                "memory.bin",
+                "--expected-hit-count",
+                "96",
+                "--out",
+                "index.json",
+            ]
+        )
+        self.assertEqual(contiguous_index.expected_hit_count, 96)
 
 
 class SchemaTests(unittest.TestCase):
@@ -482,10 +687,19 @@ class WorkflowTests(unittest.TestCase):
 
             def read_memory(self, address: int, size: int) -> bytes:
                 self.calls.append(("read_memory", address, size))
+                if address == 0x27431:
+                    return b"\xe0\x03"
                 return b"\x40\x75"
 
             def write_memory(self, address: int, data: bytes) -> None:
                 self.calls.append(("write_memory", address, data))
+
+            def registers(self) -> dict[str, int]:
+                self.calls.append(("registers",))
+                return {"eip": 0xF71A, "eflags": 0x202}
+
+            def write_registers(self, registers: dict[str, int]) -> None:
+                self.calls.append(("write_registers", registers))
 
             def continue_nowait(self) -> None:
                 self.calls.append(("continue_nowait",))
@@ -523,6 +737,7 @@ class WorkflowTests(unittest.TestCase):
                     80 * 25 * 2,
                     record,
                     0.0,
+                    preserve_memory=[(0x27431, 2)],
                 )
 
             self.assertEqual(
@@ -530,10 +745,17 @@ class WorkflowTests(unittest.TestCase):
                 [
                     ("remove_breakpoint", 0x082474DA),
                     ("read_memory", 0xF71A, 2),
+                    ("read_memory", 0x27431, 2),
+                    ("registers",),
                     ("write_memory", 0xF71A, b"\xeb\xfe"),
                     ("continue_nowait",),
                     ("halt", 10.0),
+                    ("write_memory", 0x27431, b"\xe0\x03"),
                     ("write_memory", 0xF71A, b"\x40\x75"),
+                    (
+                        "write_registers",
+                        {"eip": 0xF71A, "eflags": 0x202},
+                    ),
                     ("insert_breakpoint", 0x082474DA),
                 ],
             )
@@ -543,6 +765,16 @@ class WorkflowTests(unittest.TestCase):
                 checkpoint / "remote_runtime_screen.png",
             )
             self.assertTrue(record["screenshot_exact_checkpoint"])
+            self.assertEqual(
+                record["screenshot_preserved_memory"],
+                [
+                    {
+                        "address": 0x27431,
+                        "size": 2,
+                        "sha256": hashlib.sha256(b"\xe0\x03").hexdigest(),
+                    }
+                ],
+            )
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
             self.assertTrue(metadata["screenshot_exact_checkpoint"])
             self.assertEqual(
@@ -637,6 +869,33 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_run_for_action("run:1")
 
+    def test_runtap_action_requires_key_and_positive_hold_duration(self) -> None:
+        from dos_re_harness.remote_capture import parse_run_tap_action
+
+        self.assertEqual(parse_run_tap_action("runtap:f1"), ("f1", 0.2))
+        self.assertEqual(
+            parse_run_tap_action("runtap:spc:0.75"),
+            ("spc", 0.75),
+        )
+        with self.assertRaises(ValueError):
+            parse_run_tap_action("runtap:")
+        with self.assertRaises(ValueError):
+            parse_run_tap_action("runtap:f1:0")
+        with self.assertRaises(ValueError):
+            parse_run_tap_action("tap:f1:0.2")
+
+    def test_rununtilstop_action_requires_positive_timeout(self) -> None:
+        from dos_re_harness.remote_capture import parse_run_until_stop_action
+
+        self.assertEqual(
+            parse_run_until_stop_action("rununtilstop:12.5"),
+            12.5,
+        )
+        with self.assertRaises(ValueError):
+            parse_run_until_stop_action("rununtilstop:0")
+        with self.assertRaises(ValueError):
+            parse_run_until_stop_action("runfor:1")
+
     def test_rsp_linear_breakpoint_uses_gdb_software_packet(self) -> None:
         from dos_re_harness.remote_capture import RspClient
 
@@ -648,6 +907,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_rsp_segmented_breakpoint_packs_backend_address(self) -> None:
         from dos_re_harness.remote_capture import (
+            parse_segmented_address,
             parse_segmented_breakpoint_series_action,
             RspClient,
             parse_segmented_nth_breakpoint_action,
@@ -656,8 +916,12 @@ class WorkflowTests(unittest.TestCase):
 
         self.assertEqual(pack_segment_offset(0x0824, 0x01A5), 0x082401A5)
         self.assertEqual(
+            parse_segmented_address("0824:03d1"),
+            (0x0824, 0x03D1),
+        )
+        self.assertEqual(
             parse_segmented_nth_breakpoint_action(
-                "breaksonth:0x0824:0xb39e:14"
+                "breaksonth:0824:b39e:14"
             ),
             (0x0824B39E, 14),
         )
@@ -714,6 +978,53 @@ class WorkflowTests(unittest.TestCase):
             {"loop_tick": 42, "armor": -10},
         )
         self.assertEqual(packets, ["m112c8,2", "m112ca,2"])
+
+    def test_rsp_chunked_memory_read_preserves_requested_range(self) -> None:
+        from dos_re_harness.remote_capture import RspClient
+
+        packets = []
+        client = RspClient.__new__(RspClient)
+
+        def packet(payload: str) -> str:
+            packets.append(payload)
+            return {
+                "m1000,4": "00010203",
+                "m1004,2": "0405",
+            }[payload]
+
+        client.packet = packet
+        self.assertEqual(
+            client.read_memory_chunked(0x1000, 6, chunk_size=4),
+            bytes(range(6)),
+        )
+        self.assertEqual(packets, ["m1000,4", "m1004,2"])
+
+    def test_breakpoint_stack_snapshot_records_near_return_address(self) -> None:
+        from dos_re_harness.remote_capture import breakpoint_stack_snapshot
+
+        reads = []
+
+        class FakeGdb:
+            def read_memory(self, address: int, size: int) -> bytes:
+                reads.append((address, size))
+                return bytes.fromhex("3412aabbccddeeff")
+
+        snapshot = breakpoint_stack_snapshot(
+            FakeGdb(),
+            {"ss": 0x2567, "esp": 0x65C2},
+        )
+        self.assertEqual(reads, [(0x2BC32, 8)])
+        self.assertEqual(
+            snapshot,
+            {
+                "segment": 0x2567,
+                "offset": 0x65C2,
+                "linear": 0x2BC32,
+                "size": 8,
+                "bytes_hex": "3412aabbccddeeff",
+                "near_return_offset": 0x1234,
+            },
+        )
 
     def test_running_breakpoint_halts_inserts_and_resumes(self) -> None:
         from dos_re_harness.remote_capture import install_running_breakpoint
@@ -1123,6 +1434,9 @@ class WorkflowTests(unittest.TestCase):
                 "poke": ["0x412bb:000000"],
                 "poke_file": ["ds:0:snapshot.bin"],
                 "call_near": 0x6F52,
+                "call_near_break_linear": None,
+                "call_near_break_segmented": None,
+                "call_near_break_offset": None,
                 "call_near_continue_after_return": True,
             },
         )()
@@ -1133,6 +1447,9 @@ class WorkflowTests(unittest.TestCase):
                 "poke": ["0x412bb:000000"],
                 "poke_file": ["ds:0:snapshot.bin"],
                 "call_near": 0x6F52,
+                "call_near_break_linear": None,
+                "call_near_break_segmented": None,
+                "call_near_break_offset": None,
                 "call_near_continue_after_return": True,
             },
         )
@@ -1202,6 +1519,143 @@ class WorkflowTests(unittest.TestCase):
                 "--post-resume-poke",
                 "0x12000:ebfe",
                 "--post-resume-continue-after-poke",
+            ]
+            with (
+                patch("sys.argv", arguments),
+                patch.object(
+                    remote_capture,
+                    "RspClient",
+                    side_effect=RuntimeError("validation passed"),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "validation passed",
+                ):
+                    remote_capture.main()
+
+    def test_post_resume_break_can_continue_without_mutating_guest(self) -> None:
+        from dos_re_harness import remote_capture
+
+        with tempfile.TemporaryDirectory() as temporary:
+            arguments = [
+                "remote_capture.py",
+                "--out-dir",
+                temporary,
+                "--state-schema",
+                str(FIXTURE_ROOT / "state.schema.json"),
+                "--resume-checkpoint-script",
+                "checkpointstate:0x12340:frame_tick:23:4",
+                "--resume-next-linear",
+                "0x12343",
+                "--post-resume-break-segmented",
+                "0x1111:0x20",
+                "--post-resume-continue",
+            ]
+            with (
+                patch("sys.argv", arguments),
+                patch.object(
+                    remote_capture,
+                    "RspClient",
+                    side_effect=RuntimeError("validation passed"),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "validation passed",
+                ):
+                    remote_capture.main()
+
+    def test_post_resume_poke_can_apply_at_final_resumed_checkpoint(
+        self,
+    ) -> None:
+        from dos_re_harness import remote_capture
+
+        with tempfile.TemporaryDirectory() as temporary:
+            arguments = [
+                "remote_capture.py",
+                "--out-dir",
+                temporary,
+                "--state-schema",
+                str(FIXTURE_ROOT / "state.schema.json"),
+                "--resume-checkpoint-script",
+                "checkpointstate:0x12340:frame_tick:23:4",
+                "--resume-next-linear",
+                "0x12343",
+                "--post-resume-break-segmented",
+                "0x1111:0x20",
+                "--post-resume-poke",
+                "0x12000:ebfe",
+            ]
+            with (
+                patch("sys.argv", arguments),
+                patch.object(
+                    remote_capture,
+                    "RspClient",
+                    side_effect=RuntimeError("validation passed"),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "validation passed",
+                ):
+                    remote_capture.main()
+
+    def test_final_post_display_steps_past_installed_primary_breakpoint(
+        self,
+    ) -> None:
+        from dos_re_harness import remote_capture
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch.object(
+                remote_capture,
+                "capture_post_display_screenshot",
+            ) as capture:
+                record = remote_capture.capture_final_post_display(
+                    object(),
+                    object(),
+                    7.0,
+                    (0x1111, 0x20),
+                    (0x11130, b"\xeb\xfe"),
+                    Path(temporary),
+                    "S05",
+                    "S05",
+                    {"ds": 0x1234},
+                    "ds",
+                    0x10000,
+                    0.05,
+                    primary_breakpoint=0x850C,
+                )
+
+        self.assertEqual(record["primary_breakpoint"], 0x850C)
+        self.assertTrue(
+            capture.call_args.kwargs["primary_breakpoint_installed"]
+        )
+
+    def test_post_resume_poke_accepts_next_breakpoint_hit_series(
+        self,
+    ) -> None:
+        from dos_re_harness import remote_capture
+
+        with tempfile.TemporaryDirectory() as temporary:
+            arguments = [
+                "remote_capture.py",
+                "--out-dir",
+                temporary,
+                "--state-schema",
+                str(FIXTURE_ROOT / "state.schema.json"),
+                "--resume-checkpoint-script",
+                "checkpointstate:0x12340:frame_tick:23:4",
+                "--resume-next-linear",
+                "0x12343",
+                "--post-resume-break-segmented",
+                "0x1111:0x20",
+                "--post-resume-poke",
+                "0x12000:ebfe",
+                "--post-resume-next-break-segmented",
+                "0x2222:0x40",
+                "--post-resume-next-break-hit-series",
+                "1,3,7",
             ]
             with (
                 patch("sys.argv", arguments),
@@ -1508,6 +1962,23 @@ class WorkflowTests(unittest.TestCase):
                     (1051, False, ["right"]),
                 ],
                 [],
+            ),
+        )
+        self.assertEqual(
+            resumed_state_checkpoint_plan(
+                "checkpointstatescriptfile:"
+                "0x850c:loop_tick:1000+1050+1100:164",
+                [(1050, False, ["up"])],
+                initial_held_qcodes=["left", "up"],
+            ),
+            (
+                0x850C,
+                "loop_tick",
+                [1000, 1050, 1100],
+                [1000, 1050, 1100],
+                164,
+                [(1050, False, ["up"])],
+                ["left", "up"],
             ),
         )
         for invalid in (
@@ -1818,8 +2289,18 @@ class WorkflowTests(unittest.TestCase):
                     "first_changed": 16,
                 }
 
+            def displaydump(self) -> dict[str, object]:
+                return {
+                    "data": bytes((1, 2, 3, 4)),
+                    "width": 2,
+                    "height": 2,
+                    "bpp": 8,
+                    "pitch": 2,
+                    "generation": 17,
+                }
+
             def screendump(self) -> bytes:
-                return b"checkpoint-screen"
+                return b"\x89PNG\r\n\x1a\n" + b"0" * 12 + b"IEND"
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "checkpoints"
@@ -1839,6 +2320,7 @@ class WorkflowTests(unittest.TestCase):
                 4,
                 b"P5\n2 2\n255\n",
                 capture_dac=True,
+                capture_display=True,
                 capture_screenshot=True,
             )
             checkpoint = root / "loop_tick-183"
@@ -1853,11 +2335,15 @@ class WorkflowTests(unittest.TestCase):
             )
             self.assertEqual(
                 (checkpoint / "remote_runtime_screen.png").read_bytes(),
-                b"checkpoint-screen",
+                b"\x89PNG\r\n\x1a\n" + b"0" * 12 + b"IEND",
             )
             self.assertEqual(
                 (checkpoint / "remote_runtime_dac.bin").read_bytes(),
                 bytes(range(256)) * 3,
+            )
+            self.assertEqual(
+                (checkpoint / "remote_runtime_display.bin").read_bytes(),
+                bytes((1, 2, 3, 4)),
             )
             registers = json.loads(
                 (
@@ -1874,9 +2360,53 @@ class WorkflowTests(unittest.TestCase):
             )
             self.assertEqual(registers["dac"]["bits"], 6)
             self.assertEqual(registers["dac"]["first_changed"], 16)
+            self.assertEqual(registers["display"]["width"], 2)
+            self.assertEqual(registers["display"]["height"], 2)
+            self.assertEqual(registers["display"]["bpp"], 8)
+            self.assertEqual(registers["display"]["generation"], 17)
             self.assertIsNone(registers["screenshot_error"])
             self.assertTrue(registers["screenshot_exact_checkpoint"])
             self.assertFalse(registers["screenshot_deferred_side_effect"])
+
+    def test_state_checkpoint_uses_chunked_memory_for_all_large_reads(self) -> None:
+        from dos_re_harness.remote_capture import write_state_checkpoint
+
+        calls = []
+
+        class ChunkedQmp:
+            def memdump(self, _address: int, _size: int) -> bytes:
+                raise AssertionError("large checkpoint read bypassed chunking")
+
+            def memdump_chunked(self, address: int, size: int) -> bytes:
+                calls.append((address, size))
+                return bytes(size)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            write_state_checkpoint(
+                ChunkedQmp(),
+                Path(temporary) / "checkpoints",
+                "loop_tick",
+                3000,
+                "S05",
+                {"ds": 0x1234, "eip": 0x850C},
+                {"loop_tick": 3000},
+                1,
+                "ds",
+                8,
+                True,
+                0xA0000,
+                4,
+                b"P5\n2 2\n255\n",
+            )
+
+        self.assertEqual(
+            calls,
+            [
+                (0x12340, 8),
+                (0xA0000, 4),
+                (0, 0xA0000),
+            ],
+        )
 
     def test_qmp_full_save_state_commands_preserve_exact_backend_path(
         self,
@@ -1909,6 +2439,44 @@ class WorkflowTests(unittest.TestCase):
         )
         self.assertIsNone(calls[0][3])
 
+    def test_qmp_memdump_falls_back_to_rsp_after_timeout(self) -> None:
+        from dos_re_harness.remote_capture import QmpClient
+
+        client = QmpClient.__new__(QmpClient)
+        client.command = lambda *args, **kwargs: (_ for _ in ()).throw(
+            TimeoutError("qmp stalled")
+        )
+        fallback_calls = []
+
+        def fallback(address: int, size: int) -> bytes:
+            fallback_calls.append((address, size))
+            return bytes([0xA5]) * size
+
+        QmpClient.set_memory_fallback(fallback)
+        self.addCleanup(QmpClient.set_memory_fallback, None)
+        self.assertEqual(client.memdump(0x12340, 8), bytes([0xA5]) * 8)
+        self.assertEqual(fallback_calls, [(0x12340, 8)])
+
+    def test_qmp_memdump_chunked_bounds_each_request(self) -> None:
+        from dos_re_harness.remote_capture import QmpClient
+
+        client = QmpClient.__new__(QmpClient)
+        calls = []
+
+        def memdump(address: int, size: int) -> bytes:
+            calls.append((address, size))
+            return bytes([address & 0xFF]) * size
+
+        client.memdump = memdump
+        self.assertEqual(
+            client.memdump_chunked(0x1200, 10, chunk_size=4),
+            bytes([0x00]) * 4 + bytes([0x04]) * 4 + bytes([0x08]) * 2,
+        )
+        self.assertEqual(
+            calls,
+            [(0x1200, 4), (0x1204, 4), (0x1208, 2)],
+        )
+
     def test_qmp_dacdump_decodes_palette_and_state(self) -> None:
         from dos_re_harness.remote_capture import QmpClient
 
@@ -1938,6 +2506,181 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(result["data"], palette)
         self.assertEqual(result["bits"], 6)
         self.assertEqual(result["write_index"], 12)
+
+    def test_qmp_displaydump_decodes_completed_source_frame(self) -> None:
+        from dos_re_harness.remote_capture import QmpClient
+
+        client = QmpClient.__new__(QmpClient)
+        pixels = bytes((1, 2, 3, 4))
+
+        def command(execute, arguments=None, timeout=None, sent_event=None):
+            self.assertEqual(execute, "displaydump")
+            self.assertIsNone(arguments)
+            self.assertIsNone(timeout)
+            self.assertIsNone(sent_event)
+            return {
+                "return": {
+                    "data": base64.b64encode(pixels).decode("ascii"),
+                    "size": len(pixels),
+                    "width": 2,
+                    "height": 2,
+                    "bpp": 8,
+                    "pitch": 2,
+                    "generation": 17,
+                }
+            }
+
+        client.command = command
+        result = client.displaydump()
+        self.assertEqual(result["data"], pixels)
+        self.assertEqual(result["width"], 2)
+        self.assertEqual(result["height"], 2)
+        self.assertEqual(result["bpp"], 8)
+        self.assertEqual(result["pitch"], 2)
+        self.assertEqual(result["generation"], 17)
+
+        client.command = lambda _execute: {
+            "return": {
+                "data": base64.b64encode(pixels[:-1]).decode("ascii"),
+                "size": len(pixels) - 1,
+                "width": 2,
+                "height": 2,
+                "bpp": 8,
+                "pitch": 2,
+                "generation": 18,
+            }
+        }
+        with self.assertRaisesRegex(RuntimeError, "unexpected frame size"):
+            client.displaydump()
+
+    def test_qmp_display_history_retains_fast_completed_frames(self) -> None:
+        from dos_re_harness.remote_capture import QmpClient
+
+        client = QmpClient.__new__(QmpClient)
+        calls = []
+        frames = [bytes((1, 2, 3, 4)), bytes((5, 6, 7, 8))]
+        palettes = [bytes([17]) * 768, bytes([18]) * 768]
+
+        def command(execute, arguments=None, timeout=None, sent_event=None):
+            calls.append((execute, arguments, timeout, sent_event))
+            if execute == "displayhistory-start":
+                return {"return": {"capacity": 8, "generation": 16}}
+            self.assertEqual(execute, "displayhistory-stop")
+            return {
+                "return": {
+                    "capacity": 8,
+                    "dropped": 0,
+                    "frames": [
+                        {
+                            "data": base64.b64encode(
+                                data if generation == 17 else zlib.compress(data)
+                            ).decode("ascii"),
+                            "encoding": (
+                                "raw" if generation == 17 else "zlib"
+                            ),
+                            "size": len(data),
+                            "width": 2,
+                            "height": 2,
+                            "bpp": 8,
+                            "pitch": 2,
+                            "generation": generation,
+                            "palette": base64.b64encode(
+                                palettes[generation - 17]
+                            ).decode("ascii"),
+                            "palette_size": 768,
+                        }
+                        for generation, data in zip((17, 18), frames)
+                    ],
+                }
+            }
+
+        client.command = command
+        started = client.start_display_history(8)
+        history = client.stop_display_history()
+
+        self.assertEqual(started["generation"], 16)
+        self.assertEqual(history["capacity"], 8)
+        self.assertEqual(history["dropped"], 0)
+        self.assertEqual(
+            [frame["generation"] for frame in history["frames"]],
+            [17, 18],
+        )
+        self.assertEqual(
+            [frame["data"] for frame in history["frames"]],
+            frames,
+        )
+        self.assertEqual(
+            [frame["palette"] for frame in history["frames"]],
+            palettes,
+        )
+        self.assertEqual(
+            calls,
+            [
+                ("displayhistory-start", {"capacity": 8}, None, None),
+                ("displayhistory-stop", None, None, None),
+            ],
+        )
+
+    def test_display_history_writer_retains_generation_and_pixels(self) -> None:
+        from dos_re_harness.remote_capture import write_display_history
+
+        history = {
+            "capacity": 8,
+            "dropped": 0,
+            "frames": [
+                {
+                    "data": bytes((1, 2, 3, 4)),
+                    "width": 2,
+                    "height": 2,
+                    "bpp": 8,
+                    "pitch": 2,
+                    "generation": 17,
+                    "palette": bytes([17]) * 768,
+                },
+                {
+                    "data": bytes((5, 6, 7, 8)),
+                    "width": 2,
+                    "height": 2,
+                    "bpp": 8,
+                    "pitch": 2,
+                    "generation": 18,
+                    "palette": bytes([18]) * 768,
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            record = write_display_history(
+                root,
+                {"capacity": 8, "generation": 16},
+                history,
+            )
+
+            self.assertEqual(record["first_generation"], 17)
+            self.assertEqual(record["last_generation"], 18)
+            self.assertEqual(record["frame_count"], 2)
+            self.assertEqual(
+                (root / "post_resume_display_history" /
+                 "frame_0001.display.bin").read_bytes(),
+                bytes((5, 6, 7, 8)),
+            )
+            self.assertEqual(
+                (root / "post_resume_display_history" /
+                 "frame_0001.palette.bin").read_bytes(),
+                bytes([18]) * 768,
+            )
+            manifest = json.loads(
+                (root / "post_resume_display_history.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(manifest["start_generation"], 16)
+            self.assertEqual(manifest["frames"][0]["generation"], 17)
+            self.assertEqual(manifest["frames"][0]["palette"]["size"], 768)
+            self.assertEqual(
+                manifest["frames"][0]["palette"]["sha256"],
+                hashlib.sha256(bytes([17]) * 768).hexdigest(),
+            )
 
     def test_timed_vga_sample_retains_palette_evidence(self) -> None:
         from dos_re_harness.remote_capture import (
@@ -1983,6 +2726,41 @@ class WorkflowTests(unittest.TestCase):
             self.assertEqual(
                 sample["dac"]["sha256"],
                 hashlib.sha256(palette).hexdigest(),
+            )
+
+    def test_timed_vga_sample_can_retain_memory_snapshot(self) -> None:
+        from dos_re_harness.remote_capture import (
+            write_vga_dac_sequence_sample,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            sequence_dir = Path(temporary)
+            memory = bytes([0x12, 0x34, 0x56])
+            sample = write_vga_dac_sequence_sample(
+                sequence_dir,
+                3,
+                b"vga",
+                {
+                    "data": bytes(range(256)) * 3,
+                    "bits": 6,
+                    "pel_mask": 255,
+                    "pel_index": 0,
+                    "state": 1,
+                    "write_index": 0,
+                    "read_index": 0,
+                    "first_changed": 256,
+                },
+                memory_data=memory,
+                memory_segment="ds",
+            )
+            memory_path = sequence_dir / "frame_0003.ds.bin"
+            self.assertEqual(memory_path.read_bytes(), memory)
+            self.assertEqual(sample["memory"]["segment"], "ds")
+            self.assertEqual(sample["memory"]["path"], str(memory_path))
+            self.assertEqual(sample["memory"]["size"], len(memory))
+            self.assertEqual(
+                sample["memory"]["sha256"],
+                hashlib.sha256(memory).hexdigest(),
             )
 
     def test_qmp_screendump_rejects_empty_payload(self) -> None:
@@ -2105,6 +2883,81 @@ class WorkflowTests(unittest.TestCase):
             ],
         )
 
+    def test_checkpoint_save_state_accepts_post_resume_next_boundary(
+        self,
+    ) -> None:
+        from dos_re_harness.remote_capture import checkpoint_save_state_target
+
+        self.assertEqual(
+            checkpoint_save_state_target(
+                True,
+                [],
+                "checkpointstate:0x12340:frame_tick:40:100",
+                True,
+            ),
+            "post_resume_next",
+        )
+        self.assertEqual(
+            checkpoint_save_state_target(
+                True,
+                [],
+                "checkpointstate:0x12340:frame_tick:40:100",
+                False,
+            ),
+            "resume_final",
+        )
+        self.assertEqual(
+            checkpoint_save_state_target(
+                True,
+                [],
+                "checkpointstate:0x12340:frame_tick:40:100",
+                False,
+                save_state_first=True,
+            ),
+            "post_resume_first",
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "first post-resume save-state requires",
+        ):
+            checkpoint_save_state_target(
+                True,
+                [],
+                None,
+                False,
+                save_state_first=True,
+            )
+        self.assertEqual(
+            checkpoint_save_state_target(
+                True,
+                ["rununtilstop:120"],
+                None,
+                False,
+                "65536",
+            ),
+            "state_input_stop",
+        )
+        self.assertEqual(
+            checkpoint_save_state_target(
+                True,
+                [],
+                None,
+                False,
+                "65536",
+                True,
+            ),
+            "state_input_stop",
+        )
+        self.assertEqual(
+            checkpoint_save_state_target(
+                True,
+                ["checkpointstate:0x12340:frame_tick:40:100"],
+                None,
+                False,
+            ),
+            "startup",
+        )
+
     def test_load_state_readiness_waits_for_a_completed_guest_screen(
         self,
     ) -> None:
@@ -2182,6 +3035,56 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(metadata["dump_segment_value"], 0x2345)
         self.assertEqual(metadata["save_state_sha256"], digest)
 
+    def test_post_resume_next_checkpoint_supports_post_display_capture(
+        self,
+    ) -> None:
+        from dos_re_harness.remote_capture import (
+            capture_post_resume_next_display,
+        )
+
+        record = {"path": "checkpoint"}
+        with patch(
+            "dos_re_harness.remote_capture.capture_configured_post_display"
+        ) as capture:
+            capture_post_resume_next_display(
+                object(),
+                object(),
+                30.0,
+                (0x1234, 0x5678),
+                (0x179B8, b"\xeb\xfe"),
+                record,
+                0x12340,
+                0.05,
+            )
+
+        self.assertEqual(record["primary_breakpoint"], 0x12340)
+        capture.assert_called_once_with(
+            unittest.mock.ANY,
+            unittest.mock.ANY,
+            30.0,
+            (0x1234, 0x5678),
+            (0x179B8, b"\xeb\xfe"),
+            record,
+            0x12340,
+            0.05,
+        )
+
+    def test_post_display_scope_can_skip_preparatory_checkpoints(self) -> None:
+        from dos_re_harness.remote_capture import checkpoint_post_display_enabled
+
+        self.assertTrue(checkpoint_post_display_enabled("all", "state"))
+        self.assertTrue(
+            checkpoint_post_display_enabled("all", "post_resume_next")
+        )
+        self.assertFalse(
+            checkpoint_post_display_enabled("post-resume-next", "state")
+        )
+        self.assertTrue(
+            checkpoint_post_display_enabled(
+                "post-resume-next", "post_resume_next"
+            )
+        )
+
     def test_full_state_load_drift_requires_an_input_free_gap(self) -> None:
         from dos_re_harness.remote_capture import (
             full_state_resume_remaining_values,
@@ -2200,6 +3103,12 @@ class WorkflowTests(unittest.TestCase):
                 44,
                 [40, 42, 80],
                 [(42, True, ["left"])],
+            )
+        with self.assertRaisesRegex(ValueError, "missed input event"):
+            full_state_resume_remaining_values(
+                44,
+                [40, 42, 80],
+                [(40, True, ["left"])],
             )
 
     def test_running_poke_halts_writes_and_resumes(self) -> None:
@@ -2263,6 +3172,25 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn("no completed screenshot", error or "")
             self.assertFalse(path.exists())
 
+    def test_optional_sequence_screenshot_retries_truncated_png(self) -> None:
+        from dos_re_harness.remote_capture import capture_optional_screenshot
+
+        valid = b"\x89PNG\r\n\x1a\n" + b"0" * 12 + b"IEND"
+
+        class FlakyQmp:
+            calls = 0
+
+            def screendump(self) -> bytes:
+                self.calls += 1
+                return valid[:-4] if self.calls == 1 else valid
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "frame.png"
+            qmp = FlakyQmp()
+            self.assertIsNone(capture_optional_screenshot(qmp, path))
+            self.assertEqual(qmp.calls, 2)
+            self.assertEqual(path.read_bytes(), valid)
+
     def test_optional_screenshot_does_not_promote_backend_side_effect(
         self,
     ) -> None:
@@ -2281,7 +3209,7 @@ class WorkflowTests(unittest.TestCase):
             class SideEffectQmp:
                 def screendump(self) -> bytes:
                     (root / "program_000.png").write_bytes(
-                        b"backend-screen"
+                        b"\x89PNG\r\n\x1a\n" + b"0" * 12 + b"IEND"
                     )
                     raise RuntimeError("Screenshot capture timed out")
 
@@ -2310,7 +3238,7 @@ class WorkflowTests(unittest.TestCase):
             class SideEffectQmp:
                 def screendump(self) -> bytes:
                     (root / "program_000.png").write_bytes(
-                        b"backend-screen"
+                        b"\x89PNG\r\n\x1a\n" + b"0" * 12 + b"IEND"
                     )
                     raise RuntimeError("Screenshot capture failed")
 
@@ -2322,7 +3250,10 @@ class WorkflowTests(unittest.TestCase):
 
             self.assertIsNone(error)
             self.assertTrue(deferred)
-            self.assertEqual(destination.read_bytes(), b"backend-screen")
+            self.assertEqual(
+                destination.read_bytes(),
+                b"\x89PNG\r\n\x1a\n" + b"0" * 12 + b"IEND",
+            )
 
     def test_deferred_checkpoint_screenshots_follow_request_order(self) -> None:
         from dos_re_harness.remote_capture import (
@@ -2627,6 +3558,21 @@ class HarnessContractTests(unittest.TestCase):
         self.assertIn("[int]$VgaHeight", launcher)
         self.assertIn("& wsl.exe --exec bash", launcher)
 
+    def test_generic_launcher_isolates_remote_debug_ports(self) -> None:
+        launcher = (
+            TOOLKIT_ROOT / "scripts" / "run-wsl-remotedebug.ps1"
+        ).read_text(encoding="utf-8")
+        remote_capture = (
+            TOOLKIT_ROOT / "src" / "dos_re_harness" / "remote_capture.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("[int]$GdbPort = 0", launcher)
+        self.assertIn("[int]$QmpPort = 0", launcher)
+        self.assertIn("gdbserver port = $gdb_port", launcher)
+        self.assertIn("qmpserver port = $qmp_port", launcher)
+        self.assertIn('    --gdb-port "$gdb_port"', launcher)
+        self.assertIn('    --qmp-port "$qmp_port"', launcher)
+        self.assertIn('"remote_ports":', remote_capture)
+
     def test_generic_launcher_preserves_empty_program_arguments(self) -> None:
         launcher = (
             TOOLKIT_ROOT / "scripts" / "run-wsl-remotedebug.ps1"
@@ -2654,6 +3600,76 @@ class HarnessContractTests(unittest.TestCase):
             '--post-resume-break-hit-series "$post_resume_break_hit_series"',
             launcher,
         )
+
+    def test_generic_launcher_plumbs_halt_safe_displaydump(self) -> None:
+        launcher = (
+            TOOLKIT_ROOT / "scripts" / "run-wsl-remotedebug.ps1"
+        ).read_text(encoding="utf-8")
+        controller = (
+            TOOLKIT_ROOT / "src" / "dos_re_harness" / "remote_capture.py"
+        ).read_text(encoding="utf-8")
+        backend_patch = (
+            TOOLKIT_ROOT
+            / "backends"
+            / "dosbox-x-remotedebug"
+            / "dosbox-x-remotedebug.patch"
+        ).read_text(encoding="utf-8")
+        self.assertIn("[switch]$CheckpointDisplayDump", launcher)
+        self.assertIn(
+            "controller_args+=(--checkpoint-displaydump)",
+            launcher,
+        )
+        self.assertIn('"--checkpoint-displaydump"', controller)
+        self.assertIn("capture_display=args.checkpoint_displaydump", controller)
+        self.assertIn('execute == "displaydump"', backend_patch)
+        self.assertIn('"{\\"name\\": \\"displaydump\\"},"', backend_patch)
+
+    def test_generic_launcher_plumbs_non_mutating_post_resume_continue(
+        self,
+    ) -> None:
+        launcher = (
+            TOOLKIT_ROOT / "scripts" / "run-wsl-remotedebug.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn("[switch]$PostResumeContinue", launcher)
+        self.assertIn(
+            'controller_args+=(--post-resume-continue)',
+            launcher,
+        )
+
+    def test_generic_launcher_scopes_post_display_capture(self) -> None:
+        launcher = (
+            TOOLKIT_ROOT / "scripts" / "run-wsl-remotedebug.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            '[ValidateSet("all", "post-resume-next")]',
+            launcher,
+        )
+        self.assertIn(
+            '--checkpoint-post-display-scope',
+            launcher,
+        )
+        self.assertIn(
+            '"$checkpoint_post_display_scope"',
+            launcher,
+        )
+
+    def test_generic_launcher_plumbs_final_post_display_capture(self) -> None:
+        launcher = (
+            TOOLKIT_ROOT / "scripts" / "run-wsl-remotedebug.ps1"
+        ).read_text(encoding="utf-8")
+        controller = (
+            TOOLKIT_ROOT / "src" / "dos_re_harness" / "remote_capture.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('[string]$FinalPostDisplayBreakSegmented = ""', launcher)
+        self.assertIn('[string]$FinalPostDisplayPoke = ""', launcher)
+        self.assertIn('final_post_display_break_segmented="__none__"', launcher)
+        self.assertIn('--final-post-display-break-segmented', launcher)
+        self.assertIn('--final-post-display-poke', launcher)
+        self.assertIn('--final-post-display-delay', launcher)
+        self.assertIn('--final-post-display-value', launcher)
+        self.assertIn('--final-post-display-break-segmented', controller)
+        self.assertIn('--final-post-display-value', controller)
+        self.assertIn('def capture_final_post_display(', controller)
 
     def test_generic_launcher_plumbs_full_emulator_save_states(self) -> None:
         launcher = (
@@ -2698,7 +3714,10 @@ class HarnessContractTests(unittest.TestCase):
             "$callNearContinueAfterReturnArg $RemoteTimeout "
             "$vgaSequenceScreenshotOnStopArg "
             "$stateInputHookLinearArg $stateInputLinearArg "
-            "$StateInputWidth $stateInputLogPathWsl $turboArg @StartupKey",
+            "$StateInputWidth $stateInputLogPathWsl $turboArg "
+            "$CheckpointPostDisplayScope $stateInputStopValueArg "
+            "$GdbPort $QmpPort "
+            "@StartupKey",
             launcher,
         )
 
@@ -2717,6 +3736,9 @@ class HarnessContractTests(unittest.TestCase):
         self.assertIn('[ValidateSet(1, 2, 4)]', launcher)
         self.assertIn('[int]$StateInputWidth = 2', launcher)
         self.assertIn('[string]$StateInputLogPath = ""', launcher)
+        self.assertIn('[string]$StateInputStopValue = ""', launcher)
+        self.assertIn('[switch]$CheckpointDac', launcher)
+        self.assertIn('controller_args+=(--checkpoint-dac)', launcher)
         self.assertIn(
             'DOS_RE_HARNESS_STATE_INPUT_SCRIPT="$input_script"',
             launcher,
@@ -2737,11 +3759,191 @@ class HarnessContractTests(unittest.TestCase):
             'DOS_RE_HARNESS_STATE_INPUT_LOG="$state_input_log_path"',
             launcher,
         )
+        self.assertIn(
+            'DOS_RE_HARNESS_STATE_INPUT_STOP_VALUE="$state_input_stop_value"',
+            launcher,
+        )
         self.assertIn("QMP_ProcessGuestStateInput", backend_patch)
         self.assertIn(
             "DOS_RE_HARNESS_STATE_INPUT_SCRIPT",
             backend_patch,
         )
+        self.assertIn('line == "# state_unwrap=1"', backend_patch)
+        self.assertIn("state_epoch_base", backend_patch)
+
+    def test_guest_state_stop_can_run_without_input_script(self) -> None:
+        launcher = (
+            TOOLKIT_ROOT / "scripts" / "run-wsl-remotedebug.ps1"
+        ).read_text(encoding="utf-8")
+        backend_patch = (
+            TOOLKIT_ROOT
+            / "backends"
+            / "dosbox-x-remotedebug"
+            / "dosbox-x-remotedebug.patch"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'if [ "$input_script" != "__none__" ]; then', launcher
+        )
+        self.assertIn(
+            "InputScript or StateInputStopValue", launcher
+        )
+        self.assertIn(
+            "StateInputStopValue requires a state-input hook", launcher
+        )
+        self.assertIn(
+            "if (!have_script && !have_stop) return false;",
+            backend_patch,
+        )
+
+    def test_guest_state_input_bootstraps_initial_held_keys(self) -> None:
+        backend_patch = (
+            TOOLKIT_ROOT
+            / "backends"
+            / "dosbox-x-remotedebug"
+            / "dosbox-x-remotedebug.patch"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "static std::map<KBD_KEYS, std::string> initial_held;",
+            backend_patch,
+        )
+        self.assertIn(
+            "initial_held[key] = qcode;",
+            backend_patch,
+        )
+        self.assertIn(
+            "std::map<KBD_KEYS, std::string> held = initial_held;",
+            backend_patch,
+        )
+        self.assertIn(
+            "static std::vector<std::pair<KBD_KEYS, std::string>> initial_held_order;",
+            backend_patch,
+        )
+        self.assertIn(
+            "for (const auto& item : initial_held_order)",
+            backend_patch,
+        )
+        self.assertIn(
+            "SAVESTATE_ConsumeLoadPauseRelease",
+            backend_patch,
+        )
+
+    def test_state_input_stop_uses_immediate_halted_savestate(self) -> None:
+        from dos_re_harness.remote_capture import (
+            finalize_halted_state_input_save_state,
+        )
+
+        calls = []
+
+        class FakeQmp:
+            supports_immediate_savestate = True
+
+            def save_state_immediate(self, path: Path) -> Path:
+                calls.append(("save-immediate", path))
+                path.write_bytes(b"exact halted machine")
+                return path
+
+        class FakeGdb:
+            def __getattr__(self, name: str) -> object:
+                raise AssertionError(
+                    f"immediate state save unexpectedly used GDB {name}"
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "state_input_stop-42"
+            checkpoint.mkdir()
+            metadata_path = checkpoint / "remote_runtime_registers.json"
+            metadata_path.write_text("{}", encoding="utf-8")
+            registers = {"cs": 0x1234, "eip": 0x5678, "ds": 0x2000}
+            stop, returned_registers = (
+                finalize_halted_state_input_save_state(
+                    FakeQmp(),
+                    FakeGdb(),
+                    {"path": str(checkpoint)},
+                    "S05",
+                    registers,
+                    3.0,
+                    lambda observed: {
+                        "loop_tick": 42,
+                        "ds": observed["ds"],
+                    },
+                )
+            )
+
+            self.assertEqual(stop, "S05")
+            self.assertEqual(returned_registers, registers)
+            self.assertEqual(calls[0][0], "save-immediate")
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            resume = metadata["save_state_resume"]
+            self.assertTrue(resume["halted_boundary"])
+            self.assertTrue(resume["immediate_halted"])
+            self.assertIsNone(resume["breakpoint_linear"])
+            self.assertIsNone(resume["single_step_stop"])
+            self.assertEqual(resume["post_save_state"]["loop_tick"], 42)
+            self.assertEqual(resume["pre_save_registers"], registers)
+
+    def test_breakpoint_checkpoint_uses_immediate_halted_savestate(self) -> None:
+        from dos_re_harness.remote_capture import (
+            finalize_halted_checkpoint_save_state,
+        )
+
+        calls = []
+
+        class FakeQmp:
+            supports_immediate_savestate = True
+
+            def save_state_immediate(self, path: Path) -> Path:
+                calls.append(("save-immediate", path))
+                path.write_bytes(b"exact breakpoint machine")
+                return path
+
+        class FakeGdb:
+            def __getattr__(self, name: str) -> object:
+                raise AssertionError(
+                    f"immediate breakpoint save unexpectedly used GDB {name}"
+                )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            checkpoint = Path(temporary) / "loop_tick-0"
+            checkpoint.mkdir()
+            metadata_path = checkpoint / "remote_runtime_registers.json"
+            metadata_path.write_text("{}", encoding="utf-8")
+            registers = {"cs": 0x0824, "eip": 0x850C, "ds": 0x2567}
+            stop, returned_registers = (
+                finalize_halted_checkpoint_save_state(
+                    FakeQmp(),
+                    FakeGdb(),
+                    0x082402CC,
+                    {
+                        "path": str(checkpoint),
+                        "stop": "S05",
+                        "registers": registers,
+                    },
+                    3.0,
+                    lambda observed: {
+                        "loop_tick": 0,
+                        "ds": observed["ds"],
+                    },
+                )
+            )
+
+            self.assertEqual(stop, "S05")
+            self.assertEqual(returned_registers, registers)
+            self.assertEqual(calls[0][0], "save-immediate")
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            resume = metadata["save_state_resume"]
+            self.assertTrue(resume["halted_boundary"])
+            self.assertTrue(resume["immediate_halted"])
+            self.assertIsNone(resume["single_step_stop"])
+            self.assertEqual(resume["post_save_state"]["loop_tick"], 0)
+            self.assertEqual(resume["pre_save_registers"], registers)
+
+    def test_backend_documents_guest_state_counter_unwrapping(self) -> None:
+        backend_readme = (
+            TOOLKIT_ROOT / "backends" / "dosbox-x-remotedebug" / "README.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("# state_unwrap=1", backend_readme)
+        self.assertIn("counter wraps or", backend_readme)
+        self.assertIn("resets to a lower value", backend_readme)
 
     def test_generic_launcher_exposes_opt_in_turbo_capture(self) -> None:
         launcher = (
@@ -2749,11 +3951,15 @@ class HarnessContractTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("[switch]$Turbo", launcher)
         self.assertIn('turbo="${68}"', launcher)
-        self.assertIn("shift 68", launcher)
+        self.assertIn('checkpoint_post_display_scope="${69}"', launcher)
+        self.assertIn("shift 70", launcher)
         self.assertIn("turbo = $turbo", launcher)
         self.assertIn("stop turbo on key = false", launcher)
         self.assertIn(
-            "$StateInputWidth $stateInputLogPathWsl $turboArg @StartupKey",
+            "$StateInputWidth $stateInputLogPathWsl $turboArg "
+            "$CheckpointPostDisplayScope $stateInputStopValueArg "
+            "$GdbPort $QmpPort "
+            "@StartupKey",
             launcher,
         )
 
@@ -2786,6 +3992,8 @@ class HarnessContractTests(unittest.TestCase):
             TOOLKIT_ROOT / "src" / "dos_re_harness" / "remote_capture.py"
         ).read_text(encoding="utf-8")
         self.assertIn("[switch]$CallNearContinueAfterReturn", launcher)
+        self.assertIn('[string]$CallNearBreakOffset = ""', launcher)
+        self.assertIn('"--call-near-break-offset"', launcher)
         self.assertIn(
             "controller_args+=(--call-near-continue-after-return)",
             launcher,
@@ -2797,6 +4005,136 @@ class HarnessContractTests(unittest.TestCase):
             "                    call_near_return_linear,",
             controller,
         )
+        self.assertIn('"--call-near-break-offset"', controller)
+
+    def test_post_resume_breakpoint_clears_a_different_state_address(
+        self,
+    ) -> None:
+        from dos_re_harness.remote_capture import (
+            should_clear_resume_checkpoint_breakpoint,
+        )
+
+        self.assertFalse(
+            should_clear_resume_checkpoint_breakpoint(
+                0x19DDC, None, (0x1636, 0x3A7C), 1
+            )
+        )
+        self.assertTrue(
+            should_clear_resume_checkpoint_breakpoint(
+                0x19DDC, None, (0x1636, 0x67AF), 1
+            )
+        )
+        self.assertTrue(
+            should_clear_resume_checkpoint_breakpoint(
+                0x19DDC, 0x1CB0F, None, 1
+            )
+        )
+        self.assertTrue(
+            should_clear_resume_checkpoint_breakpoint(
+                0x19DDC, None, (0x1636, 0x3A7C), 2
+            )
+        )
+
+    def test_state_input_stop_allows_post_resume_breakpoint_series(self) -> None:
+        from dos_re_harness import remote_capture
+
+        with tempfile.TemporaryDirectory() as temporary:
+            arguments = [
+                "remote_capture.py",
+                "--out-dir",
+                temporary,
+                "--state-schema",
+                str(FIXTURE_ROOT / "state.schema.json"),
+                "--state-input-stop-value",
+                "679",
+                "--post-resume-break-segmented",
+                "0x1111:0x20",
+                "--post-resume-break-hit-series",
+                "1,3",
+            ]
+            with (
+                patch("sys.argv", arguments),
+                patch(
+                    "dos_re_harness.remote_capture.RspClient",
+                    side_effect=RuntimeError("validation passed"),
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "validation passed",
+                ):
+                    remote_capture.main()
+
+    def test_state_handoff_steps_when_breakpoint_was_consumed(self) -> None:
+        from dos_re_harness.remote_capture import (
+            step_past_optional_halted_breakpoint,
+        )
+
+        class FakeGdb:
+            def __init__(self) -> None:
+                self.stepped = False
+
+            def remove_breakpoint(self, address: int) -> None:
+                self.address = address
+                raise RuntimeError("breakpoint removal failed: 'E01'")
+
+            def step_nowait(self) -> None:
+                self.stepped = True
+
+            def wait_for_stop(self, timeout: float) -> str:
+                self.timeout = timeout
+                return "S05"
+
+        gdb = FakeGdb()
+        self.assertEqual(
+            step_past_optional_halted_breakpoint(gdb, 0x19DDC, 7.0),
+            "S05",
+        )
+        self.assertEqual(gdb.address, 0x19DDC)
+        self.assertTrue(gdb.stepped)
+        self.assertEqual(gdb.timeout, 7.0)
+
+    def test_full_state_resume_advances_checkpoint_instruction(self) -> None:
+        from dos_re_harness.remote_capture import (
+            prepare_full_state_resume_breakpoint,
+        )
+
+        class FakeGdb:
+            def __init__(self) -> None:
+                self.stepped = False
+                self.current = {"eip": 0x12343}
+
+            def remove_breakpoint(self, _address: int) -> None:
+                raise RuntimeError("breakpoint removal failed: 'E01'")
+
+            def step_nowait(self) -> None:
+                self.stepped = True
+
+            def wait_for_stop(self, _timeout: float) -> str:
+                return "S05"
+
+            def registers(self) -> dict[str, int]:
+                return self.current
+
+        gdb = FakeGdb()
+        registers = prepare_full_state_resume_breakpoint(
+            gdb,
+            0x12340,
+            7.0,
+            {"eip": 0x12340},
+        )
+        self.assertTrue(gdb.stepped)
+        self.assertEqual(registers["eip"], 0x12343)
+
+        gdb.stepped = False
+        registers = prepare_full_state_resume_breakpoint(
+            gdb,
+            0x12340,
+            7.0,
+            {"eip": 0x12343},
+        )
+        self.assertFalse(gdb.stepped)
+        self.assertEqual(registers["eip"], 0x12343)
 
     def test_generic_launcher_plumbs_remote_operation_timeout(self) -> None:
         launcher = (
@@ -2809,7 +4147,10 @@ class HarnessContractTests(unittest.TestCase):
             "$callNearContinueAfterReturnArg $RemoteTimeout "
             "$vgaSequenceScreenshotOnStopArg "
             "$stateInputHookLinearArg $stateInputLinearArg "
-            "$StateInputWidth $stateInputLogPathWsl $turboArg @StartupKey",
+            "$StateInputWidth $stateInputLogPathWsl $turboArg "
+            "$CheckpointPostDisplayScope $stateInputStopValueArg "
+            "$GdbPort $QmpPort "
+            "@StartupKey",
             launcher,
         )
 
@@ -2838,12 +4179,109 @@ class HarnessContractTests(unittest.TestCase):
             TOOLKIT_ROOT / "scripts" / "run-wsl-remotedebug.ps1"
         ).read_text(encoding="utf-8")
         self.assertIn("[switch]$VgaSequenceScreenshotOnStop", launcher)
+        self.assertIn("[switch]$VgaSequenceScreenshotAll", launcher)
         self.assertIn('vga_sequence_screenshot_on_stop="${63}"', launcher)
-        self.assertIn("shift 68", launcher)
+        self.assertIn("shift 70", launcher)
         self.assertIn(
             "controller_args+=(--vga-sequence-screenshot-on-stop)",
             launcher,
         )
+        self.assertIn(
+            "controller_args+=(--vga-sequence-screenshot-all)",
+            launcher,
+        )
+
+    def test_display_sequence_writes_completed_frame_and_dac(self) -> None:
+        from dos_re_harness.remote_capture import (
+            write_display_dac_sequence_sample,
+        )
+
+        display = {
+            "data": bytes(range(24)),
+            "width": 3,
+            "height": 2,
+            "bpp": 32,
+            "pitch": 12,
+            "generation": 17,
+        }
+        dac = {
+            "data": bytes(256 * 3),
+            "bits": 6,
+            "pel_mask": 255,
+            "pel_index": 0,
+            "state": 1,
+            "write_index": 0,
+            "read_index": 255,
+            "first_changed": 256,
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            sample = write_display_dac_sequence_sample(
+                root,
+                4,
+                display,
+                dac,
+            )
+
+            self.assertEqual(
+                (root / "frame_0004.display.bin").read_bytes(),
+                display["data"],
+            )
+            self.assertEqual(
+                (root / "frame_0004.dac.bin").read_bytes(),
+                dac["data"],
+            )
+            self.assertEqual(sample["display"]["generation"], 17)
+            self.assertEqual(sample["display"]["width"], 3)
+            self.assertEqual(sample["display"]["height"], 2)
+            self.assertEqual(sample["display"]["pitch"], 12)
+            self.assertEqual(sample["display"]["size"], 24)
+
+    def test_generic_launcher_plumbs_running_display_sequence(self) -> None:
+        launcher = (
+            TOOLKIT_ROOT / "scripts" / "run-wsl-remotedebug.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn("[int]$DisplaySequenceFrames = 0", launcher)
+        self.assertIn("[double]$DisplaySequenceInterval", launcher)
+        self.assertIn(
+            'controller_args+=(--display-sequence-frames "$display_sequence_frames")',
+            launcher,
+        )
+        self.assertIn(
+            'controller_args+=(--display-sequence-interval "$display_sequence_interval")',
+            launcher,
+        )
+
+    def test_generic_launcher_plumbs_post_resume_display_history(self) -> None:
+        launcher = (
+            TOOLKIT_ROOT / "scripts" / "run-wsl-remotedebug.ps1"
+        ).read_text(encoding="utf-8")
+        controller = (
+            TOOLKIT_ROOT / "src" / "dos_re_harness" / "remote_capture.py"
+        ).read_text(encoding="utf-8")
+        backend_patch = (
+            TOOLKIT_ROOT
+            / "backends"
+            / "dosbox-x-remotedebug"
+            / "dosbox-x-remotedebug.patch"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "[int]$PostResumeDisplayHistoryCapacity = 0",
+            launcher,
+        )
+        self.assertIn(
+            'controller_args+=(\n'
+            '        --post-resume-display-history-capacity',
+            launcher,
+        )
+        self.assertIn(
+            '"--post-resume-display-history-capacity"',
+            controller,
+        )
+        self.assertIn('execute == "displayhistory-start"', backend_patch)
+        self.assertIn('execute == "displayhistory-stop"', backend_patch)
+        self.assertIn('\\"palette_size\\"', backend_patch)
 
     def test_ghidra_query_supports_atomic_custom_evidence(self) -> None:
         wrapper = (
@@ -2855,6 +4293,40 @@ class HarnessContractTests(unittest.TestCase):
         self.assertIn("[switch]$NoAnalysis", wrapper)
         self.assertIn('$temporaryOutput = "$resolvedOutput.partial"', wrapper)
         self.assertIn("Refusing to overwrite Ghidra evidence", wrapper)
+
+    def test_ghidra_query_keeps_multiple_script_paths_separate(self) -> None:
+        wrapper = (
+            TOOLKIT_ROOT / "scripts" / "ghidra-query.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "[System.Collections.Generic.List[string]]::new()",
+            wrapper,
+        )
+        self.assertIn("$scriptPaths.Add($genericScriptPath)", wrapper)
+        self.assertIn("$scriptPaths.Add((Resolve-Path $path).Path)", wrapper)
+        self.assertIn(
+            "$scriptPath = $scriptPaths -join [IO.Path]::PathSeparator",
+            wrapper,
+        )
+        self.assertIn("if ([IO.Path]::PathSeparator -eq ';')", wrapper)
+        self.assertIn("$scriptPath = '\"' + $scriptPath + '\"'", wrapper)
+
+    def test_backend_patch_preserves_upstream_line_endings(self) -> None:
+        attributes = (TOOLKIT_ROOT / ".gitattributes").read_text()
+        self.assertIn("*.patch -text", attributes.splitlines())
+        backend = TOOLKIT_ROOT / "backends" / "dosbox-x-remotedebug"
+        patch_bytes = (backend / "dosbox-x-remotedebug.patch").read_bytes()
+        # The pinned upstream save-state source uses CRLF, including hunk
+        # context. Git must preserve those bytes on every host.
+        section = patch_bytes.split(
+            b"diff --git a/src/misc/savestates.cpp b/src/misc/savestates.cpp\n",
+            1,
+        )[1]
+        for line in section.splitlines(keepends=True):
+            if line.startswith((b"---", b"+++")):
+                continue
+            if line.startswith((b" ", b"+", b"-")):
+                self.assertTrue(line.endswith(b"\r\n"), repr(line))
 
     def test_backend_lock_matches_patch(self) -> None:
         backend = TOOLKIT_ROOT / "backends" / "dosbox-x-remotedebug"
@@ -2914,7 +4386,7 @@ class HarnessContractTests(unittest.TestCase):
             )
             self.assertEqual(
                 document["backend"]["patch"]["sha256"],
-                "26c34f89a125219d1602f3e98ceb52d531ca1183f3cc5f0dc62e3a2fb86ed3b1",
+                "4784225ddfeae06a4042aeefff0518005eabfb4de6733554e5dd45fb2795e36f",
             )
             self.assertEqual(
                 document["capture"]["configuration"]["machine"],
@@ -3206,6 +4678,278 @@ class AudioEvidenceTests(unittest.TestCase):
         self.assertFalse(active)
         self.assertEqual(qmp.capture_operations[-1], False)
 
+    def test_simple_actions_support_explicit_key_transitions(self) -> None:
+        from dos_re_harness.remote_capture import run_simple_key_actions
+
+        class FakeQmp:
+            def __init__(self) -> None:
+                self.key_operations: list[tuple[str, bool]] = []
+
+            def key_event(self, qcode: str, down: bool) -> None:
+                self.key_operations.append((qcode, down))
+
+        qmp = FakeQmp()
+        run_simple_key_actions(qmp, ["keydown:up", "keydown:spc", "keyup:spc"])
+        self.assertEqual(
+            qmp.key_operations,
+            [("up", True), ("spc", True), ("spc", False)],
+        )
+
+    def test_simple_actions_can_remove_loaded_state_breakpoint(self) -> None:
+        from dos_re_harness.remote_capture import run_simple_key_actions
+
+        class FakeQmp:
+            pass
+
+        class FakeGdb:
+            def __init__(self) -> None:
+                self.removed: list[int] = []
+
+            def remove_breakpoint(self, address: int) -> None:
+                self.removed.append(address)
+
+        gdb = FakeGdb()
+        run_simple_key_actions(
+            FakeQmp(),
+            ["removebreak:0x850c"],
+            gdb=gdb,
+        )
+        self.assertEqual(gdb.removed, [0x850C])
+
+    def test_simple_actions_restore_serialized_breakpoint_byte_when_untracked(self) -> None:
+        from dos_re_harness.remote_capture import run_simple_key_actions
+
+        class FakeQmp:
+            pass
+
+        class FakeGdb:
+            def remove_breakpoint(self, address: int) -> None:
+                raise RuntimeError("untracked breakpoint")
+
+            def read_memory(self, address: int, length: int) -> bytes:
+                self.read = (address, length)
+                return b"\xcc"
+
+            def write_memory(self, address: int, data: bytes) -> None:
+                self.write = (address, data)
+
+        gdb = FakeGdb()
+        run_simple_key_actions(
+            FakeQmp(),
+            ["removebreak:0x850c:83"],
+            gdb=gdb,
+        )
+        self.assertEqual(gdb.read, (0x850C, 1))
+        self.assertEqual(gdb.write, (0x850C, b"\x83"))
+
+    def test_restored_post_keys_release_synthetic_stop_for_wait_state(self) -> None:
+        capture = (
+            TOOLKIT_ROOT / "src" / "dos_re_harness" / "remote_capture.py"
+        ).read_text(encoding="utf-8")
+        marker = "if wait_predicates:\n                    # A restored state starts"
+        self.assertIn(marker, capture)
+
+    def test_post_restore_actions_enter_restore_setup_without_other_mutation(self) -> None:
+        capture = (
+            TOOLKIT_ROOT / "src" / "dos_re_harness" / "remote_capture.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "or args.post_restore_key\n        ):\n            stop, regs = prepare_restore_halt",
+            capture,
+        )
+
+    def test_resume_checkpoint_applies_post_restore_actions_after_script_keys(self) -> None:
+        capture = (
+            TOOLKIT_ROOT / "src" / "dos_re_harness" / "remote_capture.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn(
+            "if args.halt_after_poke or args.post_restore_key:",
+            capture,
+        )
+        self.assertNotIn(
+            "if args.post_restore_key:\n"
+            "                        wave_capture_active = run_simple_key_actions(\n"
+            "                            qmp_resume,\n"
+            "                            args.post_restore_key,\n"
+            "                            wave_capture_active,\n"
+            "                            gdb,\n"
+            "                        )\n"
+            "                    restored_regs = gdb.registers()",
+            capture,
+        )
+        self.assertIn(
+            "remaining_values = observed_values[1:]\n"
+            "                    if args.post_restore_key:\n"
+            "                        wave_capture_active = run_simple_key_actions(\n"
+            "                            qmp_resume,\n"
+            "                            args.post_restore_key,\n"
+            "                            wave_capture_active,\n"
+            "                            gdb,\n"
+            "                        )\n"
+            "                    if not remaining_values:",
+            capture,
+        )
+
+    def test_side_breakpoint_pokes_apply_before_state_capture(self) -> None:
+        capture = (
+            TOOLKIT_ROOT / "src" / "dos_re_harness" / "remote_capture.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"--state-side-break-poke",', capture)
+        self.assertIn(
+            "side_writes = apply_halted_pokes(\n"
+            "                            gdb,\n"
+            "                            args.state_side_break_poke,\n"
+            "                            side_registers,\n"
+            "                        )\n"
+            "                        side_state = read_resumed_checkpoint_state(",
+            capture,
+        )
+        self.assertIn('"writes": side_writes,', capture)
+
+        wrapper = (
+            TOOLKIT_ROOT / "scripts" / "run-wsl-remotedebug.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn('[string[]]$ResumeSideBreakPoke = @(),', wrapper)
+        self.assertIn('--state-side-break-poke "$poke"', wrapper)
+
+    def test_startup_writehalted_preserves_the_debugger_stop(self) -> None:
+        capture = (
+            TOOLKIT_ROOT / "src" / "dos_re_harness" / "remote_capture.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('if key.startswith("writehalted:"):', capture)
+        self.assertIn(
+            "gdb.write_memory_chunked(linear_address, data)\n"
+            "                        halted_regs = gdb.registers()\n"
+            "                        print(\n"
+            "                            f\"wrote {len(data)} halted bytes",
+            capture,
+        )
+
+    def test_backend_owned_resumed_input_does_not_duplicate_qmp_events(self) -> None:
+        from dos_re_harness.remote_capture import replay_resumed_script_transition
+
+        class FakeQmp:
+            def __init__(self) -> None:
+                self.key_operations: list[tuple[str, bool]] = []
+
+            def key_event(self, qcode: str, down: bool) -> None:
+                self.key_operations.append((qcode, down))
+
+        events = [
+            (719, True, ["left"]),
+            (727, False, ["left"]),
+        ]
+        qmp = FakeQmp()
+        self.assertEqual(
+            replay_resumed_script_transition(qmp, events, 727, "backend"),
+            [],
+        )
+        self.assertEqual(qmp.key_operations, [])
+
+        self.assertEqual(
+            replay_resumed_script_transition(qmp, events, 727, "controller"),
+            [("left", False)],
+        )
+        self.assertEqual(qmp.key_operations, [("left", False)])
+
+        wrapper = (
+            TOOLKIT_ROOT / "scripts" / "run-wsl-remotedebug.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'controller_args+=(--resume-script-event-owner backend)',
+            wrapper,
+        )
+
+    def test_state_input_observe_only_leaves_script_events_to_controller(self) -> None:
+        wrapper = (
+            TOOLKIT_ROOT / "scripts" / "run-wsl-remotedebug.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn("[switch]$StateInputObserveOnly,", wrapper)
+        self.assertIn('state_input_observe_only="1"', wrapper)
+        self.assertIn(
+            'if [ "$state_input_observe_only" != "1" ]; then',
+            wrapper,
+        )
+        self.assertIn(
+            'runtime_env+=(DOS_RE_HARNESS_STATE_INPUT_SCRIPT="$input_script")',
+            wrapper,
+        )
+        self.assertIn(
+            'controller_args+=(--resume-script-event-owner controller)',
+            wrapper,
+        )
+
+    def test_backend_input_script_can_end_before_controller_script(self) -> None:
+        wrapper = (
+            TOOLKIT_ROOT / "scripts" / "run-wsl-remotedebug.ps1"
+        ).read_text(encoding="utf-8")
+        self.assertIn('[string]$BackendInputScript = "",', wrapper)
+        self.assertIn('backend_input_script="__same__"', wrapper)
+        self.assertIn(
+            'DOS_RE_HARNESS_STATE_INPUT_SCRIPT="$backend_input_script"',
+            wrapper,
+        )
+        self.assertIn(
+            'if [ "$backend_input_script" != "__same__" ]; then\n'
+            '            controller_args+=(--resume-script-event-owner controller)',
+            wrapper,
+        )
+
+    def test_loaded_state_continue_allows_wait_state_to_own_boundary(self) -> None:
+        capture = (
+            TOOLKIT_ROOT / "src" / "dos_re_harness" / "remote_capture.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'if wait_predicates:\n                        halted_stop = None',
+            capture,
+        )
+        self.assertIn(
+            '"loaded full state for wait-state polling",',
+            capture,
+        )
+
+    def test_paused_load_without_continue_preserves_qmp_hold(self) -> None:
+        capture = (
+            TOOLKIT_ROOT / "src" / "dos_re_harness" / "remote_capture.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'args.load_save_state_paused\n                    and not args.load_save_state_continue',
+            capture,
+        )
+
+    def test_paused_load_with_resume_checkpoint_defers_qmp_release(self) -> None:
+        from dos_re_harness.remote_capture import (
+            should_defer_paused_load_release,
+        )
+
+        self.assertTrue(
+            should_defer_paused_load_release(
+                paused=True,
+                continue_after_load=False,
+                has_edits=True,
+                has_resume_checkpoint=True,
+            )
+        )
+        self.assertFalse(
+            should_defer_paused_load_release(
+                paused=True,
+                continue_after_load=False,
+                has_edits=True,
+                has_resume_checkpoint=False,
+            )
+        )
+        capture = (
+            TOOLKIT_ROOT / "src" / "dos_re_harness" / "remote_capture.py"
+        ).read_text(encoding="utf-8")
+        resume_branch = capture.index("elif args.resume_checkpoint_script:")
+        release = capture.index(
+            "if defer_loaded_state_resume:", resume_branch
+        )
+        second_qmp_client = capture.index(
+            "qmp_resume = QmpClient(", resume_branch
+        )
+        self.assertLess(release, second_qmp_client)
+
     def test_wave_finalization_rejects_placeholder_header(self) -> None:
         from dos_re_harness.remote_capture import wave_file_is_finalized
 
@@ -3305,6 +5049,31 @@ class CheckpointSeriesTests(unittest.TestCase):
 
             self.assertEqual(result["declared_hits"], [1, 2])
             self.assertEqual(result["hits"], [1, 2])
+
+    def test_expected_hit_count_requires_contiguous_one_based_series(self) -> None:
+        from dos_re_harness.checkpoint_series import index_checkpoint_series
+
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary)
+            for hit in (1, 2):
+                checkpoint = capture / "checkpoints" / f"breakpoint_hit-{hit}"
+                checkpoint.mkdir(parents=True)
+                (checkpoint / "memory.bin").write_bytes(bytes([hit]))
+
+            result = index_checkpoint_series(
+                capture,
+                artifact="memory.bin",
+                expected_hit_count=2,
+            )
+            self.assertEqual(result["hits"], [1, 2])
+            self.assertEqual(result["expected_hit_count"], 2)
+
+            with self.assertRaisesRegex(ValueError, "positive"):
+                index_checkpoint_series(
+                    capture,
+                    artifact="memory.bin",
+                    expected_hit_count=0,
+                )
 
     def test_checkpoint_artifact_slices_and_registers_are_indexed(self) -> None:
         from dos_re_harness.checkpoint_series import index_checkpoint_series

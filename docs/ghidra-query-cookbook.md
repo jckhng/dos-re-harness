@@ -13,6 +13,7 @@ $common = @{
     ProjectName = "game"
     Program = "GAME.EXE"
     NoAnalysis = $true
+    ReadOnly = $true
 }
 
 .\scripts\ghidra-query.ps1 @common `
@@ -26,6 +27,11 @@ single-writer resources, so do not run queries concurrently against the same
 project. `-OutputPath` refuses to overwrite existing evidence and leaves a
 `.partial` file when the query fails.
 
+`-NoAnalysis` skips auto-analysis; it does **not** prevent saving program
+changes. Use `-ReadOnly` for evidence queries so `analyzeHeadless -readOnly`
+discards program changes. The switch is opt-in to preserve existing workflows.
+Do not run concurrent queries against the same project even in read-only mode.
+
 ## Query selection
 
 | Query | Arguments | Use |
@@ -37,7 +43,7 @@ project. `-OutputPath` refuses to overwrite existing evidence and leaves a
 | `programs` | none | Inventory project programs |
 | `scalar` | one or more numeric values | Find decoded immediate operands |
 | `instruction-text` | one or more text fragments | Search rendered instruction text |
-| `memory-range-refs` | start address, end address | Find decoded address operands in a range |
+| `memory-range-refs` | start address, end address, optional `--offset-candidates` | Find decoded addresses, optionally scalar memory-displacement candidates |
 | `bytes-and-callers` | one or more hexadecimal byte strings | Find signatures and callers of containing functions |
 | `bulk-copy` | optional before and after counts | Find `MOVS`/`STOS` sites with context |
 | `dump-range` | start address, length, optional stride | Dump bytes and little-endian words |
@@ -62,6 +68,34 @@ Use the most structured query first:
 Text-rendering queries depend on Ghidra's processor language and display
 syntax. Treat them as discovery tools, then confirm results with disassembly,
 decompilation, references, and runtime evidence.
+
+## Segmented And Unanalyzed Code
+
+In a segmented Ghidra address, `getOffset()` is a linear address. Its low word
+is not the original operand displacement. `--offset-candidates` uses
+`SegmentedAddress.getSegmentOffset()` and requires a single segment range.
+Candidate matches are labelled `segment_not_proven=true`: matching a scalar
+inside a memory operand does not prove DS, the effective address, or runtime
+segment-register state. The default typed-address search is unchanged.
+
+```powershell
+.\scripts\ghidra-query.ps1 @common -Query memory-range-refs `
+    -Args "1234:0100","1234:01ff","--offset-candidates"
+
+.\scripts\ghidra-query.ps1 @common -Query custom `
+    -CustomScript DumpRawInstructions.java `
+    -AdditionalScriptPath .\ghidra\scripts `
+    -Args "1234:0200","1234:023f" `
+    -OutputPath .\.work\raw-instructions.txt
+```
+
+The latter uses pseudo-disassembly without creating instructions/functions.
+Its inclusive range is capped at 4096 bytes and must end on an instruction
+boundary. Choose an entry supported by callers or runtime evidence; arbitrary
+data can also decode as instructions. Segment aliases, missed switch arms and
+interrupt/callback entries may require this check before trusting decompiler
+control flow. Creating a missing function remains an explicit target-local
+analysis operation, not a side effect of this query.
 
 ## Examples
 

@@ -163,6 +163,12 @@ sample. Do not recapture screenshots for every unchanged leading sample.
 Apply the same stable deferred-side-effect recovery and retain the matched
 sample index, time, framebuffer hash, and screenshot hash together.
 
+For a paired post-resume experiment whose preparatory checkpoint series only
+finds the stable loaded-state value, use
+`--checkpoint-post-display-scope post-resume-next`. This preserves the state
+series but performs the expensive running-screen operation only at the paired
+next boundary.
+
 Capture registers and segment bases with memory. In real mode, record whether
 addresses are segment-relative or linear. Do not compare a DS-relative field
 against an absolute rewrite address.
@@ -185,6 +191,15 @@ strictly increasing series through the target adapter:
 The capture writes `checkpoints/breakpoint_hit-2` and the other requested hits
 without rebooting DOSBox-X. Keep breakpoint-specific decoding target-local;
 the generic harness records registers and requested memory artifacts.
+
+For a bounded function-interior probe, combine `--call-near OFFSET` with one
+of `--call-near-break-linear ADDRESS`,
+`--call-near-break-segmented SEGMENT:OFFSET`, or
+`--call-near-break-offset OFFSET`. The offset form derives the breakpoint from
+the observed post-call EIP and live CS, which avoids assuming that a loaded
+savestate retained the caller's relocation segment. Treat synthetic calls as
+controlled probes: preserve the pre-call state, record the pushed return IP,
+and do not promote an interior result to natural-route evidence.
 
 Inspect captures through the compact index first:
 
@@ -231,8 +246,21 @@ nearest verified snapshot at or before the first changed input value, the
 continuous end value, the tick-1 bootstrap movie, and an optional transition
 breakpoint. The plan must validate the snapshot size, registers, bootstrap
 breakpoint removal, fresh outputs, and adapter argument names before DOSBox-X
-starts. Keep comparison commands and semantic breakpoint meanings
-target-local.
+starts. Read `capture.stop_boundary`: if it reports an input transition at the
+terminal value, either move to a reported transition-free value or record and
+verify the intended before/queued/consumed input phase. Keep comparison
+commands and semantic breakpoint meanings target-local.
+
+For direct backend execution from that snapshot, provide
+`--sliced-input-out` and `--sliced-input-manifest` to the same planner. It
+reconstructs the held-key state, retains boundary transitions as a preapplied
+prefix, and places the resulting tail path into all generated capture
+commands. Do not manually substitute the unsliced route afterward.
+
+If the tail has no input transitions, use the state hook as an event-only
+stop without an input script. Save the stopped machine with the backend's
+immediate halted operation when available; a queued save that single-steps
+past the hook is not an exact checkpoint of the requested state boundary.
 
 ## 5. Compatibility Core
 

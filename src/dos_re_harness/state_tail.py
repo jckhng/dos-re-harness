@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any, List, Tuple
 
 from .movie import load_movie
-from .remote_capture import load_state_input_script
+from .remote_capture import (
+    load_state_input_script,
+    validate_state_input_events,
+)
 
 
 StateInputEvent = Tuple[int, bool, List[str]]
@@ -28,6 +32,81 @@ def _artifact(path: Path) -> dict[str, Any]:
     }
 
 
+def slice_state_input_script(
+    input_script: Path,
+    output_script: Path,
+    *,
+    resume_value: int,
+    manifest: Path | None = None,
+) -> dict[str, Any]:
+    """Write a backend-ready input tail for a restored state boundary."""
+    if resume_value < 0:
+        raise ValueError("state input resume value must be non-negative")
+    source = input_script.resolve()
+    metadata, events = load_state_input_script(source)
+    held: set[str] = set()
+    for value, pressed, qcodes in events:
+        if value >= resume_value:
+            break
+        if pressed:
+            held.update(qcodes)
+        else:
+            held.difference_update(qcodes)
+    first_hook_value = resume_value + 1
+    sliced = [event for event in events if event[0] >= resume_value]
+    initial_held = sorted(held)
+    if not sliced:
+        raise ValueError(
+            "state input slice has no events at or after the resume value"
+        )
+    validate_state_input_events(
+        sliced,
+        initial_held_qcodes=initial_held,
+    )
+
+    source_hash = _sha256(source)
+    sliced_metadata = dict(metadata)
+    sliced_metadata["resume_value"] = str(resume_value)
+    sliced_metadata["first_hook_value"] = str(first_hook_value)
+    sliced_metadata["slice_source_sha256"] = source_hash
+    sliced_metadata["initial_held_qcodes"] = "+".join(initial_held)
+    sliced_metadata["preapplied_through"] = str(resume_value)
+    lines = ["dos-re-state-input-script-v1"]
+    lines.extend(
+        f"# {key}={value}"
+        for key, value in sliced_metadata.items()
+    )
+    lines.extend(
+        f"{value}={'down' if pressed else 'up'}.{'+'.join(qcodes)}"
+        for value, pressed, qcodes in sliced
+    )
+    destination = output_script.resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    report = {
+        "format_version": 1,
+        "resume_value": resume_value,
+        "first_hook_value": first_hook_value,
+        "initial_held_qcodes": initial_held,
+        "event_count": len(sliced),
+        "first_event_value": sliced[0][0],
+        "last_event_value": sliced[-1][0],
+        "source": {
+            "bytes": source.stat().st_size,
+            "sha256": source_hash,
+        },
+        "output": _artifact(destination),
+    }
+    if manifest is not None:
+        manifest_path = manifest.resolve()
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    return report
+
+
 def _events_by_value(
     events: list[StateInputEvent],
 ) -> dict[int, list[tuple[bool, list[str]]]]:
@@ -35,6 +114,35 @@ def _events_by_value(
     for value, pressed, qcodes in events:
         grouped.setdefault(value, []).append((pressed, qcodes))
     return grouped
+
+
+def state_input_boundary(
+    events: list[StateInputEvent],
+    value: int,
+) -> dict[str, Any]:
+    """Describe whether a capture stop shares a state-input transition."""
+    if value < 0:
+        raise ValueError("state input boundary value must be non-negative")
+    grouped = _events_by_value(events)
+    occupied = set(grouped)
+    before = value
+    while before >= 0 and before in occupied:
+        before -= 1
+    after = value
+    while after in occupied:
+        after += 1
+    transitions = grouped.get(value, [])
+    return {
+        "value": value,
+        "input_transitions": [
+            {"pressed": pressed, "qcodes": qcodes}
+            for pressed, qcodes in transitions
+        ],
+        "transition_count": len(transitions),
+        "requires_explicit_input_phase": bool(transitions),
+        "nearest_transition_free_before": before if before >= 0 else None,
+        "nearest_transition_free_after": after,
+    }
 
 
 def _apply_events(
@@ -234,6 +342,10 @@ def build_state_tail_plan(
             "last_value": end_value,
             "value_count": len(values),
             "maximum_hits": maximum_hits,
+            "stop_boundary": state_input_boundary(
+                current_events,
+                end_value,
+            ),
             "adapter_arguments": adapter_arguments,
         },
     }

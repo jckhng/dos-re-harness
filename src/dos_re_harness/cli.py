@@ -25,7 +25,7 @@ from .project import load_project, load_scenarios, validate_project
 from .schema import load_schema
 from .screens import ScreenClassifier
 from .state import diff_states, load_state, parse_dump_file
-from .state_tail import build_state_tail_plan
+from .state_tail import build_state_tail_plan, slice_state_input_script
 from .traces import first_trace_difference, load_jsonl
 from .write_trace import extract_register_pair_trace
 
@@ -103,6 +103,17 @@ def command_diff_state(args: argparse.Namespace) -> int:
         print(f"DIFF {field.name} original={left!r} reimplementation={right!r}")
     print(f"{matches} match, {len(differences)} diff, {skipped} skipped")
     return 1 if differences else 0
+
+
+def command_slice_state_input(args: argparse.Namespace) -> int:
+    report = slice_state_input_script(
+        args.input,
+        args.output,
+        resume_value=args.resume_value,
+        manifest=args.manifest,
+    )
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
 
 
 def command_classify_screen(args: argparse.Namespace) -> int:
@@ -237,6 +248,7 @@ def command_index_checkpoints(args: argparse.Namespace) -> int:
         length=args.length,
         registers=args.register,
         expected_hits=args.expected_hits,
+        expected_hit_count=args.expected_hit_count,
     )
     _emit_json(result, args.out)
     return 0
@@ -421,30 +433,56 @@ def command_plan_state_tail(args: argparse.Namespace) -> int:
     scenario = scenarios[args.scenario]
     capture_arguments = plan["capture"]["adapter_arguments"]
     capture_adapter_replacements(adapter, scenario, capture_arguments)
+    transition = plan.get("transition")
+    if isinstance(transition, dict):
+        capture_adapter_replacements(
+            adapter,
+            scenario,
+            transition["adapter_arguments"],
+        )
+
+    capture_input_script = args.input_script
+    if args.sliced_input_manifest is not None and args.sliced_input_out is None:
+        raise ValueError(
+            "--sliced-input-manifest requires --sliced-input-out"
+        )
+    if args.sliced_input_out is not None:
+        slice_paths = [args.sliced_input_out]
+        if args.sliced_input_manifest is not None:
+            slice_paths.append(args.sliced_input_manifest)
+        existing = [path.resolve() for path in slice_paths if path.exists()]
+        if existing and not args.allow_existing_output:
+            raise ValueError(
+                "state input slice output already exists: "
+                + ", ".join(str(path) for path in existing)
+            )
+        slice_report = slice_state_input_script(
+            args.input_script,
+            args.sliced_input_out,
+            resume_value=args.checkpoint_value,
+            manifest=args.sliced_input_manifest,
+        )
+        plan["scripts"]["capture_slice"] = slice_report
+        capture_input_script = args.sliced_input_out
+
     commands: dict[str, list[str]] = {
         "capture_cli_args": _state_tail_capture_cli_args(
             project.path,
             args.scenario,
             plan["capture"]["output"],
             args.movie,
-            args.input_script,
+            capture_input_script,
             capture_arguments,
         )
     }
-    transition = plan.get("transition")
     if isinstance(transition, dict):
         transition_arguments = transition["adapter_arguments"]
-        capture_adapter_replacements(
-            adapter,
-            scenario,
-            transition_arguments,
-        )
         commands["transition_cli_args"] = _state_tail_capture_cli_args(
             project.path,
             args.scenario,
             transition["output"],
             args.movie,
-            args.input_script,
+            capture_input_script,
             transition_arguments,
         )
     plan["project"] = {
@@ -586,7 +624,17 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint_index.add_argument(
         "--register", action="append", default=[], metavar="NAME"
     )
-    checkpoint_index.add_argument("--expected-hits", type=_parse_hit_list)
+    expected_checkpoints = checkpoint_index.add_mutually_exclusive_group()
+    expected_checkpoints.add_argument(
+        "--expected-hits",
+        type=_parse_hit_list,
+        help="Exact ascending comma-separated checkpoint hit ordinals.",
+    )
+    expected_checkpoints.add_argument(
+        "--expected-hit-count",
+        type=int,
+        help="Require the contiguous checkpoint series 1 through N.",
+    )
     checkpoint_index.add_argument("--out", type=Path, required=True)
     checkpoint_index.set_defaults(func=command_index_checkpoints)
 
@@ -638,6 +686,19 @@ def build_parser() -> argparse.ArgumentParser:
     tail.add_argument("--capture-out", type=Path, required=True)
     tail.add_argument("--transition-breakpoint")
     tail.add_argument("--transition-out", type=Path)
+    tail.add_argument(
+        "--sliced-input-out",
+        type=Path,
+        help=(
+            "Write a validated backend-ready input tail at the checkpoint "
+            "and use it in generated capture commands."
+        ),
+    )
+    tail.add_argument(
+        "--sliced-input-manifest",
+        type=Path,
+        help="Write hash/provenance metadata for --sliced-input-out.",
+    )
     tail.add_argument("--allow-existing-output", action="store_true")
     tail.add_argument("--dump-segment", choices=("ds", "ss"))
     tail.add_argument("--dump-offset", type=lambda value: int(value, 0), default=0)
@@ -645,6 +706,19 @@ def build_parser() -> argparse.ArgumentParser:
     tail.add_argument("--dump-size", type=lambda value: int(value, 0))
     tail.add_argument("--out", type=Path, required=True)
     tail.set_defaults(func=command_plan_state_tail)
+
+    slice_input = subparsers.add_parser(
+        "slice-state-input",
+        help=(
+            "Create a validated backend-ready input tail for a restored "
+            "guest-state boundary."
+        ),
+    )
+    slice_input.add_argument("input", type=Path)
+    slice_input.add_argument("output", type=Path)
+    slice_input.add_argument("--resume-value", type=int, required=True)
+    slice_input.add_argument("--manifest", type=Path)
+    slice_input.set_defaults(func=command_slice_state_input)
 
     capture = subparsers.add_parser("capture")
     capture.add_argument("project", type=Path)
