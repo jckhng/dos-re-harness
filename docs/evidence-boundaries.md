@@ -3,6 +3,23 @@
 These lessons apply across DOS targets. Addresses, resource IDs, device setup
 ABIs, sprite tables and scene-specific conclusions belong in target adapters.
 
+## Budget Evidence Before Capture
+
+Write down the behavior, boundary and acceptance question before recording.
+Use source analysis and short original probes to select fields and phases;
+do not sample whole memory and every video page across a long route by default.
+Set wall-time, event and compressed-byte caps, and stop after the first useful
+divergence rather than replaying its cascades.
+
+Pin and reuse an audited original route across native revisions. For routine
+regression, compare ordered state fields and exact page/palette hashes in a
+stream; retain full memory/pages at checkpoints and around failures. Validate
+any compact representation against a full capture before replacing that
+capture as evidence. Hash equality proves only the observed content, not
+unrecorded branches, visible hold duration or audio timing. Keep a separate
+bounded release gate and an explicitly labeled exhaustive research backlog;
+do not silently weaken a frozen criterion to fit a cheaper capture.
+
 ## Distinguish The Clocks
 
 A simulation tick, hardware timer tick, completed page flip, audio interrupt

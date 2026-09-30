@@ -26,7 +26,7 @@ from .schema import load_schema
 from .screens import ScreenClassifier
 from .state import diff_states, load_state, parse_dump_file
 from .state_tail import build_state_tail_plan, slice_state_input_script
-from .traces import first_trace_difference, load_jsonl
+from .traces import compare_jsonl
 from .write_trace import extract_register_pair_trace
 
 
@@ -146,11 +146,9 @@ def command_doctor(args: argparse.Namespace) -> int:
 
 
 def command_diff_trace(args: argparse.Namespace) -> int:
-    original = load_jsonl(args.original)
-    reimplementation = load_jsonl(args.reimplementation)
-    difference = first_trace_difference(original, reimplementation)
+    row_count, difference = compare_jsonl(args.original, args.reimplementation)
     if difference is None:
-        print(f"TRACE_MATCH rows={len(original)}")
+        print(f"TRACE_MATCH rows={row_count}")
         return 0
     index, fields = difference
     print(f"TRACE_MISMATCH index={index}")

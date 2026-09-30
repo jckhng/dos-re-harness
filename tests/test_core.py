@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import base64
+import gzip
 import hashlib
 import shutil
 import struct
@@ -31,6 +32,7 @@ from dos_re_harness.screens import ScreenClassifier
 from dos_re_harness.state import diff_states
 from dos_re_harness.traces import (
     MISSING_TRACE_VALUE,
+    compare_jsonl,
     first_trace_difference,
     load_jsonl,
 )
@@ -3533,6 +3535,35 @@ class WorkflowTests(unittest.TestCase):
             first_trace_difference([{"x": "<missing>"}], [{}]),
             (0, {"x": ("<missing>", MISSING_TRACE_VALUE)}),
         )
+
+    def test_streaming_trace_comparison_supports_gzip(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            original = Path(temporary) / "original.jsonl.gz"
+            native = Path(temporary) / "native.jsonl"
+            with gzip.open(original, "wt", encoding="utf-8") as stream:
+                stream.write('{"tick": 0}\n{"tick": 1}\n')
+            native.write_text('{"tick": 0}\n{"tick": 2}\n', encoding="utf-8")
+
+            with patch.object(Path, "read_text", side_effect=AssertionError("read all")):
+                self.assertEqual(compare_jsonl(original, native), (2, (1, {"tick": (1, 2)})))
+
+    def test_streaming_trace_comparison_counts_and_rejects_bad_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            original = Path(temporary) / "original.jsonl"
+            native = Path(temporary) / "native.jsonl"
+            original.write_text('{"tick": 0}\n\n{"tick": 1}\n', encoding="utf-8")
+            native.write_text('{"tick": 0}\n{"tick": 1}\n', encoding="utf-8")
+            self.assertEqual(compare_jsonl(original, native), (2, None))
+
+            native.write_text('{"tick": 0}\n', encoding="utf-8")
+            self.assertEqual(
+                compare_jsonl(original, native),
+                (2, (1, {"row": ({"tick": 1}, MISSING_TRACE_VALUE)})),
+            )
+
+            native.write_text('{"tick": 0}\n[]\n', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, r"native.jsonl:2: trace row must be an object"):
+                compare_jsonl(original, native)
 
 
 class HarnessContractTests(unittest.TestCase):
