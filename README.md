@@ -193,9 +193,17 @@ user-supplied, hash-verified data files.
 The harness core has no third-party Python runtime dependencies. Install only
 the layers needed for the work being performed.
 
+For bounded, device-free 16-bit callback probes, install the optional
+`unicorn` extra (`python -m pip install -e ".[unicorn]"`), pinned to 2.1.4 in
+`pyproject.toml`. It is a development tool, not a runtime dependency of any
+reimplementation. The probe runner
+executes one callback from a private RAM/register snapshot with explicit
+return, instruction, and time bounds; it rejects interrupts and port I/O.
+See [the micro-probe workflow](skills/reverse-reimplement-dos/references/unicorn-microprobe.md).
+
 ### Dependency Acquisition Policy
 
-DOSBox-X and Ghidra are intentionally not Git submodules:
+Optional tools are intentionally not Git submodules:
 
 - The DOSBox-X backend is optional, GPL-2.0-only, built under WSL, and pinned
   by upstream URL, commit, and verified patch hash in
@@ -205,6 +213,9 @@ DOSBox-X and Ghidra are intentionally not Git submodules:
   compatible JDK, and is invoked through an explicit local
   `analyzeHeadless` path. A source submodule would not reproduce the tested
   binary distribution or the host Java installation.
+- Unicorn is optional and installed as an exact-version Python package through
+  the `unicorn` extra. A source submodule would not install its native Python
+  extension or improve reproducibility for the supported hosts.
 
 A normal clone therefore remains small and usable for manifest validation and
 portable comparison. Capturing an original binary requires the documented

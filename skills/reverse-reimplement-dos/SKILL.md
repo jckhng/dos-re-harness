@@ -122,6 +122,14 @@ the pristine and substituted runs from the same resumable boundary. Read
 using this method. Treat it as a contract-verification ladder, not as the
 portable deliverable.
 
+For a small deterministic real-mode callback, Unicorn can test candidate
+inputs quickly from a private RAM/register snapshot. Use the optional harness
+`dos_re_harness.unicorn_probe.run_callback` runner, keep fixture setup in the
+target adapter, and compare changed bytes with an independently captured
+DOSBox result. Read [references/unicorn-microprobe.md](references/unicorn-microprobe.md)
+before using it. A passing micro-probe is controlled-call evidence only; it
+does not replace natural execution, device timing, or the acceptance gate.
+
 When an MZ import exposes only a packer or relocation stub, use the harness
 `unpack-mz` command with a pinned `mzexplode` binary. Hash the tool, packed
 input, unpacked output, and command in a private manifest. Import the unpacked

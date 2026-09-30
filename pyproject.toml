@@ -9,6 +9,9 @@ description = "Deterministic DOSBox-X and Ghidra differential reimplementation h
 requires-python = ">=3.8"
 dependencies = []
 
+[project.optional-dependencies]
+unicorn = ["unicorn==2.1.4"]
+
 [project.scripts]
 dos-re = "dos_re_harness.cli:main"
 

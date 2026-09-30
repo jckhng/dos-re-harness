@@ -20,6 +20,17 @@ The repository does not distribute a DOSBox-X executable. Anyone distributing
 a patched executable must satisfy the GPL requirements for corresponding
 source and notices.
 
+## Optional Unicorn Micro-Probe
+
+The `unicorn` Python package is an optional development-time dependency,
+pinned at 2.1.4 and installed separately. No wheel or Unicorn library is
+distributed in this repository or required by target reimplementations.
+Upstream describes Unicorn as GPLv2; PyPI also lists BSD package metadata.
+Check the actual package's license terms before redistributing a bundle.
+
+- Source and license text: https://github.com/unicorn-engine/unicorn
+- Package: https://pypi.org/project/unicorn/2.1.4/
+
 ## Target Software
 
 Target project names, hashes, schemas, addresses, and automation manifests do
