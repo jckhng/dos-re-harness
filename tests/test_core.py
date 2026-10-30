@@ -1412,14 +1412,12 @@ class WorkflowTests(unittest.TestCase):
                 "--resume-next-linear",
                 "0x12343",
             ]
-            with (
-                patch("sys.argv", arguments),
+            with patch("sys.argv", arguments), \
                 patch.object(
                     remote_capture,
                     "RspClient",
                     side_effect=RuntimeError("validation passed"),
-                ),
-            ):
+                ):
                 with self.assertRaisesRegex(
                     RuntimeError,
                     "validation passed",
@@ -1522,14 +1520,12 @@ class WorkflowTests(unittest.TestCase):
                 "0x12000:ebfe",
                 "--post-resume-continue-after-poke",
             ]
-            with (
-                patch("sys.argv", arguments),
+            with patch("sys.argv", arguments), \
                 patch.object(
                     remote_capture,
                     "RspClient",
                     side_effect=RuntimeError("validation passed"),
-                ),
-            ):
+                ):
                 with self.assertRaisesRegex(
                     RuntimeError,
                     "validation passed",
@@ -1554,14 +1550,12 @@ class WorkflowTests(unittest.TestCase):
                 "0x1111:0x20",
                 "--post-resume-continue",
             ]
-            with (
-                patch("sys.argv", arguments),
+            with patch("sys.argv", arguments), \
                 patch.object(
                     remote_capture,
                     "RspClient",
                     side_effect=RuntimeError("validation passed"),
-                ),
-            ):
+                ):
                 with self.assertRaisesRegex(
                     RuntimeError,
                     "validation passed",
@@ -1589,14 +1583,12 @@ class WorkflowTests(unittest.TestCase):
                 "--post-resume-poke",
                 "0x12000:ebfe",
             ]
-            with (
-                patch("sys.argv", arguments),
+            with patch("sys.argv", arguments), \
                 patch.object(
                     remote_capture,
                     "RspClient",
                     side_effect=RuntimeError("validation passed"),
-                ),
-            ):
+                ):
                 with self.assertRaisesRegex(
                     RuntimeError,
                     "validation passed",
@@ -1659,14 +1651,12 @@ class WorkflowTests(unittest.TestCase):
                 "--post-resume-next-break-hit-series",
                 "1,3,7",
             ]
-            with (
-                patch("sys.argv", arguments),
+            with patch("sys.argv", arguments), \
                 patch.object(
                     remote_capture,
                     "RspClient",
                     side_effect=RuntimeError("validation passed"),
-                ),
-            ):
+                ):
                 with self.assertRaisesRegex(
                     RuntimeError,
                     "validation passed",
@@ -2289,6 +2279,8 @@ class WorkflowTests(unittest.TestCase):
                     "write_index": 8,
                     "read_index": 9,
                     "first_changed": 16,
+                    "video_timing": {"pic_ms": 1234.5678},
+                    "cpu_timing": {"debug_instruction_count": 123456789},
                 }
 
             def displaydump(self) -> dict[str, object]:
@@ -2362,6 +2354,9 @@ class WorkflowTests(unittest.TestCase):
             )
             self.assertEqual(registers["dac"]["bits"], 6)
             self.assertEqual(registers["dac"]["first_changed"], 16)
+            self.assertEqual(registers["dac"]["video_timing"], {"pic_ms": 1234.5678})
+            self.assertEqual(registers["dac"]["cpu_timing"],
+                             {"debug_instruction_count": 123456789})
             self.assertEqual(registers["display"]["width"], 2)
             self.assertEqual(registers["display"]["height"], 2)
             self.assertEqual(registers["display"]["bpp"], 8)
@@ -2706,6 +2701,7 @@ class WorkflowTests(unittest.TestCase):
                     "write_index": 12,
                     "read_index": 11,
                     "first_changed": 16,
+                    "cpu_timing": {"debug_instruction_count": 123456789},
                 },
             )
 
@@ -2724,6 +2720,8 @@ class WorkflowTests(unittest.TestCase):
             )
             self.assertEqual(sample["dac"]["bits"], 6)
             self.assertEqual(sample["dac"]["first_changed"], 16)
+            self.assertEqual(sample["dac"]["cpu_timing"],
+                             {"debug_instruction_count": 123456789})
             self.assertEqual(sample["dac"]["size"], 768)
             self.assertEqual(
                 sample["dac"]["sha256"],
@@ -3468,8 +3466,9 @@ class WorkflowTests(unittest.TestCase):
             )
             self.assertTrue(any("absolute user-home path" in item for item in errors))
 
-    def test_harness_passes_public_tree_audit(self) -> None:
-        self.assertEqual(audit_public_tree(TOOLKIT_ROOT), [])
+    def test_harness_index_passes_publication_audit(self) -> None:
+        from dos_re_harness.audit import audit_staged_tree
+        self.assertEqual(audit_staged_tree(TOOLKIT_ROOT), [])
 
     def test_input_movie_resolves_relative_to_project(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -4083,13 +4082,11 @@ class HarnessContractTests(unittest.TestCase):
                 "--post-resume-break-hit-series",
                 "1,3",
             ]
-            with (
-                patch("sys.argv", arguments),
+            with patch("sys.argv", arguments), \
                 patch(
                     "dos_re_harness.remote_capture.RspClient",
                     side_effect=RuntimeError("validation passed"),
-                ),
-            ):
+                ):
                 with self.assertRaisesRegex(
                     RuntimeError,
                     "validation passed",
@@ -4244,6 +4241,7 @@ class HarnessContractTests(unittest.TestCase):
             "write_index": 0,
             "read_index": 255,
             "first_changed": 256,
+            "cpu_timing": {"debug_instruction_count": 987654321},
         }
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -4267,6 +4265,8 @@ class HarnessContractTests(unittest.TestCase):
             self.assertEqual(sample["display"]["height"], 2)
             self.assertEqual(sample["display"]["pitch"], 12)
             self.assertEqual(sample["display"]["size"], 24)
+            self.assertEqual(sample["dac"]["cpu_timing"],
+                             {"debug_instruction_count": 987654321})
 
     def test_generic_launcher_plumbs_running_display_sequence(self) -> None:
         launcher = (
@@ -4977,7 +4977,7 @@ class AudioEvidenceTests(unittest.TestCase):
             "if defer_loaded_state_resume:", resume_branch
         )
         second_qmp_client = capture.index(
-            "qmp_resume = QmpClient(", resume_branch
+            "qmp_resume = connections.open_qmp()", resume_branch
         )
         self.assertLess(release, second_qmp_client)
 
@@ -5045,6 +5045,49 @@ class RegisterWriteTraceTests(unittest.TestCase):
 
 
 class CheckpointSeriesTests(unittest.TestCase):
+    def test_paired_next_series_is_indexed_without_mixing_first_hits(self) -> None:
+        from dos_re_harness.checkpoint_series import index_checkpoint_series
+
+        with tempfile.TemporaryDirectory() as temporary:
+            capture = Path(temporary)
+            for field, hits in (
+                ("breakpoint_hit", (2, 7)),
+                ("next_breakpoint_hit", (3, 9)),
+            ):
+                for hit in hits:
+                    checkpoint = capture / "checkpoints" / f"{field}-{hit}"
+                    checkpoint.mkdir(parents=True)
+                    (checkpoint / "memory.bin").write_bytes(bytes([hit]))
+            (capture / "capture_summary.json").write_text(json.dumps({
+                "break_state": {
+                    "post_resume_breakpoint_series": {"hits": [2, 7]},
+                    "post_resume_next_breakpoint": {"hits": [3, 9]},
+                }
+            }), encoding="utf-8")
+
+            result = index_checkpoint_series(
+                capture, artifact="memory.bin", field="next_breakpoint_hit")
+            self.assertEqual(result["checkpoint_field"], "next_breakpoint_hit")
+            self.assertEqual(result["declared_hits"], [3, 9])
+            self.assertEqual(result["hits"], [3, 9])
+            self.assertEqual(result["checkpoints"][0]["artifact"]["sha256"],
+                             hashlib.sha256(bytes([3])).hexdigest())
+            self.assertEqual(index_checkpoint_series(
+                capture, artifact="memory.bin")["hits"], [2, 7])
+
+            (capture / "checkpoints" / "next_breakpoint_hit-9" /
+             "memory.bin").unlink()
+            (capture / "checkpoints" / "next_breakpoint_hit-9").rmdir()
+            with self.assertRaisesRegex(ValueError, "do not match expected"):
+                index_checkpoint_series(
+                    capture, artifact="memory.bin", field="next_breakpoint_hit")
+
+    def test_checkpoint_field_rejects_unsupported_names(self) -> None:
+        from dos_re_harness.checkpoint_series import index_checkpoint_series
+
+        with self.assertRaisesRegex(ValueError, "checkpoint field"):
+            index_checkpoint_series(Path("unused"), artifact="memory.bin", field="../bad")
+
     def test_expected_hit_list_is_positive_strict_and_complete(self) -> None:
         from argparse import ArgumentTypeError
 

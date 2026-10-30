@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -116,16 +118,13 @@ def git_commit(path: Path) -> str | None:
         return None
 
 
-def write_evidence_manifest(
+def capture_evidence_inputs(
     project: Project,
     scenario: str,
-    out_dir: Path,
-    command: list[str],
-    exit_code: int,
     input_movie_path: Path | None = None,
     input_script_path: Path | None = None,
-) -> Path:
-    out_dir.mkdir(parents=True, exist_ok=True)
+) -> dict[str, Any]:
+    """Freeze identities before the adapter can alter inputs or mutable files."""
     schema_path = project.referenced_path("runtime.state_schema")
     screens_path = project.referenced_path("runtime.screen_signatures")
     scenarios_path = project.referenced_path("scenarios")
@@ -141,12 +140,6 @@ def write_evidence_manifest(
             "mutable_files": specimen.get("mutable_files", []),
         }
 
-    manifest_path = out_dir / "harness_manifest.json"
-    artifacts = [
-        file_record(path, out_dir)
-        for path in sorted(out_dir.rglob("*"))
-        if path.is_file() and path != manifest_path
-    ]
     contracts = {
         "state_schema": {
             "path": str(schema_path),
@@ -195,18 +188,21 @@ def write_evidence_manifest(
         if isinstance(runtime, dict) and key in runtime
     }
 
+    source_root = Path(__file__).parent
     document = {
         "format_version": 1,
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "inputs_observed_at_utc": datetime.now(timezone.utc).isoformat(),
         "project": {
             "id": project.data["id"],
             "path": str(project.path),
             "sha256": sha256_file(project.path),
         },
         "scenario": scenario,
-        "command": command,
-        "exit_code": exit_code,
         "git_commit": git_commit(project.root),
+        "harness": {
+            "python": sys.version,
+            "sources": [file_record(path, source_root) for path in sorted(source_root.glob("*.py"))],
+        },
         "contracts": contracts,
         "backend": backend_record(project),
         "capture": {
@@ -215,10 +211,41 @@ def write_evidence_manifest(
             "mutable_baseline": mutable_baseline(project),
         },
         "specimen": specimen_manifest,
-        "artifacts": artifacts,
     }
-    manifest_path.write_text(
+    return copy.deepcopy(document)
+
+
+def write_evidence_manifest(
+    project: Project,
+    scenario: str,
+    out_dir: Path,
+    command: list[str],
+    exit_code: int,
+    input_movie_path: Path | None = None,
+    input_script_path: Path | None = None,
+    *,
+    input_snapshot: dict[str, Any] | None = None,
+    execution: dict[str, Any] | None = None,
+) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    document = copy.deepcopy(input_snapshot) if input_snapshot is not None else capture_evidence_inputs(
+        project, scenario, input_movie_path, input_script_path,
+    )
+    manifest_path = out_dir / "harness_manifest.json"
+    temporary = manifest_path.with_name(manifest_path.name + ".partial")
+    document.update({
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "input_observation": "before_execution" if input_snapshot is not None else "manifest_creation",
+        "command": command,
+        "exit_code": exit_code,
+        "execution": execution,
+        "artifacts": [file_record(path, out_dir) for path in sorted(out_dir.rglob("*"))
+                      if path.is_file() and path not in (manifest_path, temporary)],
+    })
+    document["capture"]["mutable_after"] = mutable_baseline(project)
+    temporary.write_text(
         json.dumps(document, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    temporary.replace(manifest_path)
     return manifest_path

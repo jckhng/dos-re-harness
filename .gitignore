@@ -4,3 +4,12 @@ dist/
 *.egg-info/
 __pycache__/
 *.pyc
+.env
+.env.*
+!.env.example
+*.local.json
+*.local.toml
+*.local.yaml
+*.local.yml
+CMakeUserPresets.json
+host.json

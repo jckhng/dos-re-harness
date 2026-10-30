@@ -61,7 +61,8 @@ def _compact_break_state(value: Any) -> dict[str, Any] | None:
         if key == "input_script_source" and item == "None":
             compact[str(key)] = None
             continue
-        if key == "post_resume_breakpoint_series" and isinstance(item, dict):
+        if key in {"post_resume_breakpoint_series",
+                   "post_resume_paired_breakpoint_series", "startup_paired_breakpoint_series"} and isinstance(item, dict):
             series = {
                 str(series_key): series_value
                 for series_key, series_value in item.items()
@@ -176,10 +177,14 @@ def build_capture_summary(capture_dir: Path) -> dict[str, Any]:
             "nonempty_count": provenance.get("nonempty_count", 0),
         }
     post_resume_hits = 0
+    post_resume_pairs = 0
     if isinstance(break_state, dict):
         series = break_state.get("post_resume_breakpoint_series")
         if isinstance(series, dict) and isinstance(series.get("hits"), list):
             post_resume_hits = len(series["hits"])
+        pairs = break_state.get("post_resume_paired_breakpoint_series")
+        if isinstance(pairs, dict) and isinstance(pairs.get("hits"), list):
+            post_resume_pairs = len(pairs["hits"])
 
     return {
         "format_version": 1,
@@ -192,6 +197,7 @@ def build_capture_summary(capture_dir: Path) -> dict[str, Any]:
         "counts": {
             "state_checkpoints": len(compact_checkpoints),
             "post_resume_hits": post_resume_hits,
+            "post_resume_pairs": post_resume_pairs,
             "wave_files": len(audio),
         },
         "artifacts": artifacts,

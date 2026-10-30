@@ -1,5 +1,3 @@
-$ErrorActionPreference = "Stop"
-$toolkitRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$env:PYTHONPATH = Join-Path $toolkitRoot "src"
-& python -m unittest discover -s (Join-Path $toolkitRoot "tests") -v
+# Compatibility entry point; scripts/run_tests.py owns environment and discovery.
+& (Join-Path $PSScriptRoot "../scripts/run-tests.ps1") @args
 exit $LASTEXITCODE

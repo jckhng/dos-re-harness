@@ -24,6 +24,7 @@ class GhidraQuerySurfaceTests(unittest.TestCase):
             "xrefs": "FindFunctionXrefs.java",
             "functions": "ListFunctionsStdout.java",
             "programs": "ListProgramsStdout.java",
+            "program-index": "ExportProgramIndex.java",
             "scalar": "FindScalarUsage.java",
             "instruction-text": "FindInstructionText.java",
             "memory-range-refs": "FindMemoryRangeRefs.java",

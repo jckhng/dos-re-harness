@@ -27,7 +27,21 @@ runtime evidence confirms them.
 
 Do not mix evidence from different binary versions.
 
+## Plan Translation and Integration
+
+Read [references/translation-workflow.md](references/translation-workflow.md)
+before substantial translation or when isolated matches stop advancing a retained
+execution path. Map functions, dependencies and shared storage; write bounded
+contracts and preserve aliases through canonical storage where appropriate.
+Track mapped, specified, implemented, integrated and validated work separately.
+Give each work package an owner, established interfaces and a continuous boundary
+to advance. Do not require delegation or change an accepted fidelity goal.
+
 ## Build the Evidence Loop
+
+Use Ghidra for static hypotheses, Unicorn for bounded CPU-level differential
+experiments, and DOSBox-X for system-level validation. Compare reconstructed
+C/C++ against the original at the tested contract and retained runtime levels.
 
 Work in this order:
 
@@ -38,81 +52,18 @@ Work in this order:
 4. Make the reimplementation emit the same state and input schema.
 5. Compare traces at the first divergent tick.
 6. Add a regression fixture before changing behavior.
-7. Fix the earliest cause, then recapture and repeat.
+7. Fix the earliest cause and replay qualified evidence. Recapture when the
+   required boundary, inputs or provenance have changed.
 
 Read [references/workflow.md](references/workflow.md) before designing a new
 project or validation harness.
 
-When locating a frontier across nearby logical ticks, capture an ordered state
-checkpoint series in one emulator run. Keep every checkpoint independently
-comparable, hash nested artifacts in the parent evidence manifest, and report
-only observed exact/divergent ticks. Do not treat a known divergence as a
-passing regression merely because it is expected.
-
-Before launching repeated Nth-hit probes at one post-resume breakpoint, batch
-the required hit ordinals into one capture. Use the harness
-`--post-resume-break-hit-series` adapter capability and decode the resulting
-`checkpoints/breakpoint_hit-*` artifacts with a target-local analyzer. Do not
-repeat full emulator startup solely to change the requested hit count.
-
-When a paired-boundary capture uses a preparatory state series only to absorb
-save-state drift, set `--checkpoint-post-display-scope post-resume-next` if
-only the final paired boundary needs exact running-screen evidence. This
-retains the preparatory state checkpoints while avoiding a display stop,
-self-loop, DAC dump, and screenshot for each candidate value.
-
-Inspect `capture.stop_boundary` in every `plan-state-tail` report. If
-`requires_explicit_input_phase` is true, the requested terminal value shares
-one or more input transitions. Select a transition-free boundary when the
-question permits it; otherwise prove whether the capture is before input,
-after input is queued, or after input is consumed. Do not compare such a stop
-as an unqualified logical-tick state.
-
-For a restored late-state capture, prefer `plan-state-tail` with
-`--sliced-input-out` and `--sliced-input-manifest`. Use the generated capture
-arguments unchanged. This reconstructs held keys, binds only the validated
-post-resume input stream, and prevents accidental replay of pre-resume events.
-
-When a restored state needs no further input transitions, omit the input
-script and configure only the state-input hook, state address, width, and stop
-value. Prefer an immediate halted save at that stop so checkpoint creation
-does not execute an extra guest instruction.
-
-For the same problem in an ordinary startup movie, use the generic
-`breakseries:<segment>:<offset>:2+9+17` action. Reserve commas for separating
-movie actions. Use portable-only tests for routine iterations, turbo captures
-only for a target domain proven by a short A/B capture, and pinned non-turbo
-proof captures for any domain where turbo diverges.
-
-When a subsystem breakpoint must be correlated with a running state series,
-use the generic concurrent side-breakpoint controls. Arm it at a state value
-that excludes startup noise and cap the number of side hits when the routine
-is high frequency:
-
-```text
---adapter-argument resume_side_break_segmented=0x1234:0x5678
---adapter-argument resume_side_break_start_value=1
---adapter-argument resume_side_break_max_hits=128
-```
-
-The capture writes `side_breakpoint_trace.json` with registers and the
-correlated state field. Treat a capped trace as a prefix boundary; report the
-cap and do not claim full-route hardware parity from it.
-
-When the breakpoint ABI exposes an address/value register pair, first run the
-generic `dos-re extract-write-trace` command to produce an ordered, masked
-stream and hash. Add device- or target-specific grouping, tick correlation,
-and semantic names in a target-local analyzer.
-
-Read `capture_summary.json` or run `dos-re summarize-capture CAPTURE` before
-opening full register metadata. Load `remote_runtime_registers.json` only when
-the compact counts, hashes, final registers, and checkpoint index are
-insufficient.
-
-Use `dos-re index-checkpoints CAPTURE --artifact FILE` when a repeated
-breakpoint analysis needs ordered whole-file hashes, a fixed artifact slice,
-or selected registers at every `breakpoint_hit-N`. Keep segment arithmetic,
-field names, and subsystem meaning in the target-local analyzer.
+For repeated captures, prefer a versioned `dos-re capture-plan PLAN --out-dir OUT`
+request over another wrapper script. Keep output fresh; use `--dry-run` to review
+the resolved command. `diff-state` requires every field by default;
+`--allow-missing` is a partial diagnostic, not an acceptance result. Read
+[references/capture-recipes.md](references/capture-recipes.md) for batched
+breakpoints, restored input tails, compact indexes and boundary precautions.
 
 When a recovered subsystem has a narrow deterministic ABI, consider a
 controlled hybrid substitution: replace that routine inside a private copy or
@@ -122,13 +73,42 @@ the pristine and substituted runs from the same resumable boundary. Read
 using this method. Treat it as a contract-verification ladder, not as the
 portable deliverable.
 
-For a small deterministic real-mode callback, Unicorn can test candidate
-inputs quickly from a private RAM/register snapshot. Use the optional harness
-`dos_re_harness.unicorn_probe.run_callback` runner, keep fixture setup in the
-target adapter, and compare changed bytes with an independently captured
-DOSBox result. Read [references/unicorn-microprobe.md](references/unicorn-microprobe.md)
-before using it. A passing micro-probe is controlled-call evidence only; it
-does not replace natural execution, device timing, or the acceptance gate.
+For a bounded, device-free real-mode callback, use the optional harness
+`dos_re_harness.unicorn_probe.run_callback` runner for active differential
+experiments. Keep fixture setup in the target adapter. Read
+[references/unicorn-microprobe.md](references/unicorn-microprobe.md) before
+using it.
+
+1. State the competing instruction-level hypotheses and choose inputs that
+   distinguish them. Exercise relevant branch, signedness, overflow and
+   truncation boundaries rather than starting an unrestricted input sweep.
+2. Preserve the required relocated code, callees, tables, globals, segments,
+   registers and stack convention in a qualified private snapshot. Function
+   bytes alone may be insufficient. Distinguish naturally observed inputs from
+   synthetic controls and record any violated or unproven input invariants.
+3. Execute the original code and reconstructed implementation from equivalent
+   initial conditions, restoring the baseline for each independent case.
+   Record inputs, compared fields, completion or trap boundaries, commands
+   and hashes. Report unsupported or partial executions separately.
+4. Compare final state and, where ordering matters, intermediate effects.
+   Final memory equality cannot prove write order or reveal overwritten writes.
+   The runner returns final memory/registers, selected register observations and
+   optional bounded ordered RAM writes; trace mode rejects executed-code-page writes.
+5. Qualify the probe against independent DOSBox-X evidence as described in the
+   reference. Preserve a reproducing regression before one narrow fix, then
+   rerun the affected retained original/native path after integration without
+   importing later oracle state or repairing native outputs.
+
+A passing micro-probe establishes only the tested controlled-call contract.
+Finite sweeps do not prove all executions. Unicorn instruction counts do not
+establish elapsed cycles, PIT/PIC scheduling or IRQ delivery. Device-dependent
+behavior and continuous timing require system-level evidence.
+
+Use `run-plan` for native command receipts, `probe-plan` for versioned CPU fixtures,
+and `evidence-status` for declared dependency freshness and a current ledger.
+Read [the workbench contracts](../../docs/workbench.md) before migrating an
+experiment. Preserve its compared fields, original oracle and eligibility; a
+cache hit or successful process exit does not qualify fidelity.
 
 When an MZ import exposes only a packer or relocation stub, use the harness
 `unpack-mz` command with a pinned `mzexplode` binary. Hash the tool, packed
@@ -264,6 +244,11 @@ For each mismatch:
 7. Run state, temporal frame, and audio validation as applicable.
 
 Do not tune downstream pixels while upstream state still diverges.
+
+During an integration stall, tie each probe campaign to a demonstrated
+continuous divergence or a required shared contract. State which boundary
+advanced or which specific prerequisite was established; additional isolated
+matches alone do not close the retained execution or acceptance gate.
 
 ## Preserve Agent Discipline
 

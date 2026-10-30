@@ -6,18 +6,20 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from .audio import compare_waves, summarize_wave
-from .audit import audit_public_tree
+from .audit import audit_paths, audit_public_tree, audit_staged_tree
 from .backend import diagnose
+from .capture_plan import load_capture_plan
 from .capture_summary import (
     build_capture_summary,
     format_capture_summary_line,
     write_capture_summary,
 )
-from .checkpoint_series import index_checkpoint_series
-from .evidence import write_evidence_manifest
+from .checkpoint_series import CHECKPOINT_FIELDS, index_checkpoint_series
+from .evidence import capture_evidence_inputs, file_record, write_evidence_manifest
 from .frames import write_raw_diff
 from .movie import load_movie, scenario_actions
 from .mzexplode import unpack_mz
@@ -28,6 +30,10 @@ from .state import diff_states, load_state, parse_dump_file
 from .state_tail import build_state_tail_plan, slice_state_input_script
 from .traces import compare_jsonl
 from .write_trace import extract_register_pair_trace
+from .execution import command_run_plan
+from .dependency_graph import command_evidence_status
+from .probe_plan import command_probe_plan
+from .program_index import command_program_index
 
 
 def capture_adapter_replacements(
@@ -93,6 +99,8 @@ def command_parse_state(args: argparse.Namespace) -> int:
 
 def command_diff_state(args: argparse.Namespace) -> int:
     fields = load_schema(args.schema)
+    if not fields:
+        raise ValueError("state comparison requires at least one schema field")
     differences, matches, skipped = diff_states(
         load_state(args.original),
         load_state(args.reimplementation),
@@ -242,6 +250,7 @@ def command_index_checkpoints(args: argparse.Namespace) -> int:
     result = index_checkpoint_series(
         args.capture,
         artifact=args.artifact,
+        field=args.field,
         offset=args.offset,
         length=args.length,
         registers=args.register,
@@ -253,7 +262,13 @@ def command_index_checkpoints(args: argparse.Namespace) -> int:
 
 
 def command_audit_tree(args: argparse.Namespace) -> int:
-    errors = audit_public_tree(args.root, args.max_file_size)
+    if args.staged:
+        errors = audit_staged_tree(args.root, args.max_file_size)
+    elif args.paths_from:
+        paths = args.paths_from.read_text(encoding="utf-8-sig").splitlines()
+        errors = audit_paths(args.root, [path for path in paths if path], args.max_file_size)
+    else:
+        errors = audit_public_tree(args.root, args.max_file_size)
     for error in errors:
         print(f"ERROR {error}")
     if errors:
@@ -279,6 +294,16 @@ def command_unpack_mz(args: argparse.Namespace) -> int:
     )
     print(f"wrote {manifest_path}")
     return 0
+
+
+def command_capture_plan(args: argparse.Namespace) -> int:
+    plan = load_capture_plan(args.plan)
+    return command_capture(argparse.Namespace(
+        project=plan.project, scenario=plan.scenario, out_dir=args.out_dir,
+        movie=plan.movie, input_script=plan.input_script,
+        adapter_argument=[f"{key}={value}" for key, value in plan.adapter_arguments],
+        dry_run=args.dry_run, capture_plan=plan,
+    ))
 
 
 def command_capture(args: argparse.Namespace) -> int:
@@ -337,7 +362,33 @@ def command_capture(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(json.dumps(rendered, indent=2))
         return 0
-    exit_code = subprocess.run(rendered, check=False).returncode
+    out_dir = args.out_dir.resolve()
+    if out_dir.exists() and (not out_dir.is_dir() or any(out_dir.iterdir())):
+        raise ValueError(f"capture output must be a fresh or empty directory: {out_dir}")
+    input_snapshot = capture_evidence_inputs(project, args.scenario, movie_path, input_script_path)
+    plan = getattr(args, "capture_plan", None)
+    if plan is not None:
+        input_snapshot["contracts"]["capture_plan"] = {"path": str(plan.path), "sha256": plan.sha256}
+        input_snapshot["capture_plan"] = plan.record()
+    input_snapshot["adapter_sources"] = []
+    for part in rendered:
+        if Path(part).suffix.lower() in {".py", ".ps1", ".sh"}:
+            candidate = Path(part).resolve()
+            if candidate.is_file():
+                input_snapshot["adapter_sources"].append({**file_record(candidate), "path": str(candidate)})
+    out_dir.mkdir(parents=True, exist_ok=True)
+    began = time.monotonic()
+    execution = {"status": "failed"}
+    try:
+        exit_code = subprocess.run(rendered, check=False).returncode
+        execution["status"] = "completed" if exit_code == 0 else "failed"
+    except OSError as exc:
+        exit_code = 2
+        execution["error"] = str(exc)
+    except KeyboardInterrupt:
+        exit_code = 130
+        execution["status"] = "interrupted"
+    execution["wall_seconds"] = round(time.monotonic() - began, 6)
     manifest_path = write_evidence_manifest(
         project,
         args.scenario,
@@ -346,6 +397,8 @@ def command_capture(args: argparse.Namespace) -> int:
         exit_code,
         input_movie_path=movie_path,
         input_script_path=input_script_path,
+        input_snapshot=input_snapshot,
+        execution=execution,
     )
     print(f"wrote {manifest_path}")
     return exit_code
@@ -532,7 +585,12 @@ def build_parser() -> argparse.ArgumentParser:
     diff.add_argument("--schema", type=Path, required=True)
     diff.add_argument("--original", type=Path, required=True)
     diff.add_argument("--reimplementation", type=Path, required=True)
-    diff.add_argument("--strict", action="store_true")
+    comparison = diff.add_mutually_exclusive_group()
+    comparison.add_argument("--strict", dest="strict", action="store_true",
+                            help="Require every schema field (the default).")
+    comparison.add_argument("--allow-missing", dest="strict", action="store_false",
+                            help="Diagnostic partial comparison; missing fields are reported as skipped.")
+    diff.set_defaults(strict=True)
     diff.set_defaults(func=command_diff_state)
 
     classify = subparsers.add_parser("classify-screen")
@@ -610,11 +668,14 @@ def build_parser() -> argparse.ArgumentParser:
         "index-checkpoints",
         help=(
             "Hash one artifact slice and selected registers across "
-            "breakpoint_hit-N checkpoints."
+            "first or paired-next breakpoint checkpoints."
         ),
     )
     checkpoint_index.add_argument("capture", type=Path)
     checkpoint_index.add_argument("--artifact", required=True)
+    checkpoint_index.add_argument(
+        "--field", choices=CHECKPOINT_FIELDS, default="breakpoint_hit"
+    )
     checkpoint_index.add_argument(
         "--offset", type=lambda value: int(value, 0), default=0
     )
@@ -639,6 +700,9 @@ def build_parser() -> argparse.ArgumentParser:
     audit = subparsers.add_parser("audit-public-tree")
     audit.add_argument("root", type=Path, nargs="?", default=Path("."))
     audit.add_argument("--max-file-size", type=int, default=1_000_000)
+    selection = audit.add_mutually_exclusive_group()
+    selection.add_argument("--staged", action="store_true", help="Audit exact Git index bytes, including private paths.")
+    selection.add_argument("--paths-from", type=Path, help="Audit only relative paths in a UTF-8 newline list.")
     audit.set_defaults(func=command_audit_tree)
 
     unpack = subparsers.add_parser(
@@ -717,6 +781,41 @@ def build_parser() -> argparse.ArgumentParser:
     slice_input.add_argument("--resume-value", type=int, required=True)
     slice_input.add_argument("--manifest", type=Path)
     slice_input.set_defaults(func=command_slice_state_input)
+
+    capture_plan = subparsers.add_parser(
+        "capture-plan", help="Validate and execute a versioned capture request through the existing adapter.",
+    )
+    capture_plan.add_argument("plan", type=Path)
+    capture_plan.add_argument("--out-dir", type=Path, required=True)
+    capture_plan.add_argument("--dry-run", action="store_true")
+    capture_plan.set_defaults(func=command_capture_plan)
+
+    program_index = subparsers.add_parser("program-index", help="Import Ghidra discovery as a mapped-only progress inventory.")
+    program_index.add_argument("index", type=Path)
+    program_index.add_argument("--image", type=Path, required=True)
+    program_index.add_argument("--inventory-out", type=Path, required=True)
+    program_index.set_defaults(func=command_program_index)
+
+    run_plan = subparsers.add_parser("run-plan", help="Execute one declared command with a fresh receipt.")
+    run_plan.add_argument("plan", type=Path)
+    run_plan.add_argument("--out-dir", type=Path, required=True)
+    run_plan.add_argument("--dry-run", action="store_true")
+    run_plan.add_argument("--job", help="Select a named version 2 job.")
+    run_plan.add_argument("--host-profile", type=Path, help="Explicit private tool/environment overrides.")
+    run_plan.set_defaults(func=command_run_plan)
+
+    probe_plan = subparsers.add_parser("probe-plan", help="Run a versioned, device-free CPU experiment.")
+    probe_plan.add_argument("plan", type=Path)
+    probe_plan.add_argument("--out-dir", type=Path, required=True)
+    probe_plan.add_argument("--cache-dir", type=Path)
+    probe_plan.add_argument("--dry-run", action="store_true")
+    probe_plan.set_defaults(func=command_probe_plan)
+
+    evidence_status = subparsers.add_parser("evidence-status", help="Preflight dependencies and generate the current ledger.")
+    evidence_status.add_argument("graph", type=Path)
+    evidence_status.add_argument("--out", type=Path)
+    evidence_status.add_argument("--format", choices=("json", "markdown"), default="json")
+    evidence_status.set_defaults(func=command_evidence_status)
 
     capture = subparsers.add_parser("capture")
     capture.add_argument("project", type=Path)

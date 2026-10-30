@@ -30,3 +30,10 @@ restoration does not restore device state. Even a byte-identical callback
 result is `controlled_imported_snapshot_non_promotable`: it can narrow a
 code-level mismatch, not establish natural campaign or pixel/audio fidelity.
 Keep proprietary snapshots and output in ignored private work directories.
+
+For repeated fixtures use `dos-re probe-plan`; for optional ordered RAM effects,
+use `run_callback` write ranges with a finite cap. Read the
+[workbench contracts](../../../docs/workbench.md) for stack semantics, pre-write
+observations, executed-code-page rejection and cache limits. Keep device
+interpretation outside the shared runner. Reuse qualified fixtures while their
+dependencies match, then rerun the affected retained path after integration.

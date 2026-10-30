@@ -1,5 +1,5 @@
 param(
-    [string]$OutDir = "captures\dosbox\remote-runtime",
+    [string]$OutDir = ".work\captures\dosbox\remote-runtime",
     [Parameter(Mandatory = $true)]
     [ValidatePattern("^[A-Za-z0-9_.-]+$")]
     [string]$Program,
@@ -31,6 +31,8 @@ param(
     [string]$PostResumeBreakSegmented = "",
     [int]$PostResumeBreakHitCount = 1,
     [string]$PostResumeBreakHitSeries = "",
+    [string]$PostResumePairedBreakHitSeries = "",
+    [string]$PostResumePairedMiddleBreakSegmented = "",
     [int]$PostResumeDisplayHistoryCapacity = 0,
     [string[]]$PostResumePoke = @(),
     [string[]]$PostResumePokeFile = @(),
@@ -519,6 +521,8 @@ load_save_state_continue="0"
 load_save_state_paused="0"
 checkpoint_save_state_first="0"
 post_resume_next_break_hit_series="__none__"
+post_resume_paired_break_hit_series="__none__"
+post_resume_paired_middle_break_segmented="__none__"
 checkpoint_screenshot_preserve_memory=()
 checkpoint_displaydump="0"
 display_sequence_frames="0"
@@ -580,6 +584,20 @@ while [ "$#" -gt 0 ]; do
             exit 2
         fi
         post_resume_next_break_hit_series="$2"
+        shift 2
+    elif [ "$1" = "--post-resume-paired-break-hit-series" ]; then
+        if [ "$#" -lt 2 ]; then
+            echo "--post-resume-paired-break-hit-series requires HITS" >&2
+            exit 2
+        fi
+        post_resume_paired_break_hit_series="$2"
+        shift 2
+    elif [ "$1" = "--post-resume-paired-middle-break-segmented" ]; then
+        if [ "$#" -lt 2 ]; then
+            echo "--post-resume-paired-middle-break-segmented requires SEGMENT:OFFSET" >&2
+            exit 2
+        fi
+        post_resume_paired_middle_break_segmented="$2"
         shift 2
     elif [ "$1" = "--checkpoint-screenshot-preserve-memory" ]; then
         if [ "$#" -lt 2 ]; then
@@ -813,9 +831,9 @@ for arg in "$@"; do
         startup_keys+=("$arg")
     fi
 done
-conf="/tmp/${runtime_name}.conf"
-log="/tmp/${runtime_name}.log"
-pidfile="/tmp/${runtime_name}.pid"
+conf="${TMPDIR:-/tmp}/${runtime_name}.conf"
+log="${TMPDIR:-/tmp}/${runtime_name}.log"
+pidfile="${TMPDIR:-/tmp}/${runtime_name}.pid"
 
 if [ ! -x "$dosbox" ]; then
     echo "Missing WSL DOSBox-X remotedebug binary: $dosbox" >&2
@@ -1071,6 +1089,16 @@ fi
 if [ "$post_resume_break_hit_series" != "__none__" ]; then
     controller_args+=(
         --post-resume-break-hit-series "$post_resume_break_hit_series"
+    )
+fi
+if [ "$post_resume_paired_break_hit_series" != "__none__" ]; then
+    controller_args+=(
+        --post-resume-paired-break-hit-series "$post_resume_paired_break_hit_series"
+    )
+fi
+if [ "$post_resume_paired_middle_break_segmented" != "__none__" ]; then
+    controller_args+=(
+        --post-resume-paired-middle-break-segmented "$post_resume_paired_middle_break_segmented"
     )
 fi
 for poke in "${post_resume_poke_specs[@]}"; do
@@ -1541,6 +1569,18 @@ try {
         $backendRuntimeArgs += @(
             "--post-resume-next-break-hit-series",
             $PostResumeNextBreakHitSeries
+        )
+    }
+    if ($PostResumePairedBreakHitSeries.Trim().Length -gt 0) {
+        $backendRuntimeArgs += @(
+            "--post-resume-paired-break-hit-series",
+            $PostResumePairedBreakHitSeries
+        )
+    }
+    if ($PostResumePairedMiddleBreakSegmented.Trim().Length -gt 0) {
+        $backendRuntimeArgs += @(
+            "--post-resume-paired-middle-break-segmented",
+            $PostResumePairedMiddleBreakSegmented
         )
     }
     if ($PostResumeContinue) {

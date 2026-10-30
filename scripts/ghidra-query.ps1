@@ -6,6 +6,7 @@ param(
         "xrefs",
         "functions",
         "programs",
+        "program-index",
         "scalar",
         "instruction-text",
         "memory-range-refs",
@@ -49,6 +50,7 @@ $script = switch ($Query) {
     "xrefs" { "FindFunctionXrefs.java" }
     "functions" { "ListFunctionsStdout.java" }
     "programs" { "ListProgramsStdout.java" }
+    "program-index" { "ExportProgramIndex.java" }
     "scalar" { "FindScalarUsage.java" }
     "instruction-text" { "FindInstructionText.java" }
     "memory-range-refs" { "FindMemoryRangeRefs.java" }

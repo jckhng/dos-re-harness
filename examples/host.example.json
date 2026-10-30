@@ -1,0 +1,7 @@
+{
+  "format_version": 1,
+  "tools": {"python": ["python", "-B"]},
+  "values": {"scratch": "${profile_dir}/runs"},
+  "environment": {},
+  "unset_environment": []
+}

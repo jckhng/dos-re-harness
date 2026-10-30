@@ -7,12 +7,14 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import os
 import select
 import socket
 import struct
 import sys
 import threading
+import tempfile
 import time
 import wave
 import zlib
@@ -21,239 +23,9 @@ from typing import Any, Callable
 
 from .capture_summary import write_capture_summary
 from .schema import Field, load_schema
+from .remote_protocol import QmpClient, RspClient
+from .remote_session import RemoteConnections
 from .screens import ScreenClassifier
-
-
-class RspClient:
-    def __init__(self, host: str, port: int, timeout: float) -> None:
-        deadline = time.time() + timeout
-        last_error: Exception | None = None
-        while time.time() < deadline:
-            try:
-                self.sock = socket.create_connection((host, port), 1.0)
-                break
-            except OSError as exc:
-                last_error = exc
-                time.sleep(0.1)
-        else:
-            raise RuntimeError(f"GDB port {port} did not open: {last_error}")
-        self.sock.settimeout(timeout)
-
-    def close(self) -> None:
-        try:
-            self.packet("D")
-        except Exception:
-            pass
-        self.sock.close()
-
-    @staticmethod
-    def _checksum(payload: str) -> int:
-        return sum(payload.encode("ascii")) & 0xff
-
-    def _recv_packet(self, timeout: float | None = None) -> str:
-        old_timeout = self.sock.gettimeout()
-        if timeout is not None:
-            self.sock.settimeout(timeout)
-        try:
-            data = bytearray()
-            while True:
-                chunk = self.sock.recv(1)
-                if not chunk:
-                    raise RuntimeError("GDB socket closed")
-                if chunk == b"+":
-                    continue
-                if chunk == b"$":
-                    break
-            while True:
-                chunk = self.sock.recv(1)
-                if not chunk:
-                    raise RuntimeError("GDB socket closed")
-                if chunk == b"#":
-                    self.sock.recv(2)
-                    break
-                data.extend(chunk)
-            self.sock.sendall(b"+")
-            return data.decode("ascii", "replace")
-        finally:
-            self.sock.settimeout(old_timeout)
-
-    def packet(self, payload: str) -> str:
-        self.sock.sendall(f"${payload}#{self._checksum(payload):02x}".encode("ascii"))
-        return self._recv_packet()
-
-    def continue_nowait(self) -> None:
-        self.sock.sendall(b"$c#63")
-        ack = self.sock.recv(1)
-        if ack != b"+":
-            raise RuntimeError(f"unexpected continue ACK: {ack!r}")
-
-    def queue_continue(self) -> None:
-        """Queue a continue packet without waiting for its ACK.
-
-        A paused QMP state load may need its hold cleared before the GDB
-        server can service the packet.  Call ``wait_for_continue_ack`` after
-        releasing that hold.
-        """
-        self.sock.sendall(b"$c#63")
-
-    def wait_for_continue_ack(self) -> None:
-        ack = self.sock.recv(1)
-        if ack != b"+":
-            raise RuntimeError(f"unexpected continue ACK: {ack!r}")
-
-    def step_nowait(self) -> None:
-        self.sock.sendall(b"$s#73")
-        ack = self.sock.recv(1)
-        if ack != b"+":
-            raise RuntimeError(f"unexpected step ACK: {ack!r}")
-
-    def wait_for_stop(self, timeout: float) -> str:
-        return self._recv_packet(timeout)
-
-    def halt(self, timeout: float) -> str:
-        readable, _, _ = select.select(
-            [self.sock],
-            [],
-            [],
-            min(timeout, 0.05),
-        )
-        if readable:
-            return self._recv_packet(timeout)
-        self.sock.sendall(b"\x03")
-        return self._recv_packet(timeout)
-
-    def insert_breakpoint(self, linear_address: int, kind: int = 1) -> None:
-        response = self.packet(f"Z0,{linear_address:x},{kind:x}")
-        if response != "OK":
-            raise RuntimeError(
-                "GDB software breakpoint insertion failed at "
-                f"0x{linear_address:x}: {response!r}"
-            )
-
-    def remove_breakpoint(self, linear_address: int, kind: int = 1) -> None:
-        response = self.packet(f"z0,{linear_address:x},{kind:x}")
-        if response != "OK":
-            raise RuntimeError(
-                "GDB software breakpoint removal failed at "
-                f"0x{linear_address:x}: {response!r}"
-            )
-
-    def registers(self) -> dict[str, int]:
-        raw = self.packet("g")
-        names = [
-            "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi",
-            "eip", "eflags", "cs", "ss", "ds", "es", "fs", "gs",
-        ]
-        return {
-            name: struct.unpack("<I", bytes.fromhex(raw[idx * 8:(idx + 1) * 8]))[0]
-            for idx, name in enumerate(names)
-        }
-
-    def write_register(self, name: str, value: int) -> None:
-        names = [
-            "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi",
-            "eip", "eflags", "cs", "ss", "ds", "es", "fs", "gs",
-        ]
-        if name not in names:
-            raise ValueError(f"unsupported register {name!r}")
-        index = names.index(name)
-        encoded = struct.pack("<I", value & 0xFFFFFFFF).hex()
-        response = self.packet(f"P{index:x}={encoded}")
-        if response != "OK":
-            raise RuntimeError(f"GDB register write failed for {name}: {response!r}")
-
-    def write_registers(self, registers: dict[str, int]) -> None:
-        names = [
-            "eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi",
-            "eip", "eflags", "cs", "ss", "ds", "es", "fs", "gs",
-        ]
-        current = self.registers()
-        current.update({name: int(value) for name, value in registers.items() if name in names})
-        if "eip" in registers:
-            cs_base = (current["cs"] & 0xFFFF) << 4
-            eip_linear = int(registers["eip"])
-            eip_offset = eip_linear - cs_base
-            if 0 <= eip_offset <= 0xFFFF:
-                # DOSBox-X remotedebug reports real-mode EIP as a linear
-                # address, but the full-register write packet accepts the
-                # segment-relative IP value.
-                current["eip"] = eip_offset
-        encoded = "".join(struct.pack("<I", current[name] & 0xFFFFFFFF).hex() for name in names)
-        response = self.packet(f"G{encoded}")
-        if response != "OK":
-            raise RuntimeError(f"GDB full register write failed: {response!r}")
-
-    def call_near(self, offset: int, regs: dict[str, int]) -> dict[str, int]:
-        cs = regs["cs"] & 0xFFFF
-        ss = regs["ss"] & 0xFFFF
-        sp = regs["esp"] & 0xFFFF
-        eip_linear = regs["eip"]
-        cs_base = cs << 4
-        current_ip = eip_linear - cs_base
-        if not 0 <= current_ip <= 0xFFFF:
-            current_ip = eip_linear & 0xFFFF
-        new_sp = (sp - 2) & 0xFFFF
-        self.write_memory((ss << 4) + new_sp, struct.pack("<H", current_ip & 0xFFFF))
-        updated = dict(regs)
-        updated["esp"] = (regs["esp"] & 0xFFFF0000) | new_sp
-        updated["eip"] = cs_base + (offset & 0xFFFF)
-        self.write_registers(updated)
-        return updated
-
-    def write_memory(self, address: int, data: bytes) -> None:
-        response = self.packet(f"M{address:x},{len(data):x}:{data.hex()}")
-        if response != "OK":
-            raise RuntimeError(f"GDB memory write failed at 0x{address:x}: {response!r}")
-
-    def read_memory(self, address: int, size: int) -> bytes:
-        if address < 0:
-            raise ValueError("GDB memory read address must be non-negative")
-        if size < 0:
-            raise ValueError("GDB memory read size must be non-negative")
-        if size == 0:
-            return b""
-        response = self.packet(f"m{address:x},{size:x}")
-        if response.startswith("E"):
-            raise RuntimeError(
-                f"GDB memory read failed at 0x{address:x}: {response!r}"
-            )
-        try:
-            data = bytes.fromhex(response)
-        except ValueError as exc:
-            raise RuntimeError(
-                f"GDB memory read returned invalid hex at "
-                f"0x{address:x}: {response!r}"
-            ) from exc
-        if len(data) != size:
-            raise RuntimeError(
-                f"GDB memory read at 0x{address:x} returned "
-                f"{len(data)} bytes, expected {size}"
-            )
-        return data
-
-    def read_memory_chunked(
-        self,
-        address: int,
-        size: int,
-        chunk_size: int = 4096,
-    ) -> bytes:
-        """Read a guest range in RSP-sized chunks.
-
-        Some remotedebug backends can stop servicing QMP ``memdump`` while
-        the guest is halted at a late breakpoint.  RSP remains available for
-        the debugger in that state, so chunking keeps the fallback within the
-        packet size accepted by older GDB stubs.
-        """
-        if chunk_size <= 0:
-            raise ValueError("GDB memory read chunk size must be positive")
-        return b"".join(
-            self.read_memory(address + offset, min(chunk_size, size - offset))
-            for offset in range(0, size, chunk_size)
-        )
-
-    def write_memory_chunked(self, address: int, data: bytes, chunk_size: int = 4096) -> None:
-        for offset in range(0, len(data), chunk_size):
-            self.write_memory(address + offset, data[offset : offset + chunk_size])
 
 
 def pack_segment_offset(segment: int, offset: int) -> int:
@@ -313,6 +85,18 @@ def parse_segmented_breakpoint_series_action(
     pack_segment_offset(segment, offset)
     hits = parse_breakpoint_hit_series(parts[3].replace("+", ","))
     return segment, offset, hits
+
+
+def parse_segmented_breakpoint_pairs_action(action: str) -> tuple[int, int, int, list[int]]:
+    parts = action.split(":")
+    if len(parts) != 5 or parts[0] != "breakpairs":
+        raise ValueError("breakpairs action syntax: breakpairs:<segment>:<entry>:<return>:<hit>+<hit>[+...]")
+    segment, entry, return_offset = (parse_dos_integer(part) for part in parts[1:4])
+    pack_segment_offset(segment, entry)
+    pack_segment_offset(segment, return_offset)
+    if entry == return_offset:
+        raise ValueError("paired breakpoint boundaries must be distinct")
+    return segment, entry, return_offset, parse_breakpoint_hit_series(parts[4].replace("+", ","))
 
 
 def install_running_breakpoint(
@@ -633,6 +417,154 @@ def stop_on_post_resume_breakpoint_series_at_backend_address(
     return final_stop, final_registers
 
 
+def stop_on_post_resume_paired_breakpoint_series(
+    gdb: RspClient,
+    *,
+    entry_address: int,
+    entry_eip: int,
+    return_address: int,
+    return_eip: int,
+    hit_counts: list[int],
+    timeout: float,
+    capture_boundary: Callable[[str, int, str, dict[str, int]], None],
+    middle_address: int | None = None,
+    middle_eip: int | None = None,
+    side_address: int | None = None,
+    side_eip: int | None = None,
+    side_max_hits: int | None = None,
+    capture_side: Callable[[int, int, str, dict[str, int]], None] | None = None,
+) -> tuple[str, dict[str, int]]:
+    """Capture pairs with optional guarded middle and in-pair side stops."""
+    if not hit_counts or any(hit < 1 for hit in hit_counts):
+        raise ValueError("paired breakpoint hits must be nonempty and positive")
+    if any(left >= right for left, right in zip(hit_counts, hit_counts[1:])):
+        raise ValueError("paired breakpoint hits must be strictly increasing")
+    if (middle_address is None) != (middle_eip is None):
+        raise ValueError("middle breakpoint requires both backend address and EIP")
+    if (side_address is None) != (side_eip is None) or (side_address is None) != (capture_side is None):
+        raise ValueError("side breakpoint requires backend address, EIP and capture callback")
+    if side_max_hits is not None and (side_address is None or side_max_hits < 1):
+        raise ValueError("side maximum requires a side breakpoint and positive hit count")
+    addresses = [entry_address, return_address]
+    eips = [entry_eip, return_eip]
+    if middle_address is not None:
+        addresses.append(middle_address)
+        eips.append(middle_eip)
+    if side_address is not None:
+        addresses.append(side_address)
+        eips.append(side_eip)
+    if len(set(addresses)) != len(addresses) or len(set(eips)) != len(eips):
+        raise ValueError("paired breakpoint boundaries must be distinct")
+
+    requested = set(hit_counts)
+    final_hit = hit_counts[-1]
+    armed_addresses: set[int] = set()
+    side_hits = 0
+
+    def arm(address: int) -> None:
+        gdb.insert_breakpoint(address)
+        armed_addresses.add(address)
+
+    def remove(address: int) -> None:
+        gdb.remove_breakpoint(address)
+        armed_addresses.remove(address)
+
+    def wait_for_trap() -> str:
+        stop = gdb.wait_for_stop(timeout)
+        if not stop.startswith(("S05", "T05")):
+            raise RuntimeError(f"paired breakpoint series received unexpected stop: {stop}")
+        return stop
+
+    def step_past_boundary(address: int) -> None:
+        remove(address)
+        gdb.step_nowait()
+        wait_for_trap()
+
+    def validate_boundary(registers: dict[str, int], expected_eip: int, hit: int) -> None:
+        if expected_eip == middle_eip and registers["eip"] == return_eip:
+            raise RuntimeError(f"paired breakpoint series reached return before middle on hit {hit}")
+        if registers["eip"] != expected_eip:
+            raise RuntimeError(
+                "paired breakpoint series stopped at the wrong instruction "
+                f"on hit {hit}: expected 0x{expected_eip:05x}, "
+                f"observed EIP 0x{registers['eip']:05x}"
+            )
+
+    def drain_side_stops(stop: str, registers: dict[str, int], hit: int) -> tuple[str, dict[str, int]]:
+        nonlocal side_hits
+        while side_address in armed_addresses and registers["eip"] == side_eip:
+            side_hits += 1
+            capture_side(hit, side_hits, stop, registers)
+            remove(side_address)
+            if side_max_hits is None or side_hits < side_max_hits:
+                gdb.step_nowait()
+                stop = wait_for_trap()
+                registers = gdb.registers()
+                arm(side_address)
+                if registers["eip"] in (entry_eip, middle_eip, return_eip):
+                    return stop, registers
+            gdb.continue_nowait()
+            stop = wait_for_trap()
+            registers = gdb.registers()
+        return stop, registers
+
+    def stop_at_boundary(expected_eip: int, hit: int) -> tuple[str, dict[str, int]]:
+        gdb.continue_nowait()
+        stop, registers = drain_side_stops(wait_for_trap(), gdb.registers(), hit)
+        validate_boundary(registers, expected_eip, hit)
+        return stop, registers
+
+    try:
+        arm(entry_address)
+        for hit in range(1, final_hit + 1):
+            stop, registers = stop_at_boundary(entry_eip, hit)
+            if hit not in requested:
+                step_past_boundary(entry_address)
+                arm(entry_address)
+                continue
+
+            capture_boundary("paired_entry_hit", hit, stop, registers)
+            # Arm the return before stepping the entry: it may be the next IP.
+            remove(entry_address)
+            arm(return_address)
+            if middle_address is not None:
+                arm(middle_address)
+            if side_address is not None and (side_max_hits is None or side_hits < side_max_hits):
+                arm(side_address)
+            gdb.step_nowait()
+            stop = wait_for_trap()
+            stop, registers = drain_side_stops(stop, gdb.registers(), hit)
+            if middle_address is not None:
+                if registers["eip"] == return_eip:
+                    validate_boundary(registers, middle_eip, hit)
+                if registers["eip"] != middle_eip:
+                    stop, registers = stop_at_boundary(middle_eip, hit)
+                capture_boundary("paired_middle_hit", hit, stop, registers)
+                # Keep the return guard armed while leaving the middle boundary.
+                remove(middle_address)
+                gdb.step_nowait()
+                stop = wait_for_trap()
+                stop, registers = drain_side_stops(stop, gdb.registers(), hit)
+            if registers["eip"] != return_eip:
+                stop, registers = stop_at_boundary(return_eip, hit)
+            capture_boundary("paired_return_hit", hit, stop, registers)
+            if side_address in armed_addresses:
+                remove(side_address)
+            if hit == final_hit:
+                return stop, registers
+
+            step_past_boundary(return_address)
+            arm(entry_address)
+    except BaseException:
+        for address in sorted(armed_addresses):
+            try:
+                gdb.remove_breakpoint(address)
+            except Exception:
+                pass
+        raise
+    raise RuntimeError("paired breakpoint series did not capture its final hit")
+
+
 def stop_on_post_resume_segmented_breakpoint_series(
     gdb: RspClient,
     segment: int,
@@ -799,405 +731,6 @@ def wait_for_qmp_screen(
         "timed out waiting for save-state load readiness screen "
         f"{expected_state!r}; last={last_state!r}"
     )
-
-
-class QmpClient:
-    _memory_fallback: Callable[[int, int], bytes] | None = None
-
-    @classmethod
-    def set_memory_fallback(
-        cls,
-        reader: Callable[[int, int], bytes] | None,
-    ) -> None:
-        cls._memory_fallback = reader
-
-    def __init__(self, host: str, port: int, timeout: float) -> None:
-        deadline = time.time() + timeout
-        last_error: Exception | None = None
-        while time.time() < deadline:
-            try:
-                self.sock = socket.create_connection((host, port), 1.0)
-                break
-            except OSError as exc:
-                last_error = exc
-                time.sleep(0.1)
-        else:
-            raise RuntimeError(f"QMP port {port} did not open: {last_error}")
-        self.sock.settimeout(timeout)
-        self._recv_json()
-        self.command("qmp_capabilities")
-        self.supports_immediate_savestate = False
-        self.supports_loadstate_paused = False
-        try:
-            commands = self.command("query-commands").get("return", [])
-            names = {
-                item.get("name")
-                for item in commands
-                if isinstance(item, dict)
-            }
-            self.supports_immediate_savestate = "savestate-immediate" in names
-            self.supports_loadstate_paused = "loadstate-paused" in names
-        except RuntimeError:
-            # Older backends remain usable through the queued request path.
-            self.supports_immediate_savestate = False
-
-    def close(self) -> None:
-        self.sock.close()
-
-    def _recv_json(self) -> dict[str, Any]:
-        data = bytearray()
-        while True:
-            chunk = self.sock.recv(4096)
-            if not chunk:
-                raise RuntimeError("QMP socket closed")
-            data.extend(chunk)
-            try:
-                return json.loads(data.decode("utf-8"))
-            except json.JSONDecodeError:
-                continue
-
-    def command(
-        self,
-        execute: str,
-        arguments: dict[str, Any] | None = None,
-        timeout: float | None = None,
-        sent_event: threading.Event | None = None,
-    ) -> dict[str, Any]:
-        msg: dict[str, Any] = {"execute": execute}
-        if arguments is not None:
-            msg["arguments"] = arguments
-        previous_timeout = self.sock.gettimeout()
-        if timeout is not None:
-            self.sock.settimeout(timeout)
-        try:
-            self.sock.sendall((json.dumps(msg) + "\n").encode("utf-8"))
-            if sent_event is not None:
-                sent_event.set()
-            response = self._recv_json()
-        finally:
-            if timeout is not None:
-                self.sock.settimeout(previous_timeout)
-        if "error" in response:
-            raise RuntimeError(f"QMP {execute} failed: {response}")
-        return response
-
-    def key_tap(self, qcode: str, hold_seconds: float = 0.15) -> None:
-        self.command(
-            "send-key",
-            {
-                "keys": [{"type": "qcode", "data": qcode}],
-                "hold-time": int(hold_seconds * 1000),
-            },
-        )
-
-    def key_event(self, qcode: str, down: bool) -> None:
-        self.command(
-            "input-send-event",
-            {
-                "events": [
-                    {
-                        "type": "key",
-                        "data": {
-                            "down": down,
-                            "key": {"type": "qcode", "data": qcode},
-                        },
-                    }
-                ]
-            },
-        )
-
-    def key_hold(self, qcode: str, hold_seconds: float) -> None:
-        self.key_event(qcode, True)
-        time.sleep(hold_seconds)
-        self.key_event(qcode, False)
-
-    def key_chord(self, qcodes: list[str], hold_seconds: float = 0.15) -> None:
-        if len(qcodes) < 2:
-            raise ValueError("key chord requires at least two qcodes")
-        for qcode in qcodes:
-            self.key_event(qcode, True)
-        time.sleep(hold_seconds)
-        for qcode in reversed(qcodes):
-            self.key_event(qcode, False)
-
-    def capture_wave(self, start: bool) -> None:
-        self.command("capture-wave-start" if start else "capture-wave-stop")
-
-    def memdump(self, address: int, size: int) -> bytes:
-        try:
-            response = self.command(
-                "memdump",
-                {"address": address, "size": size},
-            )
-        except TimeoutError:
-            fallback = type(self)._memory_fallback
-            if fallback is None:
-                raise
-            data = fallback(address, size)
-            if len(data) != size:
-                raise RuntimeError(
-                    "RSP memory fallback returned an unexpected size: "
-                    f"{len(data)} (expected {size})"
-                )
-            return data
-        payload = response.get("return", {}).get("data")
-        if not isinstance(payload, str):
-            raise RuntimeError(f"QMP memdump did not return base64 data: {response}")
-        return base64.b64decode(payload)
-
-    def memdump_chunked(
-        self,
-        address: int,
-        size: int,
-        chunk_size: int = 4096,
-    ) -> bytes:
-        """Read a guest range as bounded QMP requests.
-
-        Older DOSBox-X remotedebug builds can stop servicing a large QMP
-        ``memdump`` late in a run even though small requests still complete.
-        Keeping the request size bounded also makes the RSP fallback useful:
-        a timeout is isolated to one chunk instead of invalidating the whole
-        checkpoint range.
-        """
-        if chunk_size <= 0:
-            raise ValueError("QMP memory read chunk size must be positive")
-        return b"".join(
-            self.memdump(
-                address + offset,
-                min(chunk_size, size - offset),
-            )
-            for offset in range(0, size, chunk_size)
-        )
-
-    def dacdump(self) -> dict[str, Any]:
-        response = self.command("dacdump")
-        result = response.get("return")
-        if not isinstance(result, dict):
-            raise RuntimeError(f"QMP dacdump did not return an object: {response}")
-        payload = result.get("data")
-        if not isinstance(payload, str):
-            raise RuntimeError(f"QMP dacdump did not return base64 data: {response}")
-        data = base64.b64decode(payload)
-        if len(data) != 256 * 3:
-            raise RuntimeError(
-                "QMP dacdump returned an unexpected palette size: "
-                f"{len(data)}"
-            )
-        return {
-            "data": data,
-            "bits": int(result.get("bits", 0)),
-            "pel_mask": int(result.get("pel_mask", 0)),
-            "pel_index": int(result.get("pel_index", 0)),
-            "state": int(result.get("state", 0)),
-            "write_index": int(result.get("write_index", 0)),
-            "read_index": int(result.get("read_index", 0)),
-            "first_changed": int(result.get("first_changed", 0)),
-        }
-
-    @staticmethod
-    def _decode_display_frame(
-        result: object,
-        command_name: str,
-    ) -> dict[str, Any]:
-        if not isinstance(result, dict):
-            raise RuntimeError(
-                f"QMP {command_name} did not return a frame object: {result}"
-            )
-        payload = result.get("data")
-        if not isinstance(payload, str):
-            raise RuntimeError(
-                f"QMP {command_name} did not return base64 data: {result}"
-            )
-        data = base64.b64decode(payload)
-        encoding = result.get("encoding", "raw")
-        if encoding == "zlib":
-            try:
-                data = zlib.decompress(data)
-            except zlib.error as error:
-                raise RuntimeError(
-                    f"QMP {command_name} returned invalid zlib data"
-                ) from error
-        elif encoding != "raw":
-            raise RuntimeError(
-                f"QMP {command_name} returned unsupported encoding: "
-                f"{encoding}"
-            )
-        width = int(result.get("width", 0))
-        height = int(result.get("height", 0))
-        bpp = int(result.get("bpp", 0))
-        pitch = int(result.get("pitch", 0))
-        if width <= 0 or height <= 0 or bpp <= 0 or pitch <= 0:
-            raise RuntimeError(
-                f"QMP {command_name} returned invalid frame geometry: "
-                f"{width}x{height} bpp={bpp} pitch={pitch}"
-            )
-        expected_size = pitch * height
-        declared_size = int(result.get("size", -1))
-        if len(data) != expected_size or declared_size != expected_size:
-            raise RuntimeError(
-                f"QMP {command_name} returned an unexpected frame size: "
-                f"decoded={len(data)} declared={declared_size} "
-                f"expected={expected_size}"
-            )
-        palette_payload = result.get("palette")
-        palette = None
-        if palette_payload is not None:
-            if not isinstance(palette_payload, str):
-                raise RuntimeError(
-                    f"QMP {command_name} returned invalid palette data"
-                )
-            palette = base64.b64decode(palette_payload)
-            declared_palette_size = int(result.get("palette_size", -1))
-            if len(palette) != 256 * 3 or declared_palette_size != len(palette):
-                raise RuntimeError(
-                    f"QMP {command_name} returned an unexpected palette size: "
-                    f"decoded={len(palette)} declared={declared_palette_size}"
-                )
-        return {
-            "data": data,
-            "palette": palette,
-            "width": width,
-            "height": height,
-            "bpp": bpp,
-            "pitch": pitch,
-            "generation": int(result.get("generation", 0)),
-        }
-
-    def displaydump(self) -> dict[str, Any]:
-        """Return the backend's last completed logical source frame.
-
-        Unlike ``screendump``, this does not ask the running renderer to
-        produce a new host screenshot.  It is therefore safe to use while the
-        guest CPU is halted at an exact debugger boundary.
-        """
-        response = self.command("displaydump")
-        return self._decode_display_frame(
-            response.get("return"),
-            "displaydump",
-        )
-
-    def start_display_history(self, capacity: int) -> dict[str, int]:
-        """Arm bounded completed-frame retention before guest continuation."""
-        if capacity <= 0:
-            raise ValueError("display history capacity must be positive")
-        response = self.command(
-            "displayhistory-start",
-            {"capacity": capacity},
-        )
-        result = response.get("return")
-        if not isinstance(result, dict):
-            raise RuntimeError(
-                "QMP displayhistory-start did not return an object: "
-                f"{response}"
-            )
-        return {
-            "capacity": int(result.get("capacity", 0)),
-            "generation": int(result.get("generation", 0)),
-        }
-
-    def stop_display_history(self) -> dict[str, Any]:
-        """Stop retention and return every retained completed source frame."""
-        response = self.command("displayhistory-stop")
-        result = response.get("return")
-        if not isinstance(result, dict):
-            raise RuntimeError(
-                "QMP displayhistory-stop did not return an object: "
-                f"{response}"
-            )
-        encoded_frames = result.get("frames")
-        if not isinstance(encoded_frames, list):
-            raise RuntimeError(
-                "QMP displayhistory-stop did not return a frame list: "
-                f"{response}"
-            )
-        frames = [
-            self._decode_display_frame(frame, "displayhistory-stop")
-            for frame in encoded_frames
-        ]
-        return {
-            "capacity": int(result.get("capacity", 0)),
-            "dropped": int(result.get("dropped", 0)),
-            "frames": frames,
-        }
-
-    def screendump(self) -> bytes:
-        response = self.command("screendump")
-        payload = response.get("return", {}).get("data")
-        if not isinstance(payload, str):
-            raise RuntimeError(f"QMP screendump did not return base64 data: {response}")
-        data = base64.b64decode(payload)
-        if not data:
-            raise RuntimeError(f"QMP screendump returned an empty payload: {response}")
-        return data
-
-    def save_state(
-        self,
-        path: Path,
-        request_sent: threading.Event | None = None,
-    ) -> Path:
-        response = self.command(
-            "savestate",
-            {"file": str(path)},
-            timeout=35.0,
-            sent_event=request_sent,
-        )
-        returned = response.get("return", {}).get("file")
-        if returned != str(path):
-            raise RuntimeError(
-                "QMP savestate returned an unexpected path: "
-                f"{response}"
-            )
-        return path
-
-    def save_state_immediate(self, path: Path) -> Path:
-        """Save without resuming the emulated CPU.
-
-        This is supported by the pinned remote-debug DOSBox-X backend for
-        halted-boundary capture.  It is deliberately separate from the
-        queued ``savestate`` request, whose servicing requires the emulator
-        main loop to run.
-        """
-        response = self.command(
-            "savestate-immediate",
-            {"file": str(path)},
-            timeout=35.0,
-        )
-        returned = response.get("return", {}).get("file")
-        if returned != str(path):
-            raise RuntimeError(
-                "QMP immediate savestate returned an unexpected path: "
-                f"{response}"
-            )
-        return path
-
-    def load_state(self, path: Path) -> Path:
-        response = self.command(
-            "loadstate",
-            {"file": str(path)},
-            timeout=35.0,
-        )
-        returned = response.get("return", {}).get("file")
-        if returned != str(path):
-            raise RuntimeError(
-                "QMP loadstate returned an unexpected path: "
-                f"{response}"
-            )
-        return path
-
-    def load_state_paused(self, path: Path) -> Path:
-        """Load on the emulation thread and pause before guest execution."""
-        response = self.command(
-            "loadstate-paused",
-            {"file": str(path)},
-            timeout=35.0,
-        )
-        returned = response.get("return", {}).get("file")
-        if returned != str(path):
-            raise RuntimeError(
-                "QMP paused loadstate returned an unexpected path: "
-                f"{response}"
-            )
-        return path
 
 
 def capture_optional_screenshot(
@@ -1617,6 +1150,7 @@ def checkpoint_save_state_target(
         return "resume_final"
     checkpoint_prefixes = (
         "checkpointstate:",
+        "checkpointreturn:",
         "checkpointstatehold:",
         "checkpointstatescript:",
         "checkpointstatescriptfile:",
@@ -1935,6 +1469,10 @@ def write_state_checkpoint(
                         "write_index": dac_dump["write_index"],
                         "read_index": dac_dump["read_index"],
                         "first_changed": dac_dump["first_changed"],
+                        **({"video_timing": dac_dump["video_timing"]}
+                           if "video_timing" in dac_dump else {}),
+                        **({"cpu_timing": dac_dump["cpu_timing"]}
+                           if "cpu_timing" in dac_dump else {}),
                     }
                     if dac_dump is not None
                     else None
@@ -2030,6 +1568,10 @@ def write_vga_dac_sequence_sample(
             "write_index": dac_dump["write_index"],
             "read_index": dac_dump["read_index"],
             "first_changed": dac_dump["first_changed"],
+            **({"video_timing": dac_dump["video_timing"]}
+               if "video_timing" in dac_dump else {}),
+            **({"cpu_timing": dac_dump["cpu_timing"]}
+               if "cpu_timing" in dac_dump else {}),
         },
     }
     if memory_data is not None:
@@ -2084,6 +1626,10 @@ def write_display_dac_sequence_sample(
             "write_index": dac_dump["write_index"],
             "read_index": dac_dump["read_index"],
             "first_changed": dac_dump["first_changed"],
+            **({"video_timing": dac_dump["video_timing"]}
+               if "video_timing" in dac_dump else {}),
+            **({"cpu_timing": dac_dump["cpu_timing"]}
+               if "cpu_timing" in dac_dump else {}),
         },
     }
 
@@ -2285,6 +1831,10 @@ def capture_post_display_screenshot(
                     "write_index": dac["write_index"],
                     "read_index": dac["read_index"],
                     "first_changed": dac["first_changed"],
+                    **({"video_timing": dac["video_timing"]}
+                       if "video_timing" in dac else {}),
+                    **({"cpu_timing": dac["cpu_timing"]}
+                       if "cpu_timing" in dac else {}),
                 },
             }
             post_registers_path = (
@@ -2988,6 +2538,59 @@ def parse_state_checkpoint_action(
     return linear_address, field_name, values, max_hits
 
 
+def _resolve_stack_return_checkpoint(
+    action: str,
+    gdb: RspClient,
+    halted_registers: dict[str, int] | None,
+) -> tuple[tuple[int, str, list[int], int], dict[str, object]]:
+    parts = action.split(":", 4)
+    word_counts = {"near": 1, "far": 2, "iret": 3}
+    if len(parts) != 5 or parts[0] != "checkpointreturn" or parts[1] not in word_counts:
+        raise ValueError(
+            "checkpointreturn action syntax: checkpointreturn:<near|far|iret>:"
+            "<field>:<value>[+<value>...]:<positive-maximum-hit-count>"
+        )
+    _, field_name, values, max_hits = parse_state_checkpoint_action(
+        "checkpointstate:0:" + ":".join(parts[2:])
+    )
+    if halted_registers is None:
+        raise ValueError("checkpointreturn requires a prior halted boundary")
+    registers = gdb.registers()
+    if registers != halted_registers:
+        raise ValueError("checkpointreturn registers changed since the halted boundary")
+    if not all(0 <= registers[name] <= 0xFFFF for name in ("cs", "ss")):
+        raise ValueError("checkpointreturn requires 16-bit real-mode segments")
+
+    return_kind = parts[1]
+    stack_pointer = registers["esp"] & 0xFFFF
+    stack_base = registers["ss"] * 16
+    stack_addresses = [stack_base + ((stack_pointer + index) & 0xFFFF)
+        for index in range(word_counts[return_kind] * 2)]
+    stack_bytes = bytearray()
+    # Read individually so a 16-bit stack wrap does not cross the segment end.
+    for address in stack_addresses:
+        value = gdb.read_memory(address, 1)
+        if len(value) != 1:
+            raise ValueError("checkpointreturn received a short stack read")
+        stack_bytes.extend(value)
+    stack_words = [int.from_bytes(stack_bytes[index:index + 2], "little")
+        for index in range(0, len(stack_bytes), 2)]
+    return_cs = registers["cs"] if return_kind == "near" else stack_words[1]
+    return_ip = stack_words[0]
+    backend_address = pack_segment_offset(return_cs, return_ip)
+    evidence = {
+        "kind": return_kind,
+        "registers": registers,
+        "stack_addresses": stack_addresses,
+        "stack_words": stack_words,
+        "return_cs": return_cs,
+        "return_ip": return_ip,
+        "backend_address": backend_address,
+        "contract": "16_bit_real_mode_stack",
+    }
+    return (backend_address, field_name, values, max_hits), evidence
+
+
 def parse_state_checkpoint_hold_action(
     action: str,
 ) -> tuple[int, str, list[int], int, str, int, int]:
@@ -3665,6 +3268,8 @@ def main() -> int:
              "breakstatesso:<segment>:<offset>:<field-predicate>:<positive-maximum-hit-count>, "
              "checkpointstate:<linear-address>:<field>:<value>[+<value>...]:"
              "<positive-maximum-hit-count>, "
+             "checkpointreturn:<near|far|iret>:<field>:<value>[+<value>...]:"
+             "<positive-maximum-hit-count> (16-bit real-mode halted stack), "
              "checkpointstatehold:<linear-address>:<field>:"
              "<value>[+<value>...]:<positive-maximum-hit-count>:"
              "<qcode>:<press-value>:<release-value>, "
@@ -3681,6 +3286,7 @@ def main() -> int:
              "breakwaithaltedso:<segment>:<offset>, "
              "breakso:<segment>:<offset>, "
             "breaksonth:<segment>:<offset>:<positive-hit-count>, "
+            "breakpairs:<segment>:<entry-offset>:<return-offset>:<hit>+<hit>[+...], "
             "poke:<linear-address>:<hexbytes>, "
             "pokehalted:<linear-address>:<hexbytes>, "
             "writehalted:<linear-address>:<hexbytes>, "
@@ -3820,6 +3426,22 @@ def main() -> int:
             "Capture several strictly increasing positive hits of the first "
             "post-resume breakpoint in one process, for example 1,4,12. "
             "Each hit is written as a nested checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--post-resume-paired-break-hit-series",
+        help=(
+            "Capture selected first-breakpoint ordinals and the next configured "
+            "second boundary after each, for example 1,4,12. Requires a resumed "
+            "checkpoint script and both post-resume breakpoints. Read-only; "
+            "writes separate paired_entry_hit-N and paired_return_hit-N checkpoints."
+        ),
+    )
+    parser.add_argument(
+        "--post-resume-paired-middle-break-segmented",
+        help=(
+            "Optional <segment>:<offset> boundary inside each paired interval. "
+            "Capture paired_middle_hit-N; fail if the return boundary occurs first."
         ),
     )
     parser.add_argument(
@@ -4269,6 +3891,16 @@ def main() -> int:
         if args.post_resume_next_break_hit_series is not None
         else None
     )
+    post_resume_paired_break_hit_series = (
+        parse_breakpoint_hit_series(args.post_resume_paired_break_hit_series)
+        if args.post_resume_paired_break_hit_series is not None
+        else None
+    )
+    post_resume_paired_middle_break_segmented = (
+        parse_segmented_address(args.post_resume_paired_middle_break_segmented)
+        if args.post_resume_paired_middle_break_segmented is not None
+        else None
+    )
     call_near_break_segmented = (
         parse_segmented_address(args.call_near_break_segmented)
         if args.call_near_break_segmented is not None
@@ -4297,6 +3929,21 @@ def main() -> int:
         if args.state_side_break_start_value > 0
         else None
     )
+    for action in args.startup_key:
+        if not action.startswith("breakpairs:"):
+            continue
+        try:
+            segment, entry_offset, return_offset, _ = parse_segmented_breakpoint_pairs_action(action)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if args.checkpoint_screenshot or args.checkpoint_save_state or args.state_side_break_poke:
+            parser.error("breakpairs does not support running screenshots, save states or side pokes")
+        if state_side_break_start_value is not None:
+            parser.error("breakpairs arms the side breakpoint at each requested entry; no state start value")
+        if state_side_break_segmented is not None:
+            side_linear = (state_side_break_segmented[0] << 4) + state_side_break_segmented[1]
+            if side_linear in ((segment << 4) + entry_offset, (segment << 4) + return_offset):
+                parser.error("paired side breakpoint must differ from both boundaries")
     wait_predicates = [parse_state_predicate(spec) for spec in args.wait_state]
     state_fields = load_schema(args.state_schema) if args.state_schema else []
     state_input_metadata: dict[str, str] = {}
@@ -4345,6 +3992,7 @@ def main() -> int:
             # not mutate the restored guest.  Permit it as a safe post-load
             # acceleration path for long deterministic routes.
             "breakseries:",
+            "breakpairs:",
         )
         if args.startup_key and not all(
             key.startswith(load_safe_startup_prefixes)
@@ -4560,6 +4208,45 @@ def main() -> int:
         args.post_resume_break_linear is not None
         or post_resume_break_segmented is not None
     )
+    if (post_resume_paired_middle_break_segmented is not None
+            and post_resume_paired_break_hit_series is None):
+        parser.error("paired middle breakpoint requires --post-resume-paired-break-hit-series")
+    middle_eip = None
+    if post_resume_paired_break_hit_series is not None:
+        if not (args.resume_checkpoint_script and has_post_resume_break
+                and has_post_resume_next_break):
+            parser.error(
+                "--post-resume-paired-break-hit-series requires "
+                "--resume-checkpoint-script and both post-resume breakpoints"
+            )
+        if (post_resume_break_hit_series is not None
+                or post_resume_next_break_hit_series is not None
+                or args.post_resume_break_hit_count != 1
+                or args.post_resume_next_break_hit_count != 1):
+            parser.error("paired breakpoint series cannot use other hit selectors")
+        if (has_post_resume_pokes or args.checkpoint_save_state
+                or args.checkpoint_screenshot
+                or args.post_resume_display_history_capacity > 0
+                or post_display_break is not None):
+            parser.error(
+                "paired breakpoint series cannot use post-resume pokes, "
+                "saves, screenshots, or post-display execution"
+            )
+        entry_eip = ((post_resume_break_segmented[0] << 4)
+                     + post_resume_break_segmented[1]
+                     if post_resume_break_segmented is not None
+                     else args.post_resume_break_linear)
+        return_eip = ((post_resume_next_break_segmented[0] << 4)
+                      + post_resume_next_break_segmented[1]
+                      if post_resume_next_break_segmented is not None
+                      else args.post_resume_next_break_linear)
+        eips = [entry_eip, return_eip]
+        if post_resume_paired_middle_break_segmented is not None:
+            middle_eip = ((post_resume_paired_middle_break_segmented[0] << 4)
+                          + post_resume_paired_middle_break_segmented[1])
+            eips.append(middle_eip)
+        if len(set(eips)) != len(eips):
+            parser.error("paired breakpoint boundaries must be distinct")
     direct_resume_final_poke = (
         has_post_resume_pokes
         and has_post_resume_break
@@ -4672,43 +4359,43 @@ def main() -> int:
             )
         return screen_classifier.classify(raw)
 
-    qmp_load: QmpClient | None = None
-    if args.load_save_state is not None:
-        qmp_load = QmpClient(args.host, args.qmp_port, args.timeout)
-        try:
-            if args.load_save_state_ready_screen is not None:
-                wait_for_qmp_screen(
-                    qmp_load,
-                    screen_classifier,
-                    args.vga_address,
-                    vga_size,
-                    args.load_save_state_ready_screen,
-                    args.load_save_state_ready_timeout,
-                    args.wait_state_interval,
-                )
-            if args.load_save_state_paused:
-                if not qmp_load.supports_loadstate_paused:
-                    raise RuntimeError(
-                        "--load-save-state-paused requires a backend with "
-                        "QMP loadstate-paused support"
+    connections = RemoteConnections(
+        args.host, args.gdb_port, args.qmp_port, args.timeout,
+        rsp_factory=RspClient, qmp_factory=QmpClient,
+    )
+    with connections:
+        qmp_load: QmpClient | None = None
+        if args.load_save_state is not None:
+            qmp_load = connections.open_qmp()
+            try:
+                if args.load_save_state_ready_screen is not None:
+                    wait_for_qmp_screen(
+                        qmp_load,
+                        screen_classifier,
+                        args.vga_address,
+                        vga_size,
+                        args.load_save_state_ready_screen,
+                        args.load_save_state_ready_timeout,
+                        args.wait_state_interval,
                     )
-                qmp_load.load_state_paused(args.load_save_state)
-            else:
-                qmp_load.load_state(args.load_save_state)
-                qmp_load.close()
+                if args.load_save_state_paused:
+                    if not qmp_load.supports_loadstate_paused:
+                        raise RuntimeError(
+                            "--load-save-state-paused requires a backend with "
+                            "QMP loadstate-paused support"
+                        )
+                    qmp_load.load_state_paused(args.load_save_state)
+                else:
+                    qmp_load.load_state(args.load_save_state)
+                    connections.close_qmp(qmp_load)
+                    qmp_load = None
+            except BaseException:
+                connections.close_qmp(qmp_load)
                 qmp_load = None
-        except BaseException:
-            qmp_load.close()
-            qmp_load = None
-            raise
+                raise
 
-    gdb = RspClient(args.host, args.gdb_port, args.timeout)
-    # QMP is the preferred bulk-memory path.  Keep RSP as a fallback for
-    # checkpoints because a halted late DOSBox-X guest can stop answering a
-    # QMP memdump while its GDB stub remains responsive.
-    QmpClient.set_memory_fallback(gdb.read_memory_chunked)
-    wave_capture_active = False
-    try:
+        gdb = connections.open_rsp()
+        wave_capture_active = False
         halted_stop: str | None = None
         halted_regs: dict[str, int] | None = None
         wait_state_match: dict[str, Any] | None = None
@@ -4729,7 +4416,7 @@ def main() -> int:
                     and not args.load_save_state_continue
                 ):
                     qmp_load.command("cont")
-                qmp_load.close()
+                connections.close_qmp(qmp_load)
                 qmp_load = None
             # The remotedebug fork starts halted when a GDB client is attached.
             if args.break_linear is not None and not defer_loaded_state_release:
@@ -4879,6 +4566,12 @@ def main() -> int:
                     "post_resume_next_break_hit_series": (
                         post_resume_next_break_hit_series
                     ),
+                    "post_resume_paired_break_hit_series": (
+                        post_resume_paired_break_hit_series
+                    ),
+                    **({"post_resume_paired_middle_break_segmented":
+                        args.post_resume_paired_middle_break_segmented}
+                       if post_resume_paired_middle_break_segmented is not None else {}),
                     "post_resume_poke": args.post_resume_poke,
                     "post_resume_poke_file": args.post_resume_poke_file,
                     "post_resume_poke_at_final_checkpoint": (
@@ -4922,7 +4615,7 @@ def main() -> int:
         print(f"initial stop: {initial}", flush=True)
         if args.startup_key:
             time.sleep(args.startup_delay)
-            qmp_startup = QmpClient(args.host, args.qmp_port, args.timeout)
+            qmp_startup = connections.open_qmp()
             try:
                 for key in args.startup_key:
                     if key.startswith("wait:"):
@@ -5273,7 +4966,7 @@ def main() -> int:
                             read_script_checkpoint_state,
                             capture_script_checkpoint,
                             transition_script_keys,
-                            False,
+                            halted_stop is not None,
                             (
                                 pack_segment_offset(
                                     *state_side_break_segmented
@@ -5433,6 +5126,7 @@ def main() -> int:
                             read_hold_checkpoint_state,
                             capture_hold_checkpoint,
                             transition_hold_key,
+                            initially_halted=halted_stop is not None,
                         )
                         if args.checkpoint_save_state:
                             (
@@ -5472,13 +5166,20 @@ def main() -> int:
                             flush=True,
                         )
                         continue
-                    if key.startswith("checkpointstate:"):
+                    if key.startswith(("checkpointstate:", "checkpointreturn:")):
+                        stack_return = None
+                        if key.startswith("checkpointreturn:"):
+                            parsed_checkpoint, stack_return = _resolve_stack_return_checkpoint(
+                                key, gdb, halted_regs if halted_stop is not None else None
+                            )
+                        else:
+                            parsed_checkpoint = parse_state_checkpoint_action(key)
                         (
                             linear_address,
                             field_name,
                             values,
                             max_hits,
-                        ) = parse_state_checkpoint_action(key)
+                        ) = parsed_checkpoint
                         if not state_fields:
                             raise ValueError(
                                 "checkpointstate action requires "
@@ -5531,6 +5232,8 @@ def main() -> int:
                                 capture_display=args.checkpoint_displaydump,
                                 capture_screenshot=args.checkpoint_screenshot,
                             )
+                            if stack_return is not None:
+                                record["stack_return"] = stack_return
                             state_checkpoints.append(record)
                             print(
                                 "captured state checkpoint "
@@ -5552,6 +5255,7 @@ def main() -> int:
                             args.timeout,
                             read_checkpoint_state,
                             capture_checkpoint,
+                            initially_halted=halted_stop is not None,
                         )
                         if args.checkpoint_save_state:
                             (
@@ -5798,6 +5502,50 @@ def main() -> int:
                             f"{hit_count}: {halted_stop}",
                             flush=True,
                         )
+                        continue
+                    if key.startswith("breakpairs:"):
+                        segment, entry_offset, return_offset, hit_counts = parse_segmented_breakpoint_pairs_action(key)
+                        if halted_stop is None:
+                            halted_stop = gdb.halt(args.timeout)
+                            halted_regs = gdb.registers()
+                        pair_records: list[dict[str, Any]] = []
+
+                        def capture_startup_pair(field: str, hit: int, pair_stop: str, registers: dict[str, int]) -> None:
+                            state = read_segment_state(gdb, registers[args.dump_segment] & 0xFFFF, state_fields)
+                            record = write_state_checkpoint(
+                                qmp_startup, args.out_dir / "checkpoints", field, hit, pair_stop,
+                                registers, state, hit, args.dump_segment, args.dump_size,
+                                args.dump_low_memory, args.vga_address, vga_size, pgm_header,
+                                capture_vga=not args.omit_checkpoint_vga, capture_dac=True,
+                                capture_display=args.checkpoint_displaydump, capture_screenshot=False,
+                            )
+                            state_checkpoints.append(record)
+                            pair_records.append(record)
+                            print(f"captured startup {field} {hit}", flush=True)
+
+                        def capture_startup_pair_side(pair_hit: int, side_hit: int, side_stop: str, registers: dict[str, int]) -> None:
+                            state_side_breakpoint_records.append(dict(
+                                pair_hit=pair_hit, hit=side_hit, stop=side_stop, registers=registers,
+                                stack=breakpoint_stack_snapshot(gdb, registers), writes=[],
+                                state=read_segment_state(gdb, registers[args.dump_segment] & 0xFFFF, state_fields),
+                            ))
+
+                        halted_stop, halted_regs = stop_on_post_resume_paired_breakpoint_series(
+                            gdb, entry_address=pack_segment_offset(segment, entry_offset),
+                            entry_eip=(segment << 4) + entry_offset,
+                            return_address=pack_segment_offset(segment, return_offset),
+                            return_eip=(segment << 4) + return_offset, hit_counts=hit_counts,
+                            timeout=args.timeout, capture_boundary=capture_startup_pair,
+                            side_address=pack_segment_offset(*state_side_break_segmented) if state_side_break_segmented else None,
+                            side_eip=(state_side_break_segmented[0] << 4) + state_side_break_segmented[1] if state_side_break_segmented else None,
+                            side_max_hits=state_side_break_max_hits,
+                            capture_side=capture_startup_pair_side if state_side_break_segmented else None,
+                        )
+                        break_state_match = {"startup_paired_breakpoint_series": dict(
+                            entry=dict(segment=segment, offset=entry_offset),
+                            return_boundary=dict(segment=segment, offset=return_offset),
+                            hits=hit_counts, checkpoints=pair_records,
+                        )}
                         continue
                     if key.startswith("breakseries:"):
                         segment, offset, hit_counts = (
@@ -6070,7 +5818,7 @@ def main() -> int:
                     print(f"key hold {key} 0.500s", flush=True)
                     time.sleep(0.15)
             finally:
-                qmp_startup.close()
+                connections.close_qmp(qmp_startup)
         if (
             args.poke
             or args.poke_file
@@ -6176,7 +5924,7 @@ def main() -> int:
                 # either that breakpoint or the configured state-input stop.
                 gdb.queue_continue()
                 qmp_load.command("cont")
-                qmp_load.close()
+                connections.close_qmp(qmp_load)
                 qmp_load = None
                 gdb.wait_for_continue_ack()
                 halted_stop = gdb.wait_for_stop(args.timeout)
@@ -6278,18 +6026,14 @@ def main() -> int:
                     # before opening the checkpoint QMP connection because
                     # the pinned backend serves one client at a time.
                     qmp_load.command("cont")
-                    qmp_load.close()
+                    connections.close_qmp(qmp_load)
                     qmp_load = None
                     print(
                         "released paused loaded state for checkpoint "
                         "continuation",
                         flush=True,
                     )
-                qmp_resume = QmpClient(
-                    args.host,
-                    args.qmp_port,
-                    args.timeout,
-                )
+                qmp_resume = connections.open_qmp()
                 try:
                     def read_resumed_checkpoint_state(
                         registers: dict[str, int],
@@ -6524,7 +6268,7 @@ def main() -> int:
                             state_side_break_start_value,
                         )
                 finally:
-                    qmp_resume.close()
+                    connections.close_qmp(qmp_resume)
                 break_state_match = {
                     "linear_address": linear_address,
                     "predicate": f"{field_name}=={values[-1]}",
@@ -6574,11 +6318,7 @@ def main() -> int:
                     ] = poke_writes
                 post_resume_display_history_start = None
                 if args.post_resume_display_history_capacity > 0:
-                    qmp_display_history = QmpClient(
-                        args.host,
-                        args.qmp_port,
-                        args.timeout,
-                    )
+                    qmp_display_history = connections.open_qmp()
                     try:
                         post_resume_display_history_start = (
                             qmp_display_history.start_display_history(
@@ -6586,7 +6326,7 @@ def main() -> int:
                             )
                         )
                     finally:
-                        qmp_display_history.close()
+                        connections.close_qmp(qmp_display_history)
                     print(
                         "armed post-resume completed-display history "
                         f"capacity={args.post_resume_display_history_capacity}",
@@ -6608,13 +6348,81 @@ def main() -> int:
                             args.timeout,
                         )
                         halted_regs = gdb.registers()
-                    if post_resume_break_hit_series is not None:
-                        breakpoint_records: list[dict[str, Any]] = []
-                        qmp_breakpoints = QmpClient(
-                            args.host,
-                            args.qmp_port,
-                            args.timeout,
+                    if post_resume_paired_break_hit_series is not None:
+                        paired_records: list[dict[str, Any]] = []
+                        qmp_pairs = connections.open_qmp()
+
+                        def capture_paired_boundary(
+                            field: str,
+                            hit: int,
+                            stop: str,
+                            registers: dict[str, int],
+                        ) -> None:
+                            record = write_state_checkpoint(
+                                qmp_pairs, args.out_dir / "checkpoints",
+                                field, hit, stop, registers, {"pair_hit": hit}, hit,
+                                args.dump_segment, args.dump_size, args.dump_low_memory,
+                                args.vga_address, vga_size, pgm_header,
+                                capture_vga=not args.omit_checkpoint_vga,
+                                capture_dac=True,
+                                capture_display=args.checkpoint_displaydump,
+                                capture_screenshot=False,
+                            )
+                            state_checkpoints.append(record)
+                            paired_records.append(record)
+                            print(f"captured {field} {hit}", flush=True)
+
+                        entry_address = (
+                            pack_segment_offset(*post_resume_break_segmented)
+                            if post_resume_break_segmented is not None
+                            else args.post_resume_break_linear
                         )
+                        return_address = (
+                            pack_segment_offset(*post_resume_next_break_segmented)
+                            if post_resume_next_break_segmented is not None
+                            else args.post_resume_next_break_linear
+                        )
+                        try:
+                            halted_stop, halted_regs = (
+                                stop_on_post_resume_paired_breakpoint_series(
+                                    gdb, entry_address=entry_address, entry_eip=entry_eip,
+                                    return_address=return_address, return_eip=return_eip,
+                                    middle_address=(
+                                        pack_segment_offset(*post_resume_paired_middle_break_segmented)
+                                        if post_resume_paired_middle_break_segmented is not None
+                                        else None
+                                    ),
+                                    middle_eip=middle_eip,
+                                    hit_counts=post_resume_paired_break_hit_series,
+                                    timeout=args.timeout,
+                                    capture_boundary=capture_paired_boundary,
+                                )
+                            )
+                        finally:
+                            connections.close_qmp(qmp_pairs)
+                        break_state_match["post_resume_paired_breakpoint_series"] = {
+                            "entry": (
+                                {"segment": post_resume_break_segmented[0],
+                                 "offset": post_resume_break_segmented[1]}
+                                if post_resume_break_segmented is not None
+                                else {"linear_address": entry_eip}
+                            ),
+                            "return": (
+                                {"segment": post_resume_next_break_segmented[0],
+                                 "offset": post_resume_next_break_segmented[1]}
+                                if post_resume_next_break_segmented is not None
+                                else {"linear_address": return_eip}
+                            ),
+                            "hits": post_resume_paired_break_hit_series,
+                            "checkpoints": paired_records,
+                            **({"middle": {
+                                "segment": post_resume_paired_middle_break_segmented[0],
+                                "offset": post_resume_paired_middle_break_segmented[1],
+                            }} if post_resume_paired_middle_break_segmented is not None else {}),
+                        }
+                    elif post_resume_break_hit_series is not None:
+                        breakpoint_records: list[dict[str, Any]] = []
+                        qmp_breakpoints = connections.open_qmp()
 
                         def capture_breakpoint_hit(
                             series_hit: int,
@@ -6724,7 +6532,7 @@ def main() -> int:
                                     )
                                 }
                         finally:
-                            qmp_breakpoints.close()
+                            connections.close_qmp(qmp_breakpoints)
                         break_state_match[
                             "post_resume_breakpoint_series"
                         ] = {
@@ -6796,17 +6604,13 @@ def main() -> int:
                                 else args.post_resume_break_linear
                             )
                     if post_resume_display_history_start is not None:
-                        qmp_display_history = QmpClient(
-                            args.host,
-                            args.qmp_port,
-                            args.timeout,
-                        )
+                        qmp_display_history = connections.open_qmp()
                         try:
                             post_resume_display_history = (
                                 qmp_display_history.stop_display_history()
                             )
                         finally:
-                            qmp_display_history.close()
+                            connections.close_qmp(qmp_display_history)
                         history_record = write_display_history(
                             args.out_dir,
                             post_resume_display_history_start,
@@ -6821,17 +6625,14 @@ def main() -> int:
                             f"dropped={history_record['dropped']}",
                             flush=True,
                         )
-                    if has_post_resume_next_break:
+                    if (has_post_resume_next_break
+                            and post_resume_paired_break_hit_series is None):
                         # Preserve the first boundary before advancing to the
                         # configured next breakpoint. This is the reusable
                         # paired-boundary capture path: callers can compare
                         # DS/VGA/DAC state from both entries in one emulator
                         # run instead of aligning separate captures.
-                        qmp_first_boundary = QmpClient(
-                            args.host,
-                            args.qmp_port,
-                            args.timeout,
-                        )
+                        qmp_first_boundary = connections.open_qmp()
                         try:
                             first_boundary_record = write_state_checkpoint(
                                 qmp_first_boundary,
@@ -6854,7 +6655,7 @@ def main() -> int:
                                 capture_screenshot=args.checkpoint_screenshot,
                             )
                         finally:
-                            qmp_first_boundary.close()
+                            connections.close_qmp(qmp_first_boundary)
                         state_checkpoints.append(first_boundary_record)
                         break_state_match[
                             "post_resume_first_checkpoint"
@@ -6923,11 +6724,7 @@ def main() -> int:
                             next_breakpoint_records: list[
                                 dict[str, Any]
                             ] = []
-                            qmp_next_breakpoints = QmpClient(
-                                args.host,
-                                args.qmp_port,
-                                args.timeout,
-                            )
+                            qmp_next_breakpoints = connections.open_qmp()
 
                             def capture_next_breakpoint_hit(
                                 series_hit: int,
@@ -7021,7 +6818,7 @@ def main() -> int:
                                         capture_next_breakpoint_hit,
                                     )
                             finally:
-                                qmp_next_breakpoints.close()
+                                connections.close_qmp(qmp_next_breakpoints)
                             next_metadata = {
                                 **next_address_metadata,
                                 "hits": post_resume_next_break_hit_series,
@@ -7079,11 +6876,7 @@ def main() -> int:
                                 flush=True,
                             )
                         if save_state_target == "post_resume_next":
-                            qmp_save = QmpClient(
-                                args.host,
-                                args.qmp_port,
-                                args.timeout,
-                            )
+                            qmp_save = connections.open_qmp()
                             try:
                                 final_state = read_resumed_checkpoint_state(
                                     halted_regs
@@ -7139,7 +6932,7 @@ def main() -> int:
                                 )
                                 next_metadata["checkpoint"] = save_record
                             finally:
-                                qmp_save.close()
+                                connections.close_qmp(qmp_save)
                             print(
                                 "saved post-resume next-boundary full state",
                                 flush=True,
@@ -7150,11 +6943,7 @@ def main() -> int:
                         # breakpoint or executing another guest instruction.
                         # This preserves a replayable machine state immediately
                         # before the event represented by the next input tick.
-                        qmp_first_boundary = QmpClient(
-                            args.host,
-                            args.qmp_port,
-                            args.timeout,
-                        )
+                        qmp_first_boundary = connections.open_qmp()
                         try:
                             first_boundary_record = write_state_checkpoint(
                                 qmp_first_boundary,
@@ -7229,7 +7018,7 @@ def main() -> int:
                                 flush=True,
                             )
                         finally:
-                            qmp_first_boundary.close()
+                            connections.close_qmp(qmp_first_boundary)
                     elif (
                         args.post_resume_continue_after_poke
                         or args.post_resume_continue
@@ -7279,11 +7068,7 @@ def main() -> int:
                             "final resumed save-state has no checkpoint"
                         )
                     final_record = state_checkpoints[-1]
-                    qmp_final = QmpClient(
-                        args.host,
-                        args.qmp_port,
-                        args.timeout,
-                    )
+                    qmp_final = connections.open_qmp()
                     try:
                         (
                             halted_stop,
@@ -7308,7 +7093,7 @@ def main() -> int:
                             "resume_final_checkpoint"
                         ] = final_record
                     finally:
-                        qmp_final.close()
+                        connections.close_qmp(qmp_final)
                     print(
                         "saved final resumed checkpoint full state",
                         flush=True,
@@ -7319,7 +7104,7 @@ def main() -> int:
                     and bool(args.post_restore_key)
                 )
                 if pre_resume_restore_keys:
-                    qmp_post_restore = QmpClient(args.host, args.qmp_port, args.timeout)
+                    qmp_post_restore = connections.open_qmp()
                     try:
                         wave_capture_active = run_simple_key_actions(
                             qmp_post_restore,
@@ -7328,7 +7113,7 @@ def main() -> int:
                             gdb,
                         )
                     finally:
-                        qmp_post_restore.close()
+                        connections.close_qmp(qmp_post_restore)
                 gdb.continue_nowait()
                 if wait_predicates:
                     # A restored state starts with a synthetic GDB stop. Once
@@ -7338,7 +7123,7 @@ def main() -> int:
                     halted_stop = None
                     halted_regs = None
                 if args.post_restore_key and not pre_resume_restore_keys:
-                    qmp_post_restore = QmpClient(args.host, args.qmp_port, args.timeout)
+                    qmp_post_restore = connections.open_qmp()
                     try:
                         wave_capture_active = run_simple_key_actions(
                             qmp_post_restore,
@@ -7347,7 +7132,7 @@ def main() -> int:
                             gdb,
                         )
                     finally:
-                        qmp_post_restore.close()
+                        connections.close_qmp(qmp_post_restore)
 
         if halted_regs is not None:
             pass
@@ -7362,7 +7147,7 @@ def main() -> int:
                 flush=True,
             )
             gdb.continue_nowait()
-            qmp_wait = QmpClient(args.host, args.qmp_port, args.timeout)
+            qmp_wait = connections.open_qmp()
             deadline = time.time() + args.wait_state_timeout
             poll_count = 0
             last_state: dict[str, int] = {}
@@ -7422,7 +7207,7 @@ def main() -> int:
                         f"last failures: {'; '.join(last_failures)}"
                     )
             finally:
-                qmp_wait.close()
+                connections.close_qmp(qmp_wait)
         else:
             time.sleep(args.delay)
             halted_stop = gdb.halt(args.timeout)
@@ -7434,7 +7219,7 @@ def main() -> int:
                 parser.error("--post-wait-key requires --wait-state")
             gdb.continue_nowait()
             post_wait_continued = True
-            qmp_post_wait = QmpClient(args.host, args.qmp_port, args.timeout)
+            qmp_post_wait = connections.open_qmp()
             try:
                 wave_capture_active = run_simple_key_actions(
                     qmp_post_wait,
@@ -7443,7 +7228,7 @@ def main() -> int:
                     gdb,
                 )
             finally:
-                qmp_post_wait.close()
+                connections.close_qmp(qmp_post_wait)
             print(
                 f"queued {len(args.post_wait_key)} post-wait key action(s)",
                 flush=True,
@@ -7466,17 +7251,19 @@ def main() -> int:
                 raise RuntimeError(
                     "state-input post-resume breakpoint has no halted boundary"
                 )
-            qmp_post_resume = QmpClient(
-                args.host,
-                args.qmp_port,
-                args.timeout,
-            )
+            qmp_post_resume = connections.open_qmp()
 
             def capture_state_input_breakpoint(
                 series_hit: int,
                 series_stop: str,
                 series_registers: dict[str, int],
             ) -> None:
+                if args.checkpoint_save_state and not getattr(
+                    qmp_post_resume, "supports_immediate_savestate", False
+                ):
+                    raise RuntimeError(
+                        "post-resume per-hit savestate requires immediate halted save"
+                    )
                 segment = series_registers[args.dump_segment] & 0xFFFF
                 series_state = read_segment_state(
                     gdb,
@@ -7504,6 +7291,20 @@ def main() -> int:
                     capture_screenshot=args.checkpoint_screenshot,
                 )
                 state_checkpoints.append(record)
+
+                if args.checkpoint_save_state:
+                    finalize_halted_checkpoint_save_state(
+                        qmp_post_resume,
+                        gdb,
+                        pack_segment_offset(*post_resume_break_segmented)
+                        if post_resume_break_segmented is not None
+                        else args.post_resume_break_linear,
+                        record,
+                        args.timeout,
+                        lambda _registers: read_segment_state(
+                            gdb, segment, state_fields
+                        ),
+                    )
 
             try:
                 if post_resume_break_hit_series is not None:
@@ -7554,7 +7355,7 @@ def main() -> int:
                         args.timeout,
                     )
             finally:
-                qmp_post_resume.close()
+                connections.close_qmp(qmp_post_resume)
             break_state_match = {
                 "linear_address": (
                     args.post_resume_break_linear
@@ -7630,7 +7431,7 @@ def main() -> int:
                 active_breakpoint_linear = None
             if not post_wait_continued:
                 gdb.continue_nowait()
-            qmp_sequence = QmpClient(args.host, args.qmp_port, args.timeout)
+            qmp_sequence = connections.open_qmp()
             try:
                 for index in range(args.vga_sequence_frames):
                     target = sequence_start + index * args.vga_sequence_interval
@@ -7747,7 +7548,7 @@ def main() -> int:
                     )):
                         break
             finally:
-                qmp_sequence.close()
+                connections.close_qmp(qmp_sequence)
             halted_stop = gdb.halt(args.timeout)
             halted_regs = gdb.registers()
             sequence_manifest = args.out_dir / "vga_sequence.json"
@@ -7797,7 +7598,7 @@ def main() -> int:
                 active_breakpoint_linear = None
             if not post_wait_continued:
                 gdb.continue_nowait()
-            qmp_sequence = QmpClient(args.host, args.qmp_port, args.timeout)
+            qmp_sequence = connections.open_qmp()
             try:
                 for index in range(args.display_sequence_frames):
                     target = (
@@ -7866,7 +7667,7 @@ def main() -> int:
                     previous_dac = dac_data
                     previous_generation = generation
             finally:
-                qmp_sequence.close()
+                connections.close_qmp(qmp_sequence)
             halted_stop = gdb.halt(args.timeout)
             halted_regs = gdb.registers()
             sequence_manifest = args.out_dir / "display_sequence.json"
@@ -7932,7 +7733,7 @@ def main() -> int:
         regs = halted_regs
         if stop is None or regs is None:
             raise RuntimeError("internal error: final capture was not halted")
-        qmp = QmpClient(args.host, args.qmp_port, args.timeout)
+        qmp = connections.open_qmp()
         if save_state_target == "state_input_stop":
             if args.state_input_stop_value is None:
                 raise RuntimeError(
@@ -8150,13 +7951,7 @@ def main() -> int:
         if screenshot_path:
             print(f"wrote {screenshot_path}", flush=True)
         return 0
-    finally:
-        QmpClient.set_memory_fallback(None)
-        gdb.close()
-        if qmp_load is not None:
-            qmp_load.close()
-        if "qmp" in locals():
-            qmp.close()
+
 
 
 if __name__ == "__main__":

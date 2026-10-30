@@ -1,0 +1,13 @@
+{
+  "format_version": 2,
+  "jobs": {
+    "smoke": {
+      "command": ["python", "-c", "print('harness-ready')"],
+      "cwd": "${plan_dir}/..",
+      "timeout_seconds": 30,
+      "dependencies_complete": false,
+      "expected_exit_code": 0,
+      "expected_stdout": ["harness-ready"]
+    }
+  }
+}

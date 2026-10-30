@@ -40,6 +40,7 @@ Do not run concurrent queries against the same project even in read-only mode.
 | `instructions` | start address, end address | Dump disassembly with function ownership |
 | `xrefs` | one or more addresses | List references to addresses |
 | `functions` | none | Inventory functions |
+| `program-index` | fresh JSON output path | Export functions, calls, references and address spaces; no validation credit |
 | `programs` | none | Inventory project programs |
 | `scalar` | one or more numeric values | Find decoded immediate operands |
 | `instruction-text` | one or more text fragments | Search rendered instruction text |

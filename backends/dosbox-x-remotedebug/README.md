@@ -65,3 +65,28 @@ Later `-Build` invocations use incremental `make`; pass `-Reconfigure` with
 The current proven build runs inside WSL2. This is an execution adapter, not a
 requirement that projects, Ghidra databases, reimplementations, or captures
 live inside WSL.
+
+## Host build qualification
+
+A locked source/patch pair does not make a compiled backend portable between
+Linux distributions. Record the binary hash, compiler flags, ABI and runtime
+libraries for each build. Select the intended WSL distribution explicitly;
+keep its name, installed tool paths and private dependency prefixes in local
+profiles/build records under `.work`, rather than changing global WSL defaults.
+
+The debug build requires matching curses development files. An SDL2 headless
+validation build uses `--enable-sdl2 --disable-sdl --enable-debug=heavy
+--enable-remotedebug`. `--disable-avcodec` removes optional FFmpeg linkage when
+video encoding is outside the tested scope; it does not qualify that feature.
+
+For the tested 32-bit x86 GCC profile, pass `-msse2 -D_FILE_OFFSET_BITS=64`
+through both compiler commands before any system headers are included. This upstream revision includes
+`sys/stat.h` before `config.h`, so its generated large-file definition alone is
+too late. Without the command-line definition, large Windows-filesystem inode
+numbers can produce `EOVERFLOW` and make an existing mount directory appear
+missing. Use libraries matching the selected compiler ABI.
+
+Validate a new binary with synthetic DOS code before using it with target
+captures. Compare paused-load registers, selected RAM, indexed pixels/palette
+and ordered protocol requests. Existing game captures retain their own backend
+identity; a new host build does not automatically qualify their replay.

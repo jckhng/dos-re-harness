@@ -1,4 +1,4 @@
-"""Stable indexes for artifacts captured at breakpoint_hit-N checkpoints."""
+"""Stable indexes for artifacts captured at first or paired-next checkpoints."""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
+CHECKPOINT_FIELDS = ("breakpoint_hit", "next_breakpoint_hit",
+                     "paired_entry_hit", "paired_middle_hit", "paired_return_hit")
 CHECKPOINT_PATTERN = re.compile(r"^breakpoint_hit-(\d+)$")
 REGISTER_METADATA_NAME = "remote_runtime_registers.json"
 SUMMARY_NAME = "capture_summary.json"
@@ -26,7 +28,7 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _declared_hits(capture: Path) -> list[int] | None:
+def _declared_hits(capture: Path, field: str) -> list[int] | None:
     summary_path = capture / SUMMARY_NAME
     if not summary_path.is_file():
         return None
@@ -34,9 +36,16 @@ def _declared_hits(capture: Path) -> list[int] | None:
     break_state = document.get("break_state")
     if not isinstance(break_state, dict):
         return None
-    series = break_state.get("post_resume_breakpoint_series")
-    if not isinstance(series, dict):
-        series = break_state.get("startup_breakpoint_series")
+    if field in {"paired_entry_hit", "paired_middle_hit", "paired_return_hit"}:
+        series = break_state.get("post_resume_paired_breakpoint_series")
+        if not isinstance(series, dict):
+            series = break_state.get("startup_paired_breakpoint_series")
+    elif field == "next_breakpoint_hit":
+        series = break_state.get("post_resume_next_breakpoint")
+    else:
+        series = break_state.get("post_resume_breakpoint_series")
+        if not isinstance(series, dict):
+            series = break_state.get("startup_breakpoint_series")
     if not isinstance(series, dict):
         return None
     hits = series.get("hits")
@@ -45,18 +54,20 @@ def _declared_hits(capture: Path) -> list[int] | None:
     return [int(hit) for hit in hits]
 
 
-def _checkpoint_paths(capture: Path) -> list[tuple[int, Path]]:
+def _checkpoint_paths(capture: Path, field: str) -> list[tuple[int, Path]]:
     checkpoint_root = capture / "checkpoints"
+    pattern = (CHECKPOINT_PATTERN if field == "breakpoint_hit" else
+               re.compile(rf"^{re.escape(field)}-(\d+)$"))
     paths: list[tuple[int, Path]] = []
     if checkpoint_root.is_dir():
         for path in checkpoint_root.iterdir():
-            match = CHECKPOINT_PATTERN.fullmatch(path.name)
+            match = pattern.fullmatch(path.name)
             if path.is_dir() and match:
                 paths.append((int(match.group(1)), path))
     paths.sort(key=lambda item: item[0])
     if not paths:
         raise ValueError(
-            f"{capture}: no checkpoints/breakpoint_hit-N directories found"
+            f"{capture}: no checkpoints/{field}-N directories found"
         )
     hits = [hit for hit, _ in paths]
     if len(hits) != len(set(hits)):
@@ -68,6 +79,7 @@ def index_checkpoint_series(
     capture: Path,
     *,
     artifact: str,
+    field: str = "breakpoint_hit",
     offset: int = 0,
     length: int | None = None,
     registers: Iterable[str] = (),
@@ -77,6 +89,8 @@ def index_checkpoint_series(
     """Index and hash one artifact slice across breakpoint checkpoints."""
 
     capture = capture.resolve()
+    if field not in CHECKPOINT_FIELDS:
+        raise ValueError(f"unsupported checkpoint field: {field}")
     if offset < 0:
         raise ValueError("artifact slice offset must not be negative")
     if length is not None and length < 0:
@@ -85,9 +99,9 @@ def index_checkpoint_series(
     if artifact_path.is_absolute() or ".." in artifact_path.parts:
         raise ValueError("artifact must be a checkpoint-relative path")
     register_names = list(dict.fromkeys(str(name) for name in registers))
-    paths = _checkpoint_paths(capture)
+    paths = _checkpoint_paths(capture, field)
     hits = [hit for hit, _ in paths]
-    declared_hits = _declared_hits(capture)
+    declared_hits = _declared_hits(capture, field)
     if expected_hits is not None and expected_hit_count is not None:
         raise ValueError(
             "expected_hits and expected_hit_count are mutually exclusive"
@@ -161,6 +175,7 @@ def index_checkpoint_series(
     return {
         "format_version": 1,
         "capture": str(capture),
+        "checkpoint_field": field,
         "artifact": artifact_path.as_posix(),
         "slice": {"offset": offset, "length": length},
         "register_names": register_names,
