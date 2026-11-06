@@ -1,5 +1,11 @@
 # Capture recipes and boundary checks
 
+For protected-mode targets, use the shared
+[descriptor and breakpoint helpers](../../../docs/protected-mode-addressing.md).
+Keep loader discovery and active-selector validation target-local. Never use
+`selector << 4` for a protected-mode memory address or pack a 32-bit EIP into the
+pinned DOSBox-X 16:16 breakpoint interface without checking its range.
+
 Read when configuring repeated breakpoints, restored input tails or checkpoint
 comparisons. Keep target addresses and decoding in the target adapter.
 

@@ -1,5 +1,10 @@
 # Harness improvement plan
 
+Latest bounded round: [Capture tooling and onboarding audit, 2026-11-06](reuse-audit-2026-11-06.md).
+Delivered shared checked x86 addressing/breakpoint helpers and a DOSBox-X-first
+getting-started path. Experimental timing/mixer work remains deferred with
+explicit qualification requirements.
+
 Preserve existing target adapters and evidence while reducing the work needed
 to translate, integrate and qualify another DOS program. Existing TD3 acceptance
 criteria remain unchanged. This is an incremental migration, not a rewrite.

@@ -1,7 +1,7 @@
 # Detailed usage reference
 
 Commands run from the repository root. This preserves the detailed setup and
-Paku Paku examples; start with the [quickstart](../README.md).
+Paku Paku examples; start with the [getting-started guide](getting-started.md).
 
 State-gated original-binary capture and differential validation for DOS
 software reimplementations.

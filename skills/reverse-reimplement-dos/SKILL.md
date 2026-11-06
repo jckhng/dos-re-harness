@@ -27,6 +27,13 @@ runtime evidence confirms them.
 
 Do not mix evidence from different binary versions.
 
+Use **DOSBox-X** for DOS original execution. For harness captures, use the pinned,
+patched backend documented in `backends/dosbox-x-remotedebug/README.md`. Do not
+fall back to classic DOSBox, DOSBox Staging or stock DOSBox-X when remote capture
+capabilities are required. Inspect existing backend configuration first; if it is
+missing, resolve setup explicitly. Start new users with
+[the getting-started guide](../../docs/getting-started.md), not the full command reference.
+
 ## Plan Translation and Integration
 
 Read [references/translation-workflow.md](references/translation-workflow.md)

@@ -16,6 +16,8 @@ import zlib
 from pathlib import Path
 from typing import Any, Callable
 
+from .x86_address import pack_segment_offset
+
 
 _MAX_PIC_OBSERVER_EVENTS = 8192
 
@@ -136,7 +138,20 @@ class RspClient:
         self.sock.sendall(b"\x03")
         return self._recv_packet(timeout)
 
+    def insert_segmented_breakpoint(self, segment: int, offset: int, kind: int = 1) -> None:
+        """Insert a checked 16:16 breakpoint for the pinned backend."""
+        self.insert_breakpoint(pack_segment_offset(segment, offset), kind)
+
+    def remove_segmented_breakpoint(self, segment: int, offset: int, kind: int = 1) -> None:
+        """Remove a breakpoint using the same checked components as insertion."""
+        self.remove_breakpoint(pack_segment_offset(segment, offset), kind)
+
     def insert_breakpoint(self, linear_address: int, kind: int = 1) -> None:
+        """Send a backend-encoded address (historical argument name retained).
+
+        The pinned DOSBox-X Z0 API interprets this as packed segment:offset,
+        not an arbitrary physical address. Prefer insert_segmented_breakpoint.
+        """
         breakpoints = getattr(self, "_software_breakpoints", set())
         key = (linear_address, kind)
         if key in breakpoints:

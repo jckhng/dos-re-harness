@@ -26,14 +26,7 @@ from .schema import Field, load_schema
 from .remote_protocol import QmpClient, RspClient
 from .remote_session import RemoteConnections
 from .screens import ScreenClassifier
-
-
-def pack_segment_offset(segment: int, offset: int) -> int:
-    if not 0 <= segment <= 0xFFFF:
-        raise ValueError(f"breakpoint segment is outside 16-bit range: {segment}")
-    if not 0 <= offset <= 0xFFFF:
-        raise ValueError(f"breakpoint offset is outside 16-bit range: {offset}")
-    return (segment << 16) | offset
+from .x86_address import pack_segment_offset
 
 
 def parse_dos_integer(spec: str) -> int:
