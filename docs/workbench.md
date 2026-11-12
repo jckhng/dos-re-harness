@@ -4,6 +4,10 @@ These commands extend existing capture/comparison tools without changing target
 acceptance. Keep original files, RAM, plans with private paths and outputs under
 ignored `.work`. Process success, current file identities and fidelity are separate.
 
+For ordered regression batches, bounded divergence context, passive event logs,
+clock/lifecycle contracts and evidence-domain summaries, see the
+[investigation workflow](investigation-workflow.md).
+
 ## Tests and publication audit
 
 ```powershell

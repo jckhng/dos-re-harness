@@ -28,7 +28,8 @@ from .schema import load_schema
 from .screens import ScreenClassifier
 from .state import diff_states, load_state, parse_dump_file
 from .state_tail import build_state_tail_plan, slice_state_input_script
-from .traces import compare_jsonl
+from .traces import compare_jsonl, write_trace_context
+from .observations import command_diff_observations, command_import_observations
 from .write_trace import extract_register_pair_trace
 from .execution import command_run_plan
 from .dependency_graph import command_evidence_status
@@ -154,6 +155,11 @@ def command_doctor(args: argparse.Namespace) -> int:
 
 
 def command_diff_trace(args: argparse.Namespace) -> int:
+    if getattr(args, 'out_dir', None):
+        report = write_trace_context(args.original, args.reimplementation, args.out_dir,
+                                     before=args.before, after=args.after)
+        print(json.dumps(report, indent=2))
+        return 0 if report['exact'] else 1
     row_count, difference = compare_jsonl(args.original, args.reimplementation)
     if difference is None:
         print(f"TRACE_MATCH rows={row_count}")
@@ -607,7 +613,29 @@ def build_parser() -> argparse.ArgumentParser:
     trace.add_argument("original", type=Path)
     trace.add_argument("reimplementation", type=Path)
     trace.add_argument("--max-fields", type=int, default=20)
+    trace.add_argument("--out-dir", type=Path, help="Retain bounded first-difference context in a fresh directory.")
+    trace.add_argument("--before", type=int, default=8)
+    trace.add_argument("--after", type=int, default=4)
     trace.set_defaults(func=command_diff_trace)
+
+    observations = subparsers.add_parser('diff-observations', help='Compare clock-explicit events and lifecycle boundaries.')
+    observations.add_argument('original', type=Path)
+    observations.add_argument('reimplementation', type=Path)
+    observations.add_argument('--out-dir', type=Path, required=True)
+    observations.add_argument('--before', type=int, default=8)
+    observations.add_argument('--after', type=int, default=4)
+    observations.set_defaults(func=command_diff_observations)
+
+    imported = subparsers.add_parser('import-observations', help='Import a completed bounded passive backend observation log.')
+    imported.add_argument('raw', type=Path)
+    imported.add_argument('--backend', type=Path, required=True)
+    imported.add_argument('--observer-plan', type=Path, required=True)
+    imported.add_argument('--out-dir', type=Path, required=True)
+    imported.add_argument('--execution', choices=('component', 'controlled', 'natural'), required=True)
+    imported.add_argument('--supplied', action='append', default=[])
+    imported.add_argument('--initial-owner', action='append', default=[])
+    imported.add_argument('--final-owner', action='append', default=[])
+    imported.set_defaults(func=command_import_observations)
 
     frame = subparsers.add_parser("diff-frame")
     frame.add_argument("--expected", type=Path, required=True)
@@ -800,7 +828,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_plan.add_argument("plan", type=Path)
     run_plan.add_argument("--out-dir", type=Path, required=True)
     run_plan.add_argument("--dry-run", action="store_true")
-    run_plan.add_argument("--job", help="Select a named version 2 job.")
+    jobs = run_plan.add_mutually_exclusive_group()
+    jobs.add_argument("--job", help="Select a named version 2 job.")
+    jobs.add_argument("--all-jobs", action='store_true', help="Run version 2 jobs in order, stopping on unmet expectations.")
     run_plan.add_argument("--host-profile", type=Path, help="Explicit private tool/environment overrides.")
     run_plan.set_defaults(func=command_run_plan)
 

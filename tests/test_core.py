@@ -4417,7 +4417,8 @@ class HarnessContractTests(unittest.TestCase):
             )
             self.assertEqual(
                 document["backend"]["patch"]["sha256"],
-                "4784225ddfeae06a4042aeefff0518005eabfb4de6733554e5dd45fb2795e36f",
+                hashlib.sha256((TOOLKIT_ROOT / "backends" / "dosbox-x-remotedebug"
+                                / "dosbox-x-remotedebug.patch").read_bytes()).hexdigest(),
             )
             self.assertEqual(
                 document["capture"]["configuration"]["machine"],

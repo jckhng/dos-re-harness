@@ -31,10 +31,19 @@ index f19ffc88a..642017bd8 100644
  #endif
 -
 diff --git a/include/qmp.h b/include/qmp.h
-index 0aff5d957..22818175a 100644
+index 0aff5d957..df3a071dc 100644
 --- a/include/qmp.h
 +++ b/include/qmp.h
-@@ -47,11 +47,14 @@ enum class QMPInputEventType {
+@@ -23,6 +23,8 @@
+ 
+ #if C_REMOTEDEBUG
+ 
++#include <initializer_list>
++#include <utility>
+ #include <string>
+ #include <vector>
+ #include <map>
+@@ -47,11 +49,14 @@ enum class QMPInputEventType {
      KeyRelease,
      MouseButtonPress,
      MouseButtonRelease,
@@ -50,7 +59,7 @@ index 0aff5d957..22818175a 100644
      union {
          KBD_KEYS key;        // For keyboard events
          uint8_t button;      // For mouse button events
-@@ -74,6 +77,12 @@ public:
+@@ -74,6 +79,12 @@ public:
      // Process pending input events (called from main thread)
      void process_pending_input_events();
  
@@ -63,7 +72,7 @@ index 0aff5d957..22818175a 100644
  private:
      int port;
      int server_fd, client_fd;
-@@ -106,9 +115,15 @@ private:
+@@ -106,9 +117,15 @@ private:
      void handle_input_send_event(const std::string& cmd);
      void handle_query_commands();
      void handle_memdump(const std::string& cmd);
@@ -80,7 +89,7 @@ index 0aff5d957..22818175a 100644
      void handle_stop();
      void handle_cont();
      void handle_system_reset(const std::string& cmd);
-@@ -131,6 +146,11 @@ void QMP_StartServer(int port);
+@@ -131,6 +148,14 @@ void QMP_StartServer(int port);
  void QMP_StopServer();
  bool QMP_IsServerRunning();
  void QMP_ProcessPendingInputEvents();
@@ -89,9 +98,208 @@ index 0aff5d957..22818175a 100644
 +                                uint32_t instruction_offset,
 +                                uint32_t ds_base);
 +uint64_t QMP_GetGuestStateInputValue();
++void QMP_ObserveInstruction(uint32_t pc);
++void QMP_ObserveEvent(const char *name, std::initializer_list<std::pair<const char *, uint64_t>> values);
++void QMP_ObservePort(uint16_t port, uint32_t value, unsigned width);
  
  #endif /* C_REMOTEDEBUG */
  
+diff --git a/include/qmp_observations.h b/include/qmp_observations.h
+new file mode 100644
+index 000000000..eb5611d46
+--- /dev/null
++++ b/include/qmp_observations.h
+@@ -0,0 +1,190 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#ifndef DOS_RE_QMP_OBSERVATIONS_H
++#define DOS_RE_QMP_OBSERVATIONS_H
++
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
++#include <cstdint>
++#include <fstream>
++#include <initializer_list>
++#include <map>
++#include <set>
++#include <sstream>
++#include <stdexcept>
++#include <string>
++#include <utility>
++
++// Main-emulation-thread observer. It never requests a guest stop or writes RAM.
++class QmpObservations {
++public:
++    using Values = std::initializer_list<std::pair<const char *, uint64_t>>;
++
++    QmpObservations(const char *plan, const char *output) {
++        std::ifstream input(plan);
++        std::string line;
++        if (!std::getline(input, line) || trim(line) != "dos-re-observer-v1") {
++            throw std::runtime_error("invalid observer plan header");
++        }
++        bool have_start = false, have_stop = false, have_limit = false;
++        while (std::getline(input, line)) {
++            line = trim(line);
++            if (line.empty() || line[0] == '#') { continue; }
++            std::istringstream row(line);
++            std::string command, value, extra;
++            row >> command >> value;
++            if (command == "probe") {
++                Probe probe;
++                if (!(row >> probe.phase >> probe.owner >> probe.boundary) || row >> extra
++                        || (probe.phase != "point" && probe.phase != "enter" && probe.phase != "leave")
++                        || !token(probe.owner) || !token(probe.boundary) || probes_.size() >= max_probes) {
++                    throw std::runtime_error("invalid observer probe");
++                }
++                if (!probes_.emplace(number(value, UINT32_MAX), probe).second) {
++                    throw std::runtime_error("duplicate observer probe");
++                }
++                continue;
++            }
++            if (value.empty() || row >> extra) { throw std::runtime_error("invalid observer plan row"); }
++            if (command == "start" && !have_start) {
++                start_ = static_cast<uint32_t>(number(value, UINT32_MAX));
++                have_start = true;
++            } else if (command == "stop" && !have_stop) {
++                stop_ = static_cast<uint32_t>(number(value, UINT32_MAX));
++                have_stop = true;
++            } else if (command == "limit" && !have_limit) {
++                limit_ = number(value, max_events);
++                have_limit = true;
++            } else if (command == "port") {
++                if (ports_.size() >= max_ports || !ports_.insert(static_cast<uint16_t>(number(value, UINT16_MAX))).second) {
++                    throw std::runtime_error("invalid observer port");
++                }
++            } else if (command == "event" && allowed_events().count(value)) {
++                if (!events_.insert(value).second) { throw std::runtime_error("duplicate observer event"); }
++            } else {
++                throw std::runtime_error("unknown or duplicate observer plan setting");
++            }
++        }
++        if (!input.eof() || !have_start || !have_stop || !have_limit || !limit_ || start_ == stop_) {
++            throw std::runtime_error("observer requires distinct start/stop and a positive limit");
++        }
++        file_ = fopen(output, "wx");
++        if (!file_) { throw std::runtime_error("observer output must be fresh and writable"); }
++        write("{\"format_version\":1,\"observer\":\"dos-re-observer-v1\",\"clocks\":{"
++              "\"pic_ns\":{\"rate_numerator\":1000000000,\"rate_denominator\":1},"
++              "\"instruction_boundary\":null}}\n");
++    }
++
++    ~QmpObservations() { if (file_) { fclose(file_); } }
++    QmpObservations(const QmpObservations&) = delete;
++    QmpObservations& operator=(const QmpObservations&) = delete;
++
++    void instruction(uint32_t pc, uint64_t pic_ns) {
++        if (finished_) { return; }
++        if (!active_) {
++            if (pc != start_) { return; }
++            active_ = true;
++        }
++        ++instructions_;
++        const auto found = probes_.find(pc);
++        if (found != probes_.end()) {
++            emit(found->second, pic_ns, {{"linear_pc", pc}});
++        }
++        if (pc == stop_) {
++            std::ostringstream row;
++            row << "{\"complete\":" << (overflow_ ? "false" : "true")
++                << ",\"end_clocks\":" << clocks(pic_ns) << "}\n";
++            write(row.str());
++            active_ = false;
++            finished_ = true;
++        }
++    }
++
++    void event(const char *name, uint64_t pic_ns, Values values) {
++        if (active_ && events_.count(name)) { emit({"point", "device", name}, pic_ns, values); }
++    }
++
++    void port(uint16_t port, uint32_t value, unsigned width, uint64_t pic_ns) {
++        if (active_ && ports_.count(port)) {
++            emit({"point", "io", "port-write-attempt"}, pic_ns,
++                 {{"port", port}, {"value", value}, {"width", width}});
++        }
++    }
++
++private:
++    struct Probe { std::string phase, owner, boundary; };
++    static constexpr unsigned max_probes = 64, max_ports = 64, max_events = 1000000;
++
++    static const std::set<std::string>& allowed_events() {
++        static const std::set<std::string> names{
++            "irq-dispatch", "interrupt-return-attempt", "dma-read-request", "dma-write-request", "display-complete"};
++        return names;
++    }
++
++    static std::string trim(const std::string& text) {
++        const auto begin = text.find_first_not_of(" \t\r\n");
++        if (begin == std::string::npos) { return {}; }
++        return text.substr(begin, text.find_last_not_of(" \t\r\n") - begin + 1);
++    }
++
++    static bool token(const std::string& text) {
++        return !text.empty() && text.size() <= 64
++            && text.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") == std::string::npos;
++    }
++
++    static uint64_t number(const std::string& text, uint64_t maximum) {
++        if (text.empty() || text[0] == '-' || text[0] == '+') { throw std::runtime_error("invalid observer integer"); }
++        char *end = nullptr;
++        errno = 0;
++        const auto value = strtoull(text.c_str(), &end, 0);
++        if (errno || end == text.c_str() || *end || value > maximum) {
++            throw std::runtime_error("observer integer out of range");
++        }
++        return value;
++    }
++
++    std::string clocks(uint64_t pic_ns) const {
++        std::ostringstream row;
++        row << "{\"pic_ns\":{\"epoch\":0,\"tick\":" << pic_ns
++            << "},\"instruction_boundary\":{\"epoch\":0,\"tick\":" << instructions_ << "}}";
++        return row.str();
++    }
++
++    void emit(const Probe& probe, uint64_t pic_ns, Values values) {
++        if (overflow_) { return; }
++        if (count_ == limit_) {
++            write("{\"overflow\":true}\n");
++            overflow_ = true;
++            return;
++        }
++        std::ostringstream row;
++        row << "{\"sequence\":" << count_++ << ",\"boundary\":\"" << probe.boundary
++            << "\",\"phase\":\"" << probe.phase << "\",\"owner\":\"" << probe.owner
++            << "\",\"clocks\":" << clocks(pic_ns) << ",\"state\":{";
++        bool first = true;
++        for (const auto& value : values) {
++            if (!token(value.first)) { throw std::runtime_error("invalid observer field"); }
++            if (!first) { row << ','; }
++            row << '"' << value.first << "\":" << value.second;
++            first = false;
++        }
++        row << "}}\n";
++        write(row.str());
++    }
++
++    void write(const std::string& text) {
++        if (fwrite(text.data(), 1, text.size(), file_) != text.size() || fflush(file_)) {
++            throw std::runtime_error("observer output write failed");
++        }
++    }
++
++    std::map<uint32_t, Probe> probes_;
++    std::set<uint16_t> ports_;
++    std::set<std::string> events_;
++    uint32_t start_ = 0, stop_ = 0;
++    uint64_t limit_ = 0, count_ = 0, instructions_ = 0;
++    bool active_ = false, finished_ = false, overflow_ = false;
++    FILE *file_ = nullptr;
++};
++
++#endif
 diff --git a/include/render.h b/include/render.h
 index 84aefeec7..11f6da1d2 100644
 --- a/include/render.h
@@ -225,10 +433,18 @@ index 67bd6886c..408c56de3 100644
  
  		/* Simple core optimizes for non-paged linear memory access and can break (segfault) if beyond end of memory */
 diff --git a/src/cpu/cpu.cpp b/src/cpu/cpu.cpp
-index 1fa6f50fa..2fa2e0416 100644
+index 1fa6f50fa..fc028edf0 100644
 --- a/src/cpu/cpu.cpp
 +++ b/src/cpu/cpu.cpp
-@@ -1134,6 +1134,7 @@ bool has_printed_triple_fault = false;
+@@ -22,6 +22,7 @@
+ #include <stddef.h>
+ 
+ #include "cpu.h"
++#include "qmp.h"
+ #include "debug.h"
+ #include "mapper.h"
+ #include "paging.h"
+@@ -1134,6 +1135,7 @@ bool has_printed_triple_fault = false;
  bool always_report_double_fault = false;
  bool always_report_triple_fault = false;
  
@@ -236,6 +452,16 @@ index 1fa6f50fa..2fa2e0416 100644
  void On_Software_CPU_Reset();
  
  void CPU_Exception(Bitu which,Bitu error ) {
+@@ -1505,6 +1507,9 @@ do_interrupt:
+  *      Make sure this code emulates that bug. Some buggy games might rely on that. */
+ 
+ void CPU_IRET(bool use32,uint32_t oldeip) {
++#if C_REMOTEDEBUG
++    QMP_ObserveEvent("interrupt-return-attempt", {{"use32", use32}, {"old_eip", oldeip}});
++#endif
+ 	uint32_t orig_esp = reg_esp;
+ 
+ 	/* x86 CPUs consider IRET the completion of an NMI, no matter where it happens */
 diff --git a/src/debug/debug.cpp b/src/debug/debug.cpp
 index 431b82a8a..9d37f5bc5 100644
 --- a/src/debug/debug.cpp
@@ -269,10 +495,10 @@ index 431b82a8a..9d37f5bc5 100644
       uint16_t off = address;
       DEBUG_ShowMsg("Removing Breakpoint %x:%x", seg, off);
 diff --git a/src/debug/qmp.cpp b/src/debug/qmp.cpp
-index 0570082b4..32a88dbc8 100644
+index 0570082b4..f75c8f28b 100644
 --- a/src/debug/qmp.cpp
 +++ b/src/debug/qmp.cpp
-@@ -27,13 +27,25 @@
+@@ -27,13 +27,28 @@
  #include <algorithm>
  #include <fstream>
  #include <sstream>
@@ -280,6 +506,9 @@ index 0570082b4..32a88dbc8 100644
 +#include <cstdio>
 +#include <cstdlib>
  #include "qmp.h"
++#include "qmp_observations.h"
++#include <memory>
++#include <cmath>
  #include "logging.h"
  #include "debug.h"
  #include "hardware.h"
@@ -298,7 +527,7 @@ index 0570082b4..32a88dbc8 100644
  
  // Base64 encoding table
  static const char base64_chars[] =
-@@ -296,7 +308,7 @@ void QMPServer::setup_socket() {
+@@ -296,7 +311,7 @@ void QMPServer::setup_socket() {
      }
  
      address.sin_family = AF_INET;
@@ -307,7 +536,7 @@ index 0570082b4..32a88dbc8 100644
      address.sin_port = htons(port);
  
      if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-@@ -411,12 +423,28 @@ void QMPServer::process_command(const std::string& cmd) {
+@@ -411,12 +426,28 @@ void QMPServer::process_command(const std::string& cmd) {
          handle_query_commands();
      } else if (execute == "memdump") {
          handle_memdump(cmd);
@@ -336,7 +565,7 @@ index 0570082b4..32a88dbc8 100644
      } else if (execute == "stop") {
          handle_stop();
      } else if (execute == "cont") {
-@@ -450,9 +478,17 @@ void QMPServer::handle_query_commands() {
+@@ -450,9 +481,17 @@ void QMPServer::handle_query_commands() {
          "{\"name\": \"query-commands\"},"
          "{\"name\": \"query-status\"},"
          "{\"name\": \"memdump\"},"
@@ -354,7 +583,7 @@ index 0570082b4..32a88dbc8 100644
          "{\"name\": \"stop\"},"
          "{\"name\": \"cont\"},"
          "{\"name\": \"system_reset\"},"
-@@ -461,6 +497,41 @@ void QMPServer::handle_query_commands() {
+@@ -461,6 +500,41 @@ void QMPServer::handle_query_commands() {
      send_response(response);
  }
  
@@ -396,7 +625,7 @@ index 0570082b4..32a88dbc8 100644
  void QMPServer::queue_input_event(const QMPInputEvent& event) {
      std::lock_guard<std::mutex> lock(input_queue_mutex);
      input_queue.push(event);
-@@ -469,6 +540,7 @@ void QMPServer::queue_input_event(const QMPInputEvent& event) {
+@@ -469,6 +543,7 @@ void QMPServer::queue_input_event(const QMPInputEvent& event) {
  void QMPServer::process_pending_input_events() {
      // Process all queued events - this runs on the main thread
      std::queue<QMPInputEvent> events_to_process;
@@ -404,7 +633,7 @@ index 0570082b4..32a88dbc8 100644
  
      {
          std::lock_guard<std::mutex> lock(input_queue_mutex);
-@@ -476,7 +548,14 @@ void QMPServer::process_pending_input_events() {
+@@ -476,7 +551,14 @@ void QMPServer::process_pending_input_events() {
      }
  
      while (!events_to_process.empty()) {
@@ -420,7 +649,7 @@ index 0570082b4..32a88dbc8 100644
  
          switch (event.type) {
              case QMPInputEventType::KeyPress:
-@@ -494,10 +573,528 @@ void QMPServer::process_pending_input_events() {
+@@ -494,12 +576,530 @@ void QMPServer::process_pending_input_events() {
              case QMPInputEventType::MouseMove:
                  Mouse_CursorMoved(event.move.x, event.move.y, 0, 0, true);
                  break;
@@ -440,9 +669,9 @@ index 0570082b4..32a88dbc8 100644
 +            input_queue.push(delayed_events.front());
 +            delayed_events.pop();
 +        }
-+    }
-+}
-+
+     }
+ }
+ 
 +bool QMPServer::process_guest_state_input(uint32_t linear_pc,
 +                                          uint32_t instruction_offset,
 +                                          uint32_t ds_base) {
@@ -937,7 +1166,7 @@ index 0570082b4..32a88dbc8 100644
 +            "State input: stopped at state %llu on linear 0x%08X",
 +            static_cast<unsigned long long>(state),
 +            linear_pc);
-     }
++    }
 +    return queued_input;
 +}
 +
@@ -947,10 +1176,12 @@ index 0570082b4..32a88dbc8 100644
 +                       : QMPInputEventType::CaptureWaveStop;
 +    queue_input_event(event);
 +    send_success();
- }
- 
++}
++
  void QMPServer::handle_send_key(const std::string& cmd) {
-@@ -541,6 +1138,7 @@ void QMPServer::handle_send_key(const std::string& cmd) {
+     // Extract hold-time (default 100ms per QEMU spec)
+     // Note: hold-time is now handled by queuing press and release events
+@@ -541,6 +1141,7 @@ void QMPServer::handle_send_key(const std::string& cmd) {
      for (auto it = kbd_keys.rbegin(); it != kbd_keys.rend(); ++it) {
          QMPInputEvent event;
          event.type = QMPInputEventType::KeyRelease;
@@ -958,7 +1189,7 @@ index 0570082b4..32a88dbc8 100644
          event.key = *it;
          queue_input_event(event);
      }
-@@ -733,6 +1331,120 @@ void QMPServer::handle_memdump(const std::string& cmd) {
+@@ -733,6 +1334,120 @@ void QMPServer::handle_memdump(const std::string& cmd) {
      send_response(response.str());
  }
  
@@ -1079,7 +1310,7 @@ index 0570082b4..32a88dbc8 100644
  void QMPServer::handle_screendump(const std::string& cmd) {
      // Extract optional file argument
      std::string args_str = extract_string(cmd, "arguments");
-@@ -885,7 +1597,7 @@ void QMPServer::handle_savestate(const std::string& cmd) {
+@@ -885,7 +1600,7 @@ void QMPServer::handle_savestate(const std::string& cmd) {
      }
  }
  
@@ -1088,7 +1319,7 @@ index 0570082b4..32a88dbc8 100644
      // Extract file argument (required)
      std::string args_str = extract_string(cmd, "arguments");
      if (args_str.empty()) {
-@@ -920,7 +1632,11 @@ void QMPServer::handle_loadstate(const std::string& cmd) {
+@@ -920,7 +1635,11 @@ void QMPServer::handle_loadstate(const std::string& cmd) {
      check.close();
  
      // Request load state (async, processed by main thread)
@@ -1101,7 +1332,7 @@ index 0570082b4..32a88dbc8 100644
  
      // Wait for completion with timeout
      const int timeout_ms = 30000;  // 30 second timeout for load
-@@ -981,6 +1697,7 @@ void QMPServer::handle_stop() {
+@@ -981,6 +1700,7 @@ void QMPServer::handle_stop() {
  
  void QMPServer::handle_cont() {
      // Resume the emulator
@@ -1109,7 +1340,7 @@ index 0570082b4..32a88dbc8 100644
      if (!EMULATOR_IsPaused()) {
          // Already running - return success anyway for idempotency
          send_success();
-@@ -1124,4 +1841,27 @@ void QMP_ProcessPendingInputEvents() {
+@@ -1124,4 +1844,68 @@ void QMP_ProcessPendingInputEvents() {
      }
  }
  
@@ -1125,9 +1356,50 @@ index 0570082b4..32a88dbc8 100644
 +    return uses_ds;
 +}
 +
++
++namespace {
++QmpObservations *guest_observer() {
++    static const auto observer = []() -> std::unique_ptr<QmpObservations> {
++        const char *plan = getenv("DOS_RE_HARNESS_OBSERVER_PLAN");
++        const char *output = getenv("DOS_RE_HARNESS_OBSERVER_OUTPUT");
++        if ((!plan || !*plan) && (!output || !*output)) { return nullptr; }
++        if (!plan || !*plan || !output || !*output) {
++            throw std::runtime_error("observer plan and output must be supplied together");
++        }
++        return std::unique_ptr<QmpObservations>(new QmpObservations(plan, output));
++    }();
++    return observer.get();
++}
++uint64_t observer_pic_ns() {
++    return static_cast<uint64_t>(std::max(0.0L, std::floor(PIC_FullIndex() * 1000000.0L)));
++}
++}
++
++void QMP_ObserveInstruction(uint32_t pc) {
++    try {
++        auto *observer = guest_observer();
++        if (observer) { observer->instruction(pc, observer_pic_ns()); }
++    } catch (const std::exception& error) { E_Exit("DOS_RE_HARNESS observer: %s", error.what()); }
++}
++
++void QMP_ObserveEvent(const char *name, std::initializer_list<std::pair<const char *, uint64_t>> values) {
++    try {
++        auto *observer = guest_observer();
++        if (observer) { observer->event(name, observer_pic_ns(), values); }
++    } catch (const std::exception& error) { E_Exit("DOS_RE_HARNESS observer: %s", error.what()); }
++}
++
++void QMP_ObservePort(uint16_t port, uint32_t value, unsigned width) {
++    try {
++        auto *observer = guest_observer();
++        if (observer) { observer->port(port, value, width, observer_pic_ns()); }
++    } catch (const std::exception& error) { E_Exit("DOS_RE_HARNESS observer: %s", error.what()); }
++}
++
 +bool QMP_ProcessGuestStateInput(uint32_t linear_pc,
 +                                uint32_t instruction_offset,
 +                                uint32_t ds_base) {
++    QMP_ObserveInstruction(linear_pc);
 +    return QMPServer::process_guest_state_input(linear_pc, instruction_offset,
 +                                                ds_base);
 +}
@@ -1155,10 +1427,10 @@ index ad04ace82..4e2924773 100644
              EMULATOR_CheckPendingControl();
              // Process pending QMP input events (keyboard, mouse) - thread-safe queue
 diff --git a/src/gui/render.cpp b/src/gui/render.cpp
-index 59cde983e..133a0d9a3 100644
+index 59cde983e..809f7ce11 100644
 --- a/src/gui/render.cpp
 +++ b/src/gui/render.cpp
-@@ -21,6 +21,9 @@
+@@ -21,9 +21,13 @@
  #include <assert.h>
  #include <math.h>
  #include <fstream>
@@ -1168,7 +1440,11 @@ index 59cde983e..133a0d9a3 100644
  #include <sstream>
  
  #include "dosbox.h"
-@@ -61,6 +64,13 @@ int                                     aspect_ratio_y = 0;
++#include "qmp.h"
+ #include "logging.h"
+ #include "video.h"
+ #include "render.h"
+@@ -61,6 +65,13 @@ int                                     aspect_ratio_y = 0;
  Bitu                                    last_gfx_flags = 0;
  ScalerLineHandler_t                     RENDER_DrawLine;
  
@@ -1182,7 +1458,7 @@ index 59cde983e..133a0d9a3 100644
  uint32_t                                GFX_palette32bpp[256] = {0};
  
  unsigned int                            GFX_GetBShift();
-@@ -400,6 +410,38 @@ void RENDER_EndUpdate( bool abort ) {
+@@ -400,6 +411,41 @@ void RENDER_EndUpdate( bool abort ) {
      if (!abort && render.active && RENDER_DrawLine == RENDER_ClearCacheHandler)
          render.scale.clearCache = false;
  
@@ -1208,6 +1484,9 @@ index 59cde983e..133a0d9a3 100644
 +        completed_source_frame.bpp = render.src.bpp;
 +        completed_source_frame.pitch = render.scale.cachePitch;
 +        ++completed_source_frame.generation;
++#if C_REMOTEDEBUG
++        QMP_ObserveEvent("display-complete", {{"generation", completed_source_frame.generation}});
++#endif
 +        if (completed_source_frame_history_enabled) {
 +            if (completed_source_frame_history.size() >=
 +                completed_source_frame_history_capacity) {
@@ -1221,7 +1500,7 @@ index 59cde983e..133a0d9a3 100644
      RENDER_DrawLine = RENDER_EmptyLineHandler;
      if (GCC_UNLIKELY(CaptureState & (CAPTURE_IMAGE|CAPTURE_VIDEO))) {
          Bitu pitch, flags;
-@@ -443,6 +485,40 @@ void RENDER_EndUpdate( bool abort ) {
+@@ -443,6 +489,40 @@ void RENDER_EndUpdate( bool abort ) {
      }
  }
  
@@ -1378,8 +1657,112 @@ index 3d739c92d..761eb1d8b 100644
  	if (adlib_force_timer_overflow_on_polling) {
  		/* detect end of polling loop by whether it writes */
  		last_poll = PIC_FullIndex();
+diff --git a/src/hardware/dma.cpp b/src/hardware/dma.cpp
+index 57b9ff77f..38c06363f 100644
+--- a/src/hardware/dma.cpp
++++ b/src/hardware/dma.cpp
+@@ -19,6 +19,7 @@
+ #include <assert.h>
+ #include <string.h>
+ #include "dosbox.h"
++#include "qmp.h"
+ #include "logging.h"
+ #include "mem.h"
+ #include "inout.h"
+@@ -440,6 +441,9 @@ DmaChannel::DmaChannel(uint8_t num, bool dma16) {
+ }
+ 
+ Bitu DmaChannel::Read(Bitu want, uint8_t * buffer) {
++#if C_REMOTEDEBUG
++    QMP_ObserveEvent("dma-read-request", {{"channel", channum}, {"requested", want}});
++#endif
+ 	Bitu done=0;
+ 	curraddr &= dma_wrapping;
+ 
+@@ -556,6 +560,9 @@ Bitu DmaChannel::Read(Bitu want, uint8_t * buffer) {
+ }
+ 
+ Bitu DmaChannel::Write(Bitu want, uint8_t * buffer) {
++#if C_REMOTEDEBUG
++    QMP_ObserveEvent("dma-write-request", {{"channel", channum}, {"requested", want}});
++#endif
+ 	Bitu done=0;
+ 	curraddr &= dma_wrapping;
+ 
+diff --git a/src/hardware/iohandler.cpp b/src/hardware/iohandler.cpp
+index 34222c434..5fbcf4a6d 100644
+--- a/src/hardware/iohandler.cpp
++++ b/src/hardware/iohandler.cpp
+@@ -20,6 +20,7 @@
+ #include <string.h>
+ #include "control.h"
+ #include "dosbox.h"
++#include "qmp.h"
+ #include "inout.h"
+ #include "logging.h"
+ #include "setup.h"
+@@ -491,6 +492,9 @@ void log_io(Bitu width, bool write, Bitu port, Bitu val) {
+ 
+ 
+ void IO_WriteB(Bitu port,uint8_t val) {
++#if C_REMOTEDEBUG
++    QMP_ObservePort(static_cast<uint16_t>(port), val, 1);
++#endif
+ 	log_io(0, true, port, val);
+ 	if (GCC_UNLIKELY(GETFLAG(VM) && (CPU_IO_Exception(port,1)))) {
+ 		CPU_ForceV86FakeIO_Out(port,val,1);
+@@ -502,6 +506,9 @@ void IO_WriteB(Bitu port,uint8_t val) {
+ }
+ 
+ void IO_WriteW(Bitu port,uint16_t val) {
++#if C_REMOTEDEBUG
++    QMP_ObservePort(static_cast<uint16_t>(port), val, 2);
++#endif
+ 	log_io(1, true, port, val);
+ 	if (GCC_UNLIKELY(GETFLAG(VM) && (CPU_IO_Exception(port,2)))) {
+ 		CPU_ForceV86FakeIO_Out(port,val,2);
+@@ -513,6 +520,9 @@ void IO_WriteW(Bitu port,uint16_t val) {
+ }
+ 
+ void IO_WriteD(Bitu port,uint32_t val) {
++#if C_REMOTEDEBUG
++    QMP_ObservePort(static_cast<uint16_t>(port), val, 4);
++#endif
+ 	log_io(2, true, port, val);
+ 	if (GCC_UNLIKELY(GETFLAG(VM) && (CPU_IO_Exception(port,4)))) {
+ 		CPU_ForceV86FakeIO_Out(port,val,4);
+diff --git a/src/hardware/pic.cpp b/src/hardware/pic.cpp
+index d199b7e44..786724df3 100644
+--- a/src/hardware/pic.cpp
++++ b/src/hardware/pic.cpp
+@@ -19,6 +19,7 @@
+ #include <assert.h>
+ 
+ #include "dosbox.h"
++#include "qmp.h"
+ #include "inout.h"
+ #include "cpu.h"
+ #include "callback.h"
+@@ -530,11 +531,17 @@ static void slave_startIRQ(){
+ 
+     slave.start_irq(pic1_irq);
+     master.start_irq(master_cascade_irq);
++#if C_REMOTEDEBUG
++    QMP_ObserveEvent("irq-dispatch", {{"vector", slave.vector_base + pic1_irq}});
++#endif
+     CPU_HW_Interrupt((unsigned int)slave.vector_base + (unsigned int)pic1_irq);
+ }
+ 
+ static void inline master_startIRQ(Bitu i){
+     master.start_irq(i);
++#if C_REMOTEDEBUG
++    QMP_ObserveEvent("irq-dispatch", {{"vector", master.vector_base + i}});
++#endif
+     CPU_HW_Interrupt(master.vector_base + i);
+ }
+ 
 diff --git a/src/misc/savestates.cpp b/src/misc/savestates.cpp
-index c6bb8d81d..039419211 100644
+index c6bb8d81d..8e25ce401 100644
 --- a/src/misc/savestates.cpp
 +++ b/src/misc/savestates.cpp
 @@ -59,11 +59,13 @@ std::string saveloaderr="";

@@ -5,6 +5,7 @@ from pathlib import Path
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -173,28 +174,93 @@ def run_command(command: list[str], *, cwd: Path, out_dir: Path,
     return receipt
 
 
-def command_run_plan(args) -> int:
-    plan = load_run_plan(args.plan, job=getattr(args, "job", None), host_profile=getattr(args, "host_profile", None))
-    if args.dry_run:
-        output = {key: str(value) if isinstance(value, Path) else value for key, value in plan.items()}
-        output["preflight"] = inspect_bindings(plan["inputs"], plan["base"])
-        print(json.dumps(output, indent=2))
-        return 0 if all(row["status"] == "current" for row in output["preflight"]) else 1
+def _execute_plan(plan, out_dir):
+    plan = dict(plan)
     path, identity = plan.pop("plan_path"), plan.pop("plan_sha256")
     name, expected = plan.pop("job", None), plan.pop("expectations", None)
     plan["inputs"] = _merge_bindings([*plan["inputs"], dict(path=str(path), sha256=identity)], plan["base"])
-    receipt = run_command(**plan, out_dir=args.out_dir)
+    receipt = run_command(**plan, out_dir=out_dir)
     if expected is not None:
         matches = {}
         for stream in ("stdout", "stderr"):
-            text = (args.out_dir / (stream + ".log")).read_text(encoding="utf-8", errors="replace") if expected[stream] else ""
+            text = (out_dir / (stream + ".log")).read_text(encoding="utf-8", errors="replace") if expected[stream] else ""
             matches[stream] = [value in text for value in expected[stream]]
         met = (receipt["status"] in ("success", "failed") and receipt["inputs_unchanged"]
                and receipt["exit_code"] == expected["exit_code"] and all(all(v) for v in matches.values()))
         result = dict(format_version=1, job=name, expectations=expected, matched=matches, expectations_met=met,
                       qualification="Job expectations only; not behavioral or fidelity qualification.")
-        (args.out_dir / "job-result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-        print(json.dumps(result, indent=2))
-        return 0 if met else 1
-    print(json.dumps(receipt, indent=2))
-    return 0 if receipt["status"] == "success" and receipt["inputs_unchanged"] else 1
+        (out_dir / "job-result.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+        return result, 0 if met else 1
+    return receipt, 0 if receipt["status"] == "success" and receipt["inputs_unchanged"] else 1
+
+
+def _preview(plan):
+    output = {key: str(value) if isinstance(value, Path) else value for key, value in plan.items()}
+    output['preflight'] = inspect_bindings(plan['inputs'], plan['base'])
+    return output
+
+
+def command_run_plan(args) -> int:
+    if getattr(args, 'all_jobs', False):
+        return _command_batch(args)
+    plan = load_run_plan(args.plan, job=getattr(args, "job", None), host_profile=getattr(args, "host_profile", None))
+    if args.dry_run:
+        output = _preview(plan)
+        print(json.dumps(output, indent=2))
+        return 0 if all(row['status'] == 'current' for row in output['preflight']) else 1
+    report, code = _execute_plan(plan, args.out_dir)
+    print(json.dumps(report, indent=2))
+    return code
+
+
+def _command_batch(args) -> int:
+    document = json.loads(args.plan.read_text(encoding='utf-8-sig'))
+    if (not isinstance(document, dict) or type(document.get('format_version')) is not int
+            or document['format_version'] != 2 or not isinstance(document.get('jobs'), dict) or not document['jobs']):
+        raise ValueError('batch execution requires named version 2 jobs')
+    names = list(document['jobs'])
+    reserved = re.compile(r'(?i)^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)')
+    if (len({name.casefold() for name in names}) != len(names)
+            or any(not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9_-])?', name)
+                   or reserved.match(name) for name in names)):
+        raise ValueError('batch job names must be portable directory names')
+    # Validate every job before creating outputs or launching the first command.
+    plans = [load_run_plan(args.plan, job=name, host_profile=args.host_profile) for name in names]
+    if len({plan['plan_sha256'] for plan in plans}) != 1:
+        raise ValueError('batch plan changed during preflight')
+    previews = [_preview(plan) for plan in plans]
+    if args.dry_run:
+        print(json.dumps(previews, indent=2))
+        return 0 if all(row['status'] == 'current' for plan in previews for row in plan['preflight']) else 1
+    if args.out_dir.exists():
+        raise ValueError('output must be fresh')
+    output = args.out_dir.resolve()
+    for plan in previews:
+        for row in plan['preflight']:
+            path = Path(row['path'])
+            if row['status'] != 'current':
+                raise ValueError('batch input missing or stale: ' + str(path))
+            if path == output or output in path.parents:
+                raise ValueError('batch output cannot contain a bound input')
+    args.out_dir.mkdir(parents=True)
+    rows, failed = [], False
+    for name, plan in zip(names, plans):
+        if failed:
+            rows.append(dict(job=name, status='skipped'))
+            continue
+        try:
+            _, code = _execute_plan(plan, args.out_dir / name)
+        except (OSError, ValueError) as error:
+            rows.append(dict(job=name, status='error', error=str(error)))
+            failed = True
+            continue
+        failed = code != 0
+        receipt = args.out_dir / name / 'receipt.json'
+        rows.append(dict(job=name, status='unmet' if failed else 'met',
+                         receipt=dict(path=name + '/receipt.json', sha256=sha256_file(receipt)),
+                         result=dict(path=name + '/job-result.json', sha256=sha256_file(args.out_dir / name / 'job-result.json'))))
+    report = dict(format_version=1, expectations_met=not failed, jobs=rows,
+                  qualification='Sequential job expectations with raw receipts retained. Fidelity is evaluated separately.')
+    (args.out_dir / 'batch-result.json').write_text(json.dumps(report, indent=2) + '\n', encoding='utf-8')
+    print(json.dumps(report, indent=2))
+    return 1 if failed else 0

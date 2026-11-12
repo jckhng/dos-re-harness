@@ -29,6 +29,10 @@ exposes:
   logical boundary;
 - immediate save and paused load operations that preserve a halted boundary
   without executing an extra guest instruction.
+- an opt-in bounded instruction/device observer with explicit start/stop probes,
+  selected I/O ports, PIC timestamps and overflow reporting. The generated-code
+  qualifier compares observer-off/on guest state and display. See the
+  [observer contract](../../docs/investigation-workflow.md#record-passive-backend-observations).
 
 Supply a state-input hook, state address, width, and stop value without an
 input script when only an exact terminal boundary is needed. When the harness

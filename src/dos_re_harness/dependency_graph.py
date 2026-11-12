@@ -16,8 +16,9 @@ _EXECUTIONS = {"component", "controlled", "natural"}
 def inspect_graph(path: Path) -> dict:
     document = json.loads(path.read_text(encoding="utf-8-sig"))
     if (not isinstance(document, dict) or set(document) != {"format_version", "artifacts", "records"}
-            or type(document["format_version"]) is not int or document["format_version"] != 1):
+            or type(document["format_version"]) is not int or document["format_version"] not in (1, 2)):
         raise ValueError("invalid dependency graph version or fields")
+    version = document['format_version']
     nodes, files = {}, {}
     for field in ("artifacts", "records"):
         if not isinstance(document[field], list):
@@ -31,8 +32,19 @@ def inspect_graph(path: Path) -> dict:
                     raise ValueError("invalid artifact fields")
                 files[node["id"]] = inspect_bindings([dict(path=node["path"], sha256=node["sha256"])], path.parent)[0]
                 continue
-            if set(node) != {"id", "dependencies", "dependencies_complete", "stage", "execution", "recorded_result", "scope"}:
+            fields = {"id", "dependencies", "dependencies_complete", "stage", "execution", "recorded_result", "scope"}
+            if version == 2:
+                fields.update(('domains', 'timing', 'supplied'))
+            if set(node) != fields:
                 raise ValueError("invalid evidence record fields")
+            if version == 2:
+                for field in ('domains', 'supplied'):
+                    values = node[field]
+                    if (not isinstance(values, list) or any(not isinstance(value, str) or not value for value in values)
+                            or len(set(values)) != len(values) or (field == 'domains' and not values)):
+                        raise ValueError('invalid evidence ' + field)
+                if node['timing'] not in ('unqualified', 'logical', 'emulated', 'physical'):
+                    raise ValueError('invalid evidence timing qualification')
             deps = node["dependencies"]
             if (not isinstance(deps, list) or any(not isinstance(item, str) for item in deps)
                     or len(set(deps)) != len(deps) or type(node["dependencies_complete"]) is not bool
@@ -70,18 +82,34 @@ def inspect_graph(path: Path) -> dict:
         return result
 
     records = [visit(node["id"]) for node in document["records"]]
-    return dict(format_version=1, records=records, artifacts=[dict(id=key, **value) for key, value in files.items()],
+    report = dict(format_version=version, records=records, artifacts=[dict(id=key, **value) for key, value in files.items()],
                 counts=dict(Counter(row["freshness"] for row in records)),
                 scope="Declared transitive file identities only; recorded outcomes and stages are not rerun or inferred.")
+    if version == 2:
+        fidelity = {field: {} for field in ('execution', 'timing', 'domains')}
+        for row in records:
+            for field in fidelity:
+                values = row[field] if field == 'domains' else [row[field]]
+                for value in values:
+                    counts = fidelity[field].setdefault(value, {})
+                    result = row['recorded_result']
+                    counts[result] = counts.get(result, 0) + 1
+        fidelity['current_passes'] = sum(row['freshness'] == 'current' and row['recorded_result'] == 'pass' for row in records)
+        report['fidelity'] = fidelity
+    return report
 
 
 def command_evidence_status(args) -> int:
     report = inspect_graph(args.graph)
     if args.format == "markdown":
-        rows = ["| Record | Stage | Execution | Recorded result | Freshness |", "|---|---|---|---|---|"]
+        fields = ['id', 'stage', 'execution', 'recorded_result', 'freshness']
+        labels = ['Record', 'Stage', 'Execution', 'Recorded result', 'Freshness']
+        if report['format_version'] == 2:
+            fields.extend(('domains', 'timing', 'supplied'))
+            labels.extend(('Domains', 'Timing', 'Supplied inputs'))
+        rows = ['| ' + ' | '.join(labels) + ' |', '|' + '---|' * len(labels)]
         for row in report["records"]:
-            values = [str(row[key]).replace('|', '\\|').replace('\n', ' ') for key in
-                      ('id', 'stage', 'execution', 'recorded_result', 'freshness')]
+            values = [str(row[key]).replace('|', '\\|').replace('\n', ' ') for key in fields]
             rows.append('| ' + ' | '.join(values) + ' |')
         text = '\n'.join(rows) + '\n'
     else:

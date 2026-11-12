@@ -58,6 +58,7 @@ program portable, with platform I/O (such as SDL2) in a separate host layer.
 | First original run and capture | [Getting started](docs/getting-started.md) |
 | Plan and integrate recovered subsystems | [Translation workflow](skills/reverse-reimplement-dos/references/translation-workflow.md) |
 | Repeat experiments and track evidence | [Workbench](docs/workbench.md) · [Capture plans](docs/capture-plans.md) |
+| Batch regressions, inspect divergence and qualify clocks | [Investigation workflow](docs/investigation-workflow.md) |
 | Query code or resolve protected-mode addresses | [Ghidra](docs/ghidra-query-cookbook.md) · [Address helpers](docs/protected-mode-addressing.md) |
 | Assess fidelity and remaining gaps | [Evidence boundaries](docs/evidence-boundaries.md) · [Presentation](docs/presentation-contract.md) |
 | Configure tools or publish changes | [Configuration and publication](docs/configuration-and-publication.md) |
